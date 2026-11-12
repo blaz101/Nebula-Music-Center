@@ -1,7 +1,7 @@
 # Sync, part 1 — scan and reconcile the device
 
 **Fast hash only.** This file started as an exact clone of the supplied part-1 tree.
-The branches marked **[1.19]** are the corrections found while running the 763
+The branches marked **[tested]** are the corrections found while running the 763
 scenario suites in `tests/sync_hash_check.py` and `tests/sync_hash_matrix.py`.
 
 ## Final tree
@@ -85,7 +85,7 @@ scenario suites in `tests/sync_hash_check.py` and `tests/sync_hash_matrix.py`.
    timestamp move. A moved timestamp is a hint to read the device once; it is never
    proof that the content changed.
 5. **Non-canonical paths are duplicates for a still-selected file.** This is the
-   1.19 fix for the reported album. An old target, a wrong media folder, or a former
+   tested fix for the reported album. An old target, a wrong media folder, or a former
    filesystem name can leave records for the same source at another device path.
    Mirror deletes those copies; Update keeps them but never restores them.
 6. **Only the current target is touched.** A record under an older target folder is

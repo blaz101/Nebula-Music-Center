@@ -1,7 +1,7 @@
 # Sync, part 2 — reconcile the library with the manifest
 
 **Fast hash only.** This file started as an exact clone of the supplied part-2 tree.
-The branches marked **[1.19]** are the corrections found while running the 763
+The branches marked **[tested]** are the corrections found while running the 763
 scenario suites in `tests/sync_hash_check.py` and `tests/sync_hash_matrix.py`.
 
 ## Final tree
@@ -67,7 +67,7 @@ That means:
    action is `changed` at the same canonical path — never a second copy. A rename or
    an organized path is `new` plus `delete` under Mirror.
 
-## What changed after testing [1.19]
+## What changed after testing
 
 - **Canonical-only verification.** After a sync, the verifier checks one canonical
   path for each selected file. It no longer walks every manifest record and copies

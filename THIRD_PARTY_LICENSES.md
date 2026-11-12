@@ -9,15 +9,15 @@ in the source tree and in the `.deb`, plus the external programs the app invokes
 ## Verdict
 
 - **No known bundled licensing blocker remains.** The RainbowCrack `rcrack` binary
-  and its `README-rcrack.txt` were removed in 1.25 along with the Audible `.aax`
-  import feature. There is no bundled `rcrack`, rainbow-table payload, activation
+  and its `README-rcrack.txt` are not part of the 1.26 release, along with the Audible
+  `.aax` import feature. There is no bundled `rcrack`, rainbow-table payload, activation
   byte setting or `.aax` importer in this version.
 - **The application itself is now licensed under GPL-3.0-only.** `LICENSE`, source
   headers, `SOURCE_OFFER.md`, `PROVENANCE.md` and `TRADEMARK.md` are present in the
   release tree.
-- **The old conditional Qt components are gone.** Qt VirtualKeyboard and Qt PDF,
-  including their libraries and plugins, were removed in 1.26 because the app does
-  not use them.
+- **The old conditional Qt components are not bundled.** Qt VirtualKeyboard and Qt PDF,
+  including their libraries and plugins, are absent because the app does not use
+  them.
 - Everything else found is compatible with GPLv3, subject to the notices and
   source-offer obligations below.
 
@@ -26,7 +26,7 @@ in the source tree and in the `.deb`, plus the external programs the app invokes
 | Component | Where | Licence | GPLv3 status |
 |---|---|---|---|
 | PySide6 6.12.0 / shiboken6 | `assets/PySide6`, `assets/shiboken6` | LGPL-3.0-only, GPL-2.0-only, GPL-3.0-only, or commercial | **Compatible** under LGPLv3. Keep dynamic linking, notices and relink/source rights. |
-| Qt 6.12 libraries | `assets/PySide6/Qt/lib` | LGPL-3.0 (most modules) | **Compatible** under LGPLv3. The unused GPLv3-only modules were removed in 1.26. |
+| Qt 6.12 libraries | `assets/PySide6/Qt/lib` | LGPL-3.0 (most modules) | **Compatible** under LGPLv3. The unused GPLv3-only modules are not bundled. |
 | FFmpeg 9.0.1 libraries | `assets/PySide6/Qt/lib/libavcodec.so.63`, `libavformat.so.63`, `libavutil.so.61`, `libswresample.so.7`, `libswscale.so.10` | LGPL-2.1-or-later (verified in the binaries) | **Compatible.** Ship the LGPL text and corresponding source/offer. No `--enable-nonfree` string was found. |
 | mutagen 1.48.1 | `assets/mutagen` | GPL-2.0-or-later | **Compatible** with GPLv3; the "or later" permission is present in the source headers. |
 | DejaVu Sans fonts | `assets/fonts/*.ttf` | Bitstream Vera / Arev font licence (permissive) | **Compatible.** Keep the copyright and licence notice with the fonts. |
@@ -40,7 +40,7 @@ in the source tree and in the `.deb`, plus the external programs the app invokes
 | Nebula code, UI text, `nebula.png`, docs | project root | Copyright (C) 2026 Roger Barthares; GPL-3.0-only | **Licensed.** `LICENSE`, source headers and source offer are present. |
 | Lucide icons: repeat, repeat-one, shuffle and file-clock | vector paths in `nebula.py`; `sync-log.png` | ISC, with Feather-derived portions under MIT | **Compatible.** Ship the full `LICENSES/Lucide.txt` and keep the icon notice. |
 
-## Removed in 1.25
+## Not shipped in 1.26
 
 The following are no longer shipped:
 
@@ -59,7 +59,7 @@ The non-code Audible service/DRM question is therefore no longer part of the
 application's bundled feature set. MusicBrainz/Cover Art Archive metadata and
 artwork still keep their own attribution and service terms.
 
-## Removed in 1.26
+## Qt components not bundled
 
 - Qt VirtualKeyboard libraries and plugin
 - Qt PDF library and `libqpdf.so` image plugin
