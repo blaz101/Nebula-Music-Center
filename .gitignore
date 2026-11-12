@@ -1,0 +1,33 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local build and release artifacts
+*.deb
+*.orig.tar.*
+release-*/
+artifacts/
+
+# Private / local material
+chat-history/
+.freebuff/
+.env
+.env.*
+!.env.example
+
+# Local design and image-processing scratch material
+.tracework/
+logo-concepts/
+nebula-clock*
+rosette*
+preview.html
+digitise_rosette.py
+generate_emblem.py
+nmc-emblem.svg
+
+# Editors and temporary files
+*.swp
+*.swo
+*~
+.DS_Store

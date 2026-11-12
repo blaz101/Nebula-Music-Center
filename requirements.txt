@@ -1,0 +1,4 @@
+# Only needed when you run nebula.py without the bundled assets/ folder.
+# The bundled PySide6 in assets/ takes precedence (it is added to sys.path first).
+PySide6>=6.5
+mutagen>=1.46

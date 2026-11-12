@@ -1,0 +1,22943 @@
+# Copyright (C) 2026 Roger Barthares
+# SPDX-License-Identifier: GPL-3.0-only
+"""Nebula Music Center - library/player, batch tagger, devices (MTP) and sync for Linux.
+
+Run:  python3 nebula.py      Keep the 'assets' folder next to this file - it contains everything needed.
+"""
+# ---- use the libraries bundled in ./assets (no pip install needed) ----
+import os
+import sys
+
+_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+if os.path.isdir(_ASSETS):
+    sys.path.insert(0, _ASSETS)
+try:
+    import PySide6.QtWidgets  # noqa: F401
+    import PySide6.QtMultimedia  # noqa: F401
+    import mutagen  # noqa: F401
+except ImportError as _e:
+    sys.stderr.write(
+        "\nNebula Music Center could not start: " + str(_e) + "\n\n"
+        "Make sure the 'assets' folder sits next to nebula.py (64-bit Linux, Python 3.9+).\n"
+        "If a system library is missing, install it, e.g. on Ubuntu/Debian:\n"
+        "    sudo apt install libxcb-cursor0 libegl1 libxkbcommon-x11-0\n"
+        "Phones (MTP) also need: gvfs-backends (Debian/Ubuntu) or gvfs-mtp (Fedora/Arch).\n\n")
+    sys.exit(1)
+import atexit
+import base64
+import concurrent.futures
+import fcntl
+import getpass
+import hashlib
+import json
+import math
+import mutagen
+import os
+import random
+import re
+import shutil
+import sqlite3
+import struct
+import subprocess
+import html
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote, unquote
+
+try:  # ID3 inside WAV/AIFF needs explicit container classes
+    from mutagen.wave import WAVE as _WAVE
+    from mutagen.aiff import AIFF as _AIFF
+    ID3_CONTAINERS = (_WAVE, _AIFF)
+except ImportError:  # pragma: no cover
+    ID3_CONTAINERS = ()
+
+from PySide6.QtCore import (QObject, QThread, QUrl, Qt, Signal, QPoint, QPointF, QRectF, QSize,
+                            QTimer, QEvent, QBuffer)
+from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QIcon,
+                           QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen,
+                           QPixmap, QPolygonF, QShortcut)
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QProgressDialog,
+    QProxyStyle,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QStyle,
+    QStyleOptionSlider,
+    QStyledItemDelegate,
+    QSystemTrayIcon,
+    QStyleOptionToolButton,
+    QStyleOptionViewItem,
+    QStylePainter,
+    QStackedWidget,
+    QTabBar,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget)
+from dataclasses import asdict, dataclass, field
+
+# Optional: real audio tap for the spectrum analyser (Qt 6.8+ / PySide6 6.8+).
+try:
+    from PySide6.QtMultimedia import QAudioFormat  # noqa: F401
+    _HAS_AUDIO_FORMAT = True
+except ImportError:  # very old Qt
+    QAudioFormat = None
+    _HAS_AUDIO_FORMAT = False
+try:  # Qt 6.8+ can hand us the player's decoded buffers
+    from PySide6.QtMultimedia import QAudioBufferOutput  # noqa: F401
+    _HAS_AUDIO_TAP = True
+except ImportError:  # older Qt
+    QAudioBufferOutput = None
+    _HAS_AUDIO_TAP = False
+try:  # Qt 5/6 all ship QAudioDecoder, which decodes the file separately
+    from PySide6.QtMultimedia import QAudioDecoder  # noqa: F401
+    _HAS_AUDIO_DECODER = True
+except ImportError:  # no multimedia module at all
+    QAudioDecoder = None
+    _HAS_AUDIO_DECODER = False
+
+
+# ======================================================================
+# core/config.py
+# ======================================================================
+APP_NAME = "Nebula Music Center"      # the full title, used in About and the desktop entry
+APP_SHORT = "Nebula"                 # what the title bar and menus call it
+VERSION = "1.26"
+SOURCE_URL = "https://github.com/blaz101/Nebula-Music-Center"
+CONTACT_EMAIL = "roger.barthares@gmail.com"
+# Let the desktop provide its own file chooser. The native GTK/portal dialog follows
+# the system light/dark setting, unlike Qt's in-app fallback, which only follows the
+# app palette. Folders still keep ShowDirsOnly.
+FILE_DIALOG_OPTIONS = QFileDialog.Options()
+DIRECTORY_DIALOG_OPTIONS = QFileDialog.Option.ShowDirsOnly
+# the app icon, also shown as the logo at the left of the tab bar
+ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nebula.png")
+# the sync log's clock-and-page glyph, tinted to the theme when it is shown
+LOG_ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync-log.png")
+
+# ------------------------------------------------------------------ two folders
+# Everything the app writes lives in one of two folders: the data one, which is
+# worth backing up, and the cache one, which can be deleted at any time.
+#
+#   ~/Nebula/                     settings and data
+#     settings/  what the app remembers: config, profiles, smart playlists, queue rows
+#     library/   the databases and the exported playlists
+#     sync/      what each sync profile knows each device holds (manifests, hashes)
+#
+#   ~/.cache/Nebula/              everything that can be rebuilt or thrown away
+#     covers/    artwork cache, downloaded again when it is missing
+#     tmp/       buffers (CD, device, rip and burn staging)
+#
+# Two roots rather than one because a sandboxed install keeps them apart: inside
+# a Flatpak these are the app's private data and cache directories
+# ($XDG_DATA_HOME/Nebula and $XDG_CACHE_HOME/Nebula), and a backup of the first
+# never has to walk a 2 GB buffer again.  NEBULA_DATA and NEBULA_CACHE point them
+# anywhere (a portable install, or a test run), which is also how the test suite
+# keeps itself away from real data.
+DATA_ROOT = os.path.abspath(os.path.expanduser(
+    os.environ.get("NEBULA_DATA") or os.path.join("~", "Nebula")))
+CACHE_ROOT = os.path.abspath(os.path.expanduser(
+    os.environ.get("NEBULA_CACHE") or os.path.join("~", ".cache", "Nebula")))
+SETTINGS_DIR = os.path.join(DATA_ROOT, "settings")
+LIBRARY_DIR = os.path.join(DATA_ROOT, "library")
+SYNC_DIR = os.path.join(DATA_ROOT, "sync")
+COVERS_DIR = os.path.join(CACHE_ROOT, "covers")
+TMP_DIR = os.path.join(CACHE_ROOT, "tmp")
+PLAYLIST_DIR = os.path.join(LIBRARY_DIR, "playlists")
+
+# tells backup tools (rsync, restic, Deja Dup) that a folder can be rebuilt
+CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n"
+
+
+def prune_tmp(max_age=24 * 3600):
+    """Delete buffers that a crash or an earlier session left behind.
+
+    Nothing younger than a day is touched, so a second copy of the app that is
+    playing right now keeps the buffers it is reading.
+    """
+    try:
+        names = os.listdir(TMP_DIR)
+    except OSError:
+        return 0
+    now = time.time()
+    removed = 0
+    for name in names:
+        path = os.path.join(TMP_DIR, name)
+        try:
+            if now - os.path.getmtime(path) < max_age:
+                continue
+        except OSError:
+            continue
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+for _d in (DATA_ROOT, SETTINGS_DIR, LIBRARY_DIR, SYNC_DIR,
+           CACHE_ROOT, COVERS_DIR, TMP_DIR, PLAYLIST_DIR):
+    os.makedirs(_d, exist_ok=True)
+for _d in (CACHE_ROOT, COVERS_DIR, TMP_DIR):    # rebuildable: keep them out of backups
+    try:
+        with open(os.path.join(_d, "CACHEDIR.TAG"), "w", encoding="ascii") as _f:
+            _f.write(CACHE_TAG)
+    except OSError:
+        pass
+prune_tmp()
+
+CONFIG_FILE = os.path.join(SETTINGS_DIR, "config.json")
+PROFILES_FILE = os.path.join(SETTINGS_DIR, "profiles.json")
+PRESETS_FILE = os.path.join(SETTINGS_DIR, "device_presets.json")
+SYNC_LOG_FILE = os.path.join(SETTINGS_DIR, "sync_log.json")
+SMART_FILE = os.path.join(SETTINGS_DIR, "smart_playlists.json")
+
+DEFAULT_CONFIG = {
+    "library_folders": [],
+    # audiobook folders stay out of the music library: the Audiobooks tab reads them
+    "audiobook_folders": [],
+    # where Import moves files, and where the last file dialog was left
+    "audiobook_import_target": "",
+    "audiobook_import_last": "",
+    # where new sync profiles and Copy to device put each kind of audio
+    "device_music_folder": "Music/Artists",
+    "device_audiobook_folder": "Audiobooks",
+    "device_podcast_folder": "Music/Podcasts",
+    # column order and widths each grid was left with
+    "grid_layouts": {},
+    "volume": 70,
+    "grouping": "artist_album",
+    "view": "collection",
+    "queue": [],
+    "queue_index": -1,
+    "tab": 0,
+    # how many compares/syncs each profile's log keeps (Preferences > Syncing)
+    "sync_log_keep": 10,
+    "shuffle": False,
+    "repeat": "off",
+    "stop_after": False,
+    # clicking the time bar jumps to that point (Preferences > Playback)
+    "seek_click": True,
+    "window": [1360, 860],
+    "split": [760, 640],
+    # library tab (Strawberry collection view parity)
+    "lib_details": False,
+    "lib_show_covers": True,
+    "lib_show_dividers": True,
+    "lib_auto_open": False,
+    # how the folders were left open: "all", "letters", "none" ("" = never chosen yet)
+    "lib_fold": "",
+    "lib_double_click": "queue",
+    # 0.52: how a selection is ordered when it is queued, and how whole albums play
+    "shuffle_mode": "off",
+    "album_play_order": "in_order",
+    "lib_mode": "list",
+    # devices tab: device list across the top, or down the side
+    "devices_layout": "bar",
+    # the last Music / Audiobooks / Podcasts tab opened for each device
+    "device_categories": {},
+    # devices hidden from the Devices tab, restored from Preferences > Devices
+    "removed_devices": {},
+    # how the device tree was left open: "all", "letters", "none" ("" = never chosen)
+    "dev_fold": "",
+    "lib_columns": ["title", "artist", "album", "length", "year", "rating"],
+    "lib_column_widths": [],
+    "grouping_levels": ["artist", "album"],
+    "saved_groupings": [],
+    "lib_track_prefix": True,
+    "ui_revision": 42,
+    # multiple collections (each one is a separate database + folder list)
+    "collections": [],
+    "active_collection": 0,
+    # ReplayGain
+    "rg_mode": "off",
+    "rg_preamp": 0.0,
+    "rg_prevent_clip": True,
+    # online metadata
+    "online_lookup": True,
+    # audio CD: tracks buffered ahead of playback so starting one doesn't wait for the drive
+    "cd_buffer": 3,
+    # playing from the PC: megabytes read into memory ahead of the player (0 = off)
+    "file_buffer_mb": 30,
+    # playing from a device: megabytes copied into a local buffer ahead of the player
+    "device_buffer_mb": 128,
+}
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = load_json(CONFIG_FILE, None)
+    if not isinstance(cfg, dict) or not cfg:
+        # A missing, empty or truncated config falls back to the copy kept before the
+        # last write, so one bad save cannot lose the folders, devices and presets.
+        backup = load_json(CONFIG_FILE + ".bak", None)
+        if isinstance(backup, dict) and backup:
+            cfg = backup
+    if not isinstance(cfg, dict):
+        cfg = {}
+    try:
+        revision = int(cfg.get("ui_revision") or 0)
+    except (TypeError, ValueError):
+        revision = 0
+    if revision < 41:
+        # 0.41: the grouped library is a clean three-level tree (artist, album,
+        # "01. Title"); detail columns stay available from the wrench menu.
+        cfg["lib_details"] = False
+        cfg["ui_revision"] = 41
+    if revision < 42:
+        # 1.07: Audiobooks is a new tab between Music and Tags, so a saved tab index past
+        # Music moves along with it.
+        tab = cfg.get("tab")
+        if isinstance(tab, int) and tab >= 1:
+            cfg["tab"] = tab + 1
+        cfg["ui_revision"] = 42
+    for key, val in DEFAULT_CONFIG.items():
+        if key not in cfg or not isinstance(cfg[key], type(val)):
+            cfg[key] = val
+    folders = [f for f in cfg["library_folders"] if isinstance(f, str)]
+    cfg["library_folders"] = folders
+    migrate_collections(cfg)
+    return cfg
+
+
+# ======================================================================
+# core/collections.py - several independent libraries
+# ======================================================================
+def _safe_db_name(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-") or "collection"
+    return slug + ".db"
+
+
+def migration_collection(folders):
+    """The collection that owns the v3 database and folder list."""
+    return {"name": "Music", "folders": list(folders or []), "db": DB_FILE}
+
+
+def migrate_collections(cfg):
+    """Make sure the config has a valid collections list and a valid active index."""
+    raw = cfg.get("collections")
+    cols = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            db = str(entry.get("db") or "").strip()
+            if not name or not db:
+                continue
+            folders = [f for f in (entry.get("folders") or []) if isinstance(f, str)]
+            cols.append({"name": name, "folders": folders, "db": db})
+    if not cols:
+        cols = [migration_collection(cfg.get("library_folders"))]
+    names = set()
+    for entry in cols:
+        base = entry["name"]
+        n = 1
+        while entry["name"] in names:
+            n += 1
+            entry["name"] = "%s %d" % (base, n)
+        names.add(entry["name"])
+    cfg["collections"] = cols
+    try:
+        idx = int(cfg.get("active_collection") or 0)
+    except (TypeError, ValueError):
+        idx = 0
+    idx = max(0, min(idx, len(cols) - 1))
+    cfg["active_collection"] = idx
+    live = [f for f in (cfg.get("library_folders") or []) if isinstance(f, str)]
+    cols[idx]["folders"] = live
+    cfg["library_folders"] = list(live)
+    return cols
+
+
+def active_collection(cfg):
+    cols = migrate_collections(cfg)
+    return cols[cfg["active_collection"]]
+
+
+def new_collection_db(name):
+    folder = os.path.join(LIBRARY_DIR, "collections")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, _safe_db_name(name))
+    base, ext = os.path.splitext(path)
+    n = 1
+    while os.path.exists(path):
+        n += 1
+        path = "%s-%d%s" % (base, n, ext)
+    return path
+
+
+def store_active_collection(cfg):
+    """Push the live folder list back into the active collection entry."""
+    cols = cfg.get("collections") or []
+    idx = cfg.get("active_collection", 0)
+    if isinstance(cols, list) and 0 <= int(idx) < len(cols):
+        cols[int(idx)]["folders"] = [f for f in cfg.get("library_folders") or []
+                                     if isinstance(f, str)]
+    return cols
+
+
+def save_config(cfg):
+    """Write the config, first keeping the file it replaces as config.json.bak."""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            shutil.copyfile(CONFIG_FILE, CONFIG_FILE + ".bak")
+    except OSError:
+        pass
+    save_json(CONFIG_FILE, cfg)
+
+
+# ======================================================================
+# core/tags.py
+# ======================================================================
+AUDIO_EXT = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".mp4", ".aac",
+             ".wav", ".wma", ".aiff", ".aif", ".ape", ".wv", ".alac"}
+FIELDS = ["title", "artist", "album", "albumartist", "tracknumber",
+          "discnumber", "date", "genre", "composer"]
+COVER_NAMES = ("cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "album.jpg")
+# pretty names used by the format pill / devices view
+FORMAT_NAMES = {
+    ".mp3": "MP3", ".flac": "FLAC", ".ogg": "OGG", ".opus": "OPUS", ".m4a": "M4A",
+    ".mp4": "M4A", ".aac": "AAC", ".wav": "WAV", ".wma": "WMA", ".aiff": "AIFF",
+    ".aif": "AIFF", ".ape": "APE", ".wv": "WV", ".alac": "ALAC",
+}
+# containers whose extension says nothing about the codec inside
+MP4_EXT = {".m4a", ".mp4", ".alac"}
+
+
+def is_audio(path):
+    return os.path.splitext(path)[1].lower() in AUDIO_EXT
+
+
+def is_lrc(path):
+    """A lyric sidecar next to an audio file."""
+    return os.path.splitext(str(path or ""))[1].lower() == ".lrc"
+
+
+# Audiobooks add the .m4b container, which the music library deliberately ignores.
+AUDIOBOOK_EXT = AUDIO_EXT | {".m4b"}
+
+
+def is_audiobook(path):
+    return os.path.splitext(path)[1].lower() in AUDIOBOOK_EXT
+
+
+AUDIOBOOK_IMPORT_FILTER = ("Audio (" + " ".join("*" + ext for ext in sorted(AUDIOBOOK_EXT))
+                           + ");;All files (*)")
+
+
+# MP4 sample entry fourcc -> codec name. This is the authoritative tag: the
+# container extension says nothing about what is inside.
+MP4_SAMPLE_CODECS = {b"mp4a": "AAC", b"alac": "ALAC", b"ac-3": "AC-3", b"ec-3": "E-AC-3",
+                     b"Opus": "OPUS", b"fLaC": "FLAC", b"mp3 ": "MP3",
+                     b"samr": "AMR", b"sawb": "AMR-WB"}
+MP4_PARENT_BOXES = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+
+
+def mp4_sample_codec(path):
+    """Fourcc of the first audio sample entry (``mp4a``/``alac``/...), or b''.
+
+    Reads atom headers only, so it stays cheap on large files and keeps working
+    when mutagen cannot build a full stream info object.
+    """
+    try:
+        with open(path, "rb") as fh:
+            end = os.fstat(fh.fileno()).st_size
+
+            def walk(start, stop, depth=0):
+                pos = start
+                while pos + 8 <= stop and depth <= 6:
+                    fh.seek(pos)
+                    head = fh.read(16)
+                    if len(head) < 8:
+                        return b""
+                    size = int.from_bytes(head[0:4], "big")
+                    name = head[4:8]
+                    header = 8
+                    if size == 1:
+                        if len(head) < 16:
+                            return b""
+                        size = int.from_bytes(head[8:16], "big")
+                        header = 16
+                    elif size == 0:
+                        size = stop - pos
+                    if size < header or pos + size > stop:
+                        return b""
+                    if name == b"stsd":
+                        entry = pos + header + 8
+                        if entry + 8 <= pos + size:
+                            fh.seek(entry)
+                            return fh.read(8)[4:8]
+                        return b""
+                    if name in MP4_PARENT_BOXES:
+                        found = walk(pos + header, pos + size, depth + 1)
+                        if found:
+                            return found
+                    pos += size
+                return b""
+
+            return walk(0, end)
+    except (OSError, ValueError):
+        return b""
+
+
+def audio_codec(path, audio=None):
+    """Short codec name for MP4/M4A files: AAC, ALAC, AC-3, OPUS...
+
+    The extension cannot tell these apart, so ask the stream itself: the sample
+    entry fourcc is read straight from the file, and mutagen fills in the rest.
+    Returns "" for files where the extension is enough.
+    """
+    if os.path.splitext(path)[1].lower() not in MP4_EXT:
+        return ""
+    tag = mp4_sample_codec(path)
+    name = MP4_SAMPLE_CODECS.get(tag, "")
+    if tag == b"mp4a":
+        # mp4a is the AAC family; a few files carry MP3 or AC-3 in it
+        name = "AAC"
+    if audio is None:
+        try:
+            audio = mutagen.File(path)
+        except Exception:
+            audio = None
+    info = getattr(audio, "info", None)
+    if info is None or isinstance(info, (list, tuple)):
+        return name
+    codec = str(getattr(info, "codec", "") or "").lower()
+    desc = str(getattr(info, "codec_description", "") or "").upper()
+    # the fourcc wins over mutagen: it cannot mistake AAC for ALAC
+    if tag == b"alac":
+        return "ALAC"
+    if tag == b"mp4a":
+        for wanted, label in (("AC-3", "AC-3"), ("MP3", "MP3"), ("OPUS", "OPUS")):
+            if wanted in desc:
+                return label
+        return "AAC"
+    if name:
+        return name
+    if codec.startswith("alac") or desc.startswith("ALAC"):
+        return "ALAC"
+    if codec.startswith(("mp4a", "aac")) or desc.startswith("AAC"):
+        return "AAC"
+    if codec.startswith("ac-3") or desc.startswith("AC-3"):
+        return "AC-3"
+    if codec.startswith("opus") or desc.startswith("OPUS"):
+        return "OPUS"
+    return desc.split()[0] if desc else ""
+
+
+def filetype(path, audio=None):
+    """Pretty format for a file: MP3, FLAC, and the real codec inside MP4."""
+    codec = audio_codec(path, audio)
+    if codec:
+        return codec
+    ext = os.path.splitext(path)[1].lower()
+    return FORMAT_NAMES.get(ext, ext.lstrip(".").upper() or "?")
+
+
+def tag_label(path, audio=None):
+    """mp3tag's Tag column: container plus the codec or tag family it carries."""
+    ext = os.path.splitext(path)[1].lower()
+    codec = audio_codec(path, audio)
+    if codec:
+        return "MP4 (%s)" % codec
+    if ext == ".mp3":
+        version = ""
+        try:
+            tags = getattr(audio, "tags", None)
+            if tags is None:
+                tags = mutagen.File(path).tags
+            version = str(getattr(tags, "version", "") or "")
+        except Exception:
+            version = ""
+        return "MP3 (ID3v2.%s)" % version if version else "MP3 (no tag)"
+    if ext == ".flac":
+        return "FLAC (FLAC)"
+    if ext == ".ogg":
+        return "OGG (Vorbis)"
+    if ext == ".opus":
+        return "OPUS (Vorbis)"
+    if ext in (".wav", ".aiff", ".aif"):
+        return "%s (ID3v2)" % FORMAT_NAMES[ext]
+    if ext == ".wma":
+        return "WMA (ASF)"
+    if ext in (".ape", ".wv"):
+        return "%s (APE)" % FORMAT_NAMES[ext]
+    if ext == ".aac":
+        return "AAC (ADTS)"
+    return filetype(path, audio)
+
+
+def _first(value):
+    if isinstance(value, (list, tuple)):
+        return str(value[0]) if value else ""
+    return str(value) if value is not None else ""
+
+
+# ID3 frames, used for WAV/AIFF whose tags are plain ID3 rather than an easy mapping
+ID3_MAP = {"title": "TIT2", "artist": "TPE1", "album": "TALB", "albumartist": "TPE2",
+           "tracknumber": "TRCK", "discnumber": "TPOS", "date": "TDRC", "genre": "TCON",
+           "composer": "TCOM"}
+
+
+def _read_id3_tags(path):
+    out = {}
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        return out
+    tags = getattr(audio, "tags", None)
+    if tags is None or not hasattr(tags, "getall"):
+        return out
+    for field, frame in ID3_MAP.items():
+        try:
+            if frame in tags:
+                out[field] = _first(tags[frame].text).strip()
+            elif field == "date" and "TYER" in tags:
+                out[field] = _first(tags["TYER"].text).strip()
+        except Exception:
+            continue
+    return out
+
+
+def read_tags(path):
+    """Text tags plus length. Missing values are empty strings."""
+    out = {f: "" for f in FIELDS}
+    out["length"] = 0.0
+    try:
+        audio = mutagen.File(path, easy=True)
+    except Exception:
+        audio = None
+    if audio is None:
+        return out
+    info = getattr(audio, "info", None)
+    if info is not None:
+        out["length"] = float(getattr(info, "length", 0) or 0)
+    if audio.tags:
+        for f in FIELDS:
+            try:
+                v = audio.tags.get(f)
+            except Exception:
+                v = None
+            out[f] = _first(v).strip()
+    if not any(out[f] for f in FIELDS):
+        out.update(_read_id3_tags(path))
+    # EasyMP4 has no composer key, so read the atom directly.
+    if os.path.splitext(path)[1].lower() in (".m4a", ".mp4") and not out["composer"]:
+        try:
+            raw = mutagen.File(path)
+            tags = getattr(raw, "tags", None)
+            if tags is not None and "\xa9wrt" in tags:
+                out["composer"] = _first(tags["\xa9wrt"]).strip()
+        except Exception:
+            pass
+    return out
+
+
+def _read_id3_comment(path):
+    """ID3 files keep their comment in a COMM frame, not the easy layer."""
+    try:
+        tags = getattr(mutagen.File(path), "tags", None)
+    except Exception:
+        return ""
+    try:
+        frames = tags.getall("COMM") if tags is not None else []
+        for frame in frames:
+            text = _first(getattr(frame, "text", "")).strip()
+            if text:
+                return text
+    except Exception:
+        pass
+    return ""
+
+
+def read_extra_tags(path):
+    """comment / grouping / performer - the tags Strawberry can group by too."""
+    out = {f: "" for f in INFO_FIELDS}
+    try:
+        audio = mutagen.File(path, easy=True)
+    except Exception:
+        audio = None
+    ext = os.path.splitext(path)[1].lower()
+    if audio is None or not audio.tags:
+        if ext in (".mp3", ".wav", ".aiff", ".aif"):
+            out["comment"] = _read_id3_comment(path)
+        return out
+    for fld in INFO_FIELDS:
+        for key in (fld, fld + ":" if fld == "performer" else fld):
+            try:
+                value = audio.tags.get(key)
+            except Exception:
+                value = None
+            if value:
+                out[fld] = _first(value).strip()
+                break
+    if not out["comment"] and ext in (".mp3", ".wav", ".aiff", ".aif"):
+        out["comment"] = _read_id3_comment(path)
+    return out
+
+
+def read_specs(path):
+    """Technical stream information: sample rate, bit depth, bitrate, channels."""
+    out = {"length": 0.0, "sample_rate": 0, "bits_per_sample": 0, "bitrate": 0,
+           "channels": 0, "filetype": filetype(path)}
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        audio = None
+    out["filetype"] = filetype(path, audio)
+    if audio is None:
+        return out
+    info = getattr(audio, "info", None)
+    if info is None:
+        return out
+    out["length"] = float(getattr(info, "length", 0) or 0)
+    out["sample_rate"] = int(getattr(info, "sample_rate", 0) or 0)
+    out["channels"] = int(getattr(info, "channels", 0) or 0)
+    out["bitrate"] = int(getattr(info, "bitrate", 0) or 0)
+    depth = getattr(info, "bits_per_sample", 0) or 0
+    if not depth:
+        # WAV/AIFF expose sample size under another name, MP3/AAC simply have none
+        depth = getattr(info, "sample_size", 0) or 0
+    out["bits_per_sample"] = int(depth or 0)
+    if not out["bitrate"] and out["sample_rate"] and out["channels"] and out["bits_per_sample"]:
+        out["bitrate"] = int(out["sample_rate"] * out["channels"] * out["bits_per_sample"])
+    return out
+
+
+# ======================================================================
+# queue rows for music the library does not hold (device files, mostly)
+# ======================================================================
+# The queue draws its columns from the library, which knows nothing about a file that
+# only exists on a device. Those rows read the file's own tags and keep them here, so a
+# queue restored at launch does not come back blank.
+QUEUE_META_FILE = os.path.join(SETTINGS_DIR, "queue-meta.json")
+QUEUE_META_LIMIT = 2000
+QUEUE_META = {}
+_QUEUE_META_LOADED = [False]
+
+
+def _file_hint(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return [int(st.st_size), int(st.st_mtime)]
+
+
+def load_queue_meta():
+    """Read the saved queue tags once per run; they are hints, so a bad file is ignored."""
+    if _QUEUE_META_LOADED[0]:
+        return QUEUE_META
+    _QUEUE_META_LOADED[0] = True
+    data = load_json(QUEUE_META_FILE, {})
+    if isinstance(data, dict):
+        for key, row in data.items():
+            if isinstance(row, dict):
+                QUEUE_META[key] = row
+    return QUEUE_META
+
+
+def queue_meta(path):
+    """The queue columns for one file, read from its tags and remembered per file.
+
+    Size and timestamp are the only validation a saved entry gets, so a file that
+    changed is simply read again; a file that cannot be read still yields a row (its
+    name only) instead of failing the queue.
+    """
+    load_queue_meta()
+    hint = _file_hint(path)
+    row = QUEUE_META.get(path)
+    if row is not None and hint is not None and row.get("stat") == hint:
+        return row
+    row = dict(read_tags(path))
+    row.update(read_specs(path))
+    row["stat"] = hint
+    QUEUE_META[path] = row
+    return row
+
+
+def save_queue_meta():
+    """Write the tag cache back after queueing or rebuilding the queue."""
+    load_queue_meta()
+    if len(QUEUE_META) > QUEUE_META_LIMIT:
+        for key in list(QUEUE_META)[:len(QUEUE_META) - QUEUE_META_LIMIT]:
+            QUEUE_META.pop(key, None)
+    try:
+        os.makedirs(os.path.dirname(QUEUE_META_FILE), exist_ok=True)
+        save_json(QUEUE_META_FILE, QUEUE_META)
+    except OSError:
+        pass
+
+
+def _write_id3_comment(audio, text):
+    """Set or clear the COMM frame; EasyID3 has no comment key."""
+    from mutagen.id3 import COMM
+    if audio.tags is None:
+        audio.add_tags()
+    audio.tags.delall("COMM")
+    if text:
+        audio.tags.add(COMM(encoding=3, lang="eng", desc="", text=text))
+
+
+def _write_id3_container(audio, values):
+    """Write ID3 frames into a WAV/AIFF container (their easy layer is read-only).
+    Returns the keys this container cannot store."""
+    from mutagen.id3 import TIT2, TPE1, TALB, TPE2, TRCK, TPOS, TDRC, TCON, TCOM
+    classes = {"TIT2": TIT2, "TPE1": TPE1, "TALB": TALB, "TPE2": TPE2, "TRCK": TRCK,
+               "TPOS": TPOS, "TDRC": TDRC, "TCON": TCON, "TCOM": TCOM}
+    if audio.tags is None:
+        audio.add_tags()
+    skipped = []
+    for key, val in values.items():
+        if key == "comment":
+            _write_id3_comment(audio, val)
+            continue
+        frame = ID3_MAP.get(key)
+        if not frame:
+            skipped.append(key)
+            continue
+        audio.tags.delall(frame)
+        if val != "":
+            audio.tags.add(classes[frame](encoding=3, text=val))
+    audio.save()
+    return skipped
+
+
+def write_tags(path, values):
+    """values: dict field->str. Empty string removes the field.
+    Returns the keys this file's format cannot store (they are not written)."""
+    values = {k: v for k, v in values.items() if k in FIELDS or k in INFO_FIELDS}
+    try:
+        raw = mutagen.File(path)
+    except Exception:
+        raw = None
+    if raw is None:
+        raise ValueError(f"Unsupported file: {path}")
+    if ID3_CONTAINERS and isinstance(raw, ID3_CONTAINERS):
+        return _write_id3_container(raw, values)
+
+    ext = os.path.splitext(path)[1].lower()
+    skipped = []
+    # EasyMP4 has no composer key; ©wrt is the atom every player reads.
+    if ext in (".m4a", ".mp4") and "composer" in values:
+        composer = values.pop("composer")
+        if raw.tags is None:
+            raw.add_tags()
+        if composer:
+            raw.tags["\xa9wrt"] = [composer]
+        else:
+            raw.tags.pop("\xa9wrt", None)
+        raw.save()
+    # EasyID3 has no comment key; write the COMM frame instead.
+    if ext == ".mp3" and "comment" in values:
+        _write_id3_comment(raw, values.pop("comment"))
+        raw.save()
+    if not values:
+        return skipped
+
+    audio = mutagen.File(path, easy=True)
+    if audio is None:
+        raise ValueError(f"Unsupported file: {path}")
+    if audio.tags is None:
+        audio.add_tags()
+    for key, val in values.items():
+        try:
+            if val == "":
+                if key in audio.tags:
+                    del audio.tags[key]
+            else:
+                audio.tags[key] = [val]
+        except (KeyError, ValueError, TypeError):
+            skipped.append(key)
+    audio.save()
+    return skipped
+
+
+# ======================================================================
+# core/extended.py - free-form tags outside the core fields (key/value)
+# ======================================================================
+EXT_MP4_PREFIX = "----:com.apple.iTunes:"
+EXT_HIDDEN_KEYS = {"metadata_block_picture", "coverart", "coverartmime", "coverartdescription"}
+
+
+def _ext_kind(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".mp3", ".wav", ".aiff", ".aif"):
+        return "id3"
+    if ext in (".m4a", ".mp4"):
+        return "mp4"
+    if ext in (".flac", ".ogg", ".opus"):
+        return "vorbis"
+    return None
+
+
+def _ext_is_core(key):
+    low = key.lower()
+    return low in EXT_CORE_KEYS or low.startswith("performer")
+
+
+def _ext_text(values):
+    """First value of a tag list, as text."""
+    if isinstance(values, (list, tuple)):
+        values = values[0] if values else ""
+    if isinstance(values, (bytes, bytearray)):
+        return bytes(values).decode("utf-8", "replace")
+    return str(values)
+
+
+def read_extended(path):
+    """Free-form tags outside the core fields, as {key: text}. Keys keep their case."""
+    kind = _ext_kind(path)
+    if kind is None:
+        return {}
+    try:
+        raw = mutagen.File(path)
+    except Exception:
+        return {}
+    tags = getattr(raw, "tags", None) if raw is not None else None
+    if tags is None:
+        return {}
+    out = {}
+    try:
+        if kind == "id3":
+            for frame in tags.getall("TXXX"):
+                if frame.desc:
+                    out.setdefault(frame.desc, _ext_text(frame.text))
+        elif kind == "mp4":
+            for key, values in tags.items():
+                if key.startswith(EXT_MP4_PREFIX):
+                    out.setdefault(key[len(EXT_MP4_PREFIX):], _ext_text(values))
+        else:
+            for key, value in tags:
+                if not _ext_is_core(key):
+                    out.setdefault(key, _ext_text(value))
+    except Exception:
+        return {}
+    return {k: v for k, v in out.items() if v}
+
+
+def write_extended(path, values):
+    """Store free-form tags {key: text}; an empty text removes the key.
+    Returns the keys this file's format cannot store (they are not written)."""
+    values = {k: v for k, v in values.items() if k}
+    if not values:
+        return []
+    kind = _ext_kind(path)
+    if kind is None:
+        return sorted(values)
+    raw = mutagen.File(path)
+    if raw is None:
+        raise ValueError(f"Unsupported file: {path}")
+    if raw.tags is None:
+        raw.add_tags()
+    skipped = []
+    if kind == "id3":
+        from mutagen.id3 import TXXX
+        for key, text in values.items():
+            raw.tags.delall(f"TXXX:{key}")
+            if text:
+                raw.tags.add(TXXX(encoding=3, desc=key, text=[text]))
+    elif kind == "mp4":
+        from mutagen.mp4 import MP4FreeForm
+        for key, text in values.items():
+            name = EXT_MP4_PREFIX + key
+            if name in raw.tags:
+                del raw.tags[name]
+            if text:
+                raw.tags[name] = [MP4FreeForm(text.encode("utf-8"))]
+    else:
+        for key, text in values.items():
+            try:
+                del raw.tags[key]
+            except KeyError:
+                pass
+            if not text:
+                continue
+            try:
+                raw.tags[key] = [text]
+            except (ValueError, TypeError):
+                skipped.append(key)
+    raw.save()
+    return skipped
+
+
+def _copy_tags(tags):
+    """Copy of a file's tag dict; the free-form sub-dict is copied too."""
+    out = dict(tags)
+    if "ext" in out:
+        out["ext"] = dict(out["ext"])
+    return out
+
+
+def ext_diff(tags, orig):
+    """Free-form changes since the last save: {key: text}, with "" for a removed key."""
+    now, was = tags.get("ext", {}), orig.get("ext", {})
+    return {k: now.get(k, "") for k in set(now) | set(was)
+            if now.get(k, "") != was.get(k, "")}
+
+
+# the picture types ID3 and FLAC store, listed the way mp3tag lists them
+COVER_PICTURE_TYPES = (
+    ("Front Cover", 3), ("Back Cover", 4), ("Other", 0), ("Icon", 1),
+    ("Leaflet", 5), ("Media", 6), ("Lead Artist", 7), ("Artist", 8),
+    ("Conductor", 9), ("Band", 10), ("Composer", 11), ("Lyricist", 12),
+    ("Recording Location", 13), ("During Recording", 14),
+    ("During Performance", 15), ("Video Capture", 16), ("Illustration", 17),
+    ("Band Logotype", 18), ("Publisher Logotype", 19),
+)
+FRONT_COVER = 3
+DEFAULT_COVER_DESC = "Front Cover"
+_COVER_TYPE_NAMES = {num: name for name, num in COVER_PICTURE_TYPES}
+
+
+def cover_type_name(kind):
+    """The name of an ID3/FLAC picture type, as the cover menu lists it."""
+    return _COVER_TYPE_NAMES.get(int(kind or 0), "Other")
+
+
+def write_cover(path, data, cover_type=FRONT_COVER, description=DEFAULT_COVER_DESC):
+    """Replace the file's cover with image bytes, or remove it when data is None.
+
+    `cover_type` is one of the ID3/FLAC picture types and `description` sits next to
+    the picture in those formats. MP4 has no place for either, so it keeps the image
+    only.
+    """
+    kind = _ext_kind(path)
+    if kind is None:
+        raise ValueError("covers are not stored in this format")
+    raw = mutagen.File(path)
+    if raw is None:
+        raise ValueError(f"Unsupported file: {path}")
+    if kind == "id3":
+        from mutagen.id3 import APIC
+        if raw.tags is None:
+            raw.add_tags()
+        raw.tags.delall("APIC")
+        if data:
+            mime = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+            raw.tags.add(APIC(encoding=3, mime=mime, type=cover_type,
+                              desc=description or "", data=data))
+    elif kind == "mp4":
+        from mutagen.mp4 import MP4Cover
+        if raw.tags is None:
+            raw.add_tags()
+        raw.tags.pop("covr", None)
+        if data:
+            fmt = MP4Cover.FORMAT_PNG if data[:8] == b"\x89PNG\r\n\x1a\n" else MP4Cover.FORMAT_JPEG
+            raw.tags["covr"] = [MP4Cover(data, imageformat=fmt)]
+    else:
+        from mutagen.flac import Picture
+        if raw.tags is None:
+            raw.add_tags()
+        if hasattr(raw, "clear_pictures"):
+            raw.clear_pictures()
+            if data:
+                pic = Picture()
+                pic.type = cover_type
+                pic.mime = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+                pic.desc = description or ""
+                pic.data = data
+                raw.add_picture(pic)
+        else:
+            raw.tags.pop("metadata_block_picture", None)
+            if data:
+                pic = Picture()
+                pic.type = cover_type
+                pic.mime = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+                pic.desc = description or ""
+                pic.data = data
+                raw.tags["metadata_block_picture"] = [
+                    base64.b64encode(pic.write()).decode("ascii")]
+    raw.save()
+
+
+# ======================================================================
+# core/replaygain.py - read/write/apply ReplayGain
+# ======================================================================
+RG_FIELDS = ("track_gain", "track_peak", "album_gain", "album_peak")
+RG_TARGET_LUFS = -18.0
+
+
+def _rg_float(value):
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    if hasattr(value, "text"):
+        value = value.text
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else ""
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", str(value))
+    try:
+        return float(m.group(0)) if m else None
+    except ValueError:
+        return None
+
+
+def read_replaygain(path):
+    """ReplayGain values from tags: gains in dB, peaks as linear factors."""
+    out = {k: None for k in RG_FIELDS}
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        return out
+    tags = getattr(audio, "tags", None) if audio is not None else None
+    if tags is None:
+        return out
+    try:
+        items = list(tags.items())
+    except Exception:
+        return out
+    values = {}
+    for key, val in items:
+        name = str(key).lower()
+        if name.startswith("txxx:"):
+            name = name.rsplit(":", 1)[-1]
+        elif ":" in name:
+            name = name.rsplit(":", 1)[-1]
+        if not name.startswith("replaygain_"):
+            continue
+        values[name] = _rg_float(val)
+    for field in RG_FIELDS:
+        key = "replaygain_" + field
+        if key in values:
+            out[field] = values[key]
+    return out
+
+
+def write_replaygain(path, track_gain, track_peak=None, album_gain=None, album_peak=None):
+    """Write REPLAYGAIN_* tags in a format-specific way. Returns True on success."""
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        return False
+    if audio is None:
+        return False
+    wanted = {}
+    if track_gain is not None:
+        wanted["replaygain_track_gain"] = "%+.2f dB" % float(track_gain)
+    if track_peak is not None:
+        wanted["replaygain_track_peak"] = "%.8f" % float(track_peak)
+    if album_gain is not None:
+        wanted["replaygain_album_gain"] = "%+.2f dB" % float(album_gain)
+    if album_peak is not None:
+        wanted["replaygain_album_peak"] = "%.8f" % float(album_peak)
+    if not wanted:
+        return False
+    try:
+        if audio.__class__.__name__ in ("MP4", "MP4Cover"):
+            from mutagen.mp4 import MP4FreeForm
+            for key, value in wanted.items():
+                audio["----:com.apple.iTunes:" + key.upper()] = [
+                    MP4FreeForm(value.encode("utf-8"))]
+            audio.save()
+            return True
+        id3_tags = (getattr(audio, "tags", None) is not None
+                    and audio.tags.__class__.__name__ == "ID3")
+        if id3_tags or (ID3_CONTAINERS and isinstance(audio, ID3_CONTAINERS)):
+            from mutagen.id3 import TXXX
+            if audio.tags is None:
+                audio.add_tags()
+            for key, value in wanted.items():
+                desc = key.upper()
+                audio.tags.delall("TXXX:" + desc)
+                audio.tags.add(TXXX(encoding=3, desc=desc, text=[value]))
+            audio.save()
+            return True
+    except Exception:
+        pass
+    try:
+        audio = mutagen.File(path, easy=True)
+        if audio.tags is None:
+            audio.add_tags()
+        for key, value in wanted.items():
+            audio.tags[key] = [value]
+        audio.save()
+        return True
+    except Exception:
+        return False
+
+
+def replaygain_db(row, mode):
+    """The gain (dB) to apply for one library row in the chosen mode."""
+    if mode not in ("track", "album") or not row:
+        return None
+    if mode == "album":
+        value = row.get("rg_album_gain")
+        return float(value) if value is not None else None
+    value = row.get("rg_track_gain")
+    return float(value) if value is not None else None
+
+
+def replaygain_peak(row, mode):
+    if not row:
+        return None
+    value = row.get("rg_album_peak" if mode == "album" else "rg_track_peak")
+    return float(value) if value is not None else None
+
+
+def replaygain_factor(db, preamp=0.0, peak=None, prevent_clip=True):
+    """Linear volume factor; clips the boost to the peak when asked."""
+    if db is None:
+        return 1.0
+    try:
+        factor = 10.0 ** ((float(db) + float(preamp or 0.0)) / 20.0)
+    except (TypeError, ValueError, OverflowError):
+        return 1.0
+    if prevent_clip and peak and peak > 0:
+        factor = min(factor, 1.0 / float(peak))
+    return max(0.0, min(factor, 8.0))
+
+
+def parse_ebur128(text):
+    """Parse ffmpeg's ebur128 summary into (integrated LUFS, peak dBFS)."""
+    lufs = None
+    peak = None
+    for line in str(text).splitlines():
+        m = re.search(r"I:\s*(-?\d+(?:\.\d+)?)\s*LUFS", line)
+        if m:
+            lufs = float(m.group(1))
+        m = re.search(r"Peak:\s*(-?\d+(?:\.\d+)?)\s*dBFS", line)
+        if m:
+            peak = float(m.group(1))
+    return lufs, peak
+
+
+def measure_album_loudness(paths, cancel=lambda: False):
+    """Integrated loudness of a whole album in one ffmpeg pass, as (LUFS, peak dBFS).
+
+    ffmpeg's concat demuxer feeds the tracks as one programme, so the EBU R128
+    gate sees the album rather than an average of separate track readings. None
+    means the album could not be joined (the caller falls back to track values).
+    """
+    exe = shutil.which("ffmpeg")
+    if not exe or not paths or cancel():
+        return None
+    handle = None
+    try:
+        handle = tempfile.NamedTemporaryFile("w", suffix=".ffconcat", delete=False,
+                                             dir=TMP_DIR, encoding="utf-8")
+        for path in paths:
+            handle.write("file '%s'\n" % path.replace("'", "'\\''"))
+        handle.close()
+        proc = subprocess.run(
+            [exe, "-hide_banner", "-nostats", "-f", "concat", "-safe", "0",
+             "-i", handle.name, "-vn", "-af", "ebur128=peak=true", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=600)
+        lufs, peak = parse_ebur128(proc.stderr)
+        return (lufs, peak) if lufs is not None else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        if handle is not None:
+            try:
+                os.unlink(handle.name)
+            except OSError:
+                pass
+
+
+def analyze_replaygain(paths, target=RG_TARGET_LUFS, progress=None, cancel=lambda: False,
+                       album_groups=None):
+    """Measure loudness with ffmpeg (returns per-path results; ffmpeg is optional).
+
+    album_groups is a list of {"label": str, "paths": [...]} albums. Groups of
+    two or more tracks are measured again as one programme and their album gain
+    and peak are added to every track result from that album.
+    """
+    exe = shutil.which("ffmpeg")
+    results = []
+    if not exe:
+        return results
+    groups = [g for g in (album_groups or []) if len(g.get("paths") or []) > 1]
+    total = len(paths) + len(groups)
+    done = 0
+    by_path = {}
+    for path in paths:
+        if cancel():
+            break
+        try:
+            proc = subprocess.run(
+                [exe, "-hide_banner", "-nostats", "-i", path, "-af", "ebur128=peak=true",
+                 "-f", "null", "-"], capture_output=True, text=True, timeout=300)
+            lufs, peak = parse_ebur128(proc.stderr)
+        except (OSError, subprocess.SubprocessError):
+            lufs, peak = None, None
+        if lufs is None:
+            continue
+        peak_linear = 10.0 ** (peak / 20.0) if peak is not None else None
+        item = {"path": path, "gain": target - lufs, "peak": peak_linear}
+        results.append(item)
+        by_path[path] = item
+        done += 1
+        if progress:
+            progress(done, total, os.path.basename(path))
+    for group in groups:
+        if cancel():
+            break
+        paths_in_group = group.get("paths") or []
+        measured = measure_album_loudness(paths_in_group, cancel)
+        if measured is not None:
+            album_gain = target - measured[0]
+            album_peak = 10.0 ** (measured[1] / 20.0) if measured[1] is not None else None
+        else:
+            items = [by_path[p] for p in paths_in_group if p in by_path]
+            if not items:
+                continue
+            # The album could not be joined: the average track gain is a reasonable
+            # stand-in, and the highest peak still describes the album.
+            album_gain = sum(x["gain"] for x in items) / len(items)
+            peaks = [x["peak"] for x in items if x["peak"] is not None]
+            album_peak = max(peaks) if peaks else None
+        for path in paths_in_group:
+            item = by_path.get(path)
+            if item is not None:
+                item["album_gain"] = album_gain
+                item["album_peak"] = album_peak
+        done += 1
+        if progress:
+            progress(done, total, "Album: " + str(group.get("label") or ""))
+    return results
+
+
+# ======================================================================
+# core/online.py - MusicBrainz + Cover Art Archive (no API key needed)
+# ======================================================================
+MB_UA = f"{APP_NAME}/{VERSION} ( https://github.com/spectra-player/spectra )"
+MB_ROOT = "https://musicbrainz.org/ws/2"
+CAA_ROOT = "https://coverartarchive.org"
+
+# MusicBrainz allows one request per second per client. The search dialog and the
+# cover preview can fire close together, so every WS/2 call goes through this gate.
+MB_MIN_INTERVAL = 1.05
+MB_RETRY_DELAY = 2.0
+_MB_PACE_LOCK = threading.Lock()
+_MB_LAST_CALL = [0.0]
+
+
+def http_get(url, timeout=10, accept="application/json"):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": MB_UA,
+        "Accept": accept,
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read()
+
+
+def _mb_pace():
+    """Keep at least MB_MIN_INTERVAL between MusicBrainz requests."""
+    with _MB_PACE_LOCK:
+        wait = MB_MIN_INTERVAL - (time.monotonic() - _MB_LAST_CALL[0])
+        if wait > 0:
+            time.sleep(wait)
+        _MB_LAST_CALL[0] = time.monotonic()
+
+
+def _retry_after(exc):
+    """Seconds to wait before retrying a failed MusicBrainz request."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            value = (exc.headers or {}).get("Retry-After")
+            if value:
+                return max(1.0, min(30.0, float(value)))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return MB_RETRY_DELAY
+
+
+def mb_get(url, timeout=10, attempts=4):
+    """GET a MusicBrainz URL, pacing requests and retrying 429/5xx answers.
+
+    MusicBrainz answers 503 when a client exceeds one request per second (or when
+    its own workers are saturated). Retrying turns that into a working lookup
+    instead of a dead dialog.
+    """
+    last = None
+    for attempt in range(attempts):
+        _mb_pace()
+        try:
+            return http_get(url, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            last = exc
+            if exc.code not in (429, 500, 502, 503, 504):
+                raise
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last = exc
+        if attempt + 1 < attempts:
+            time.sleep(_retry_after(last))
+    raise last
+
+
+def mb_error_text(exc):
+    """A short, actionable message for a failed MusicBrainz request."""
+    text = str(exc or "")
+    if "HTTP Error 503" in text:
+        return ("MusicBrainz is busy or rate-limiting this connection (HTTP 503). "
+                "Wait a few seconds and press Search again.")
+    if "HTTP Error 429" in text:
+        return "MusicBrainz asked us to slow down (HTTP 429). Try again in a minute."
+    if "HTTP Error 404" in text:
+        return "MusicBrainz has no such release (HTTP 404)."
+    if "timed out" in text.lower():
+        return "MusicBrainz did not answer in time. Check the connection and try again."
+    lines = text.strip().splitlines()
+    return lines[-1] if lines else "unknown error"
+
+
+def _mb_artist(entity):
+    credit = entity.get("artist-credit") or []
+    names = []
+    for part in credit:
+        if isinstance(part, dict):
+            names.append(str(part.get("name") or (part.get("artist") or {}).get("name")
+                             or part.get("joinphrase") or ""))
+    return "".join(names).strip()
+
+
+def parse_mb_releases(payload):
+    """MusicBrainz release-search JSON -> a small list of candidates."""
+    out = []
+    for rel in (payload or {}).get("releases") or []:
+        groups = rel.get("release-group") or {}
+        labels = []
+        for info in rel.get("label-info") or []:
+            name = ((info or {}).get("label") or {}).get("name")
+            if name:
+                labels.append(name)
+        out.append({
+            "id": rel.get("id") or "",
+            "title": rel.get("title") or "",
+            "artist": _mb_artist(rel),
+            "date": (rel.get("date") or "")[:10],
+            "country": rel.get("country") or "",
+            "tracks": int(rel.get("track-count") or 0),
+            "type": groups.get("primary-type") or "",
+            "labels": labels,
+            "score": int(rel.get("score") or 0),
+        })
+    return out
+
+
+def parse_mb_release(payload):
+    """Release JSON -> album metadata plus the ordered track list."""
+    payload = payload or {}
+    media = payload.get("media") or []
+    tracks = []
+    for medium in media:
+        disc = medium.get("position") or 1
+        for track in medium.get("tracks") or []:
+            tracks.append({
+                "position": track.get("number") or str(len(tracks) + 1),
+                "disc": disc,
+                "title": track.get("title") or "",
+                "length": int(track.get("length") or 0),
+            })
+    genres = [g.get("name") for g in (payload.get("genres") or []) if g.get("name")]
+    if not genres:
+        genres = [g.get("name") for g in (payload.get("tags") or []) if g.get("name")]
+    labels = [((info or {}).get("label") or {}).get("name")
+              for info in payload.get("label-info") or []]
+    return {
+        "id": payload.get("id") or "",
+        "title": payload.get("title") or "",
+        "artist": _mb_artist(payload),
+        "date": (payload.get("date") or "")[:10],
+        "country": payload.get("country") or "",
+        "labels": [x for x in labels if x],
+        "genres": [x for x in genres if x][:4],
+        "tracks": tracks,
+    }
+
+
+def mb_search_releases(artist, album, limit=10, timeout=10):
+    """Search releases, falling back to a shorter album title when needed.
+
+    MusicBrainz tokenises "Album (Subtitle)" into a phrase, so a release stored
+    simply as "Album" never matches the full tag. Trying the part before the
+    bracket finds it. We do not fall back to artist-only results: a list of
+    unrelated albums is worse than saying nothing was found.
+    """
+    artist = (artist or "").replace('"', "").strip()
+    album = (album or "").replace('"', "").strip()
+    titles = []
+    if album:
+        titles.append(album)
+        base = re.split(r"\s*[\(\[]", album, maxsplit=1)[0].strip(" -–—")
+        if base and base.lower() != album.lower():
+            titles.append(base)
+    queries = []
+    for title in titles:
+        if artist:
+            queries.append('artist:"%s" AND release:"%s"' % (artist, title))
+        queries.append('release:"%s"' % title)
+    if artist and not album:
+        queries.append('artist:"%s"' % artist)
+    seen = set()
+    for query in queries:
+        if query in seen:
+            continue
+        seen.add(query)
+        url = "%s/release/?query=%s&fmt=json&limit=%d" % (
+            MB_ROOT, urllib.parse.quote(query), int(limit))
+        results = parse_mb_releases(json.loads(mb_get(url, timeout=timeout)))
+        if results:
+            return results
+    return []
+
+
+def mb_release(mbid, timeout=10):
+    url = "%s/release/%s?inc=recordings+labels+genres+artist-credits&fmt=json" % (
+        MB_ROOT, urllib.parse.quote(str(mbid)))
+    return parse_mb_release(json.loads(mb_get(url, timeout=timeout)))
+
+
+def caa_front_url(mbid, size=500):
+    return "%s/release/%s/front-%d" % (CAA_ROOT, urllib.parse.quote(str(mbid)), int(size))
+
+
+def _cover_cache_path(mbid, size):
+    folder = COVERS_DIR
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        return ""
+    digest = hashlib.sha1(("%s|%s" % (mbid, size)).encode("utf-8")).hexdigest()
+    return os.path.join(folder, digest + ".img")
+
+
+def mb_cover_bytes(mbid, size=500, timeout=15):
+    """Front cover from the Cover Art Archive, cached and retried once."""
+    cache = _cover_cache_path(mbid, size)
+    if cache and os.path.isfile(cache):
+        try:
+            with open(cache, "rb") as f:
+                data = f.read()
+            if data:
+                return data
+        except OSError:
+            pass
+    last = None
+    for attempt in range(2):
+        try:
+            data = http_get(caa_front_url(mbid, size), timeout=timeout,
+                            accept="image/jpeg,image/png,image/*")
+        except urllib.error.HTTPError as exc:
+            last = exc
+            if exc.code == 404:
+                raise
+        except (urllib.error.URLError, OSError) as exc:
+            last = exc
+        else:
+            if data:
+                if cache:
+                    try:
+                        with open(cache, "wb") as f:
+                            f.write(data)
+                    except OSError:
+                        pass
+                return data
+        time.sleep(0.8)
+    if last is not None:
+        raise last
+    raise LookupError("Cover Art Archive returned no image")
+
+
+def read_cover(path):
+    """Return embedded cover bytes, or a folder image, or None."""
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        audio = None
+    if audio is not None:
+        pics = getattr(audio, "pictures", None)
+        if pics:
+            return pics[0].data
+        tags = audio.tags
+        if tags is not None:
+            try:
+                for k in list(tags.keys()):
+                    if str(k).startswith("APIC"):
+                        return tags[k].data
+                if "covr" in tags:
+                    return bytes(tags["covr"][0])
+                if "metadata_block_picture" in tags:
+                    from mutagen.flac import Picture
+                    return Picture(base64.b64decode(tags["metadata_block_picture"][0])).data
+            except Exception:
+                pass
+    folder = os.path.dirname(path)
+    for name in COVER_NAMES:
+        p = os.path.join(folder, name)
+        if os.path.isfile(p):
+            try:
+                with open(p, "rb") as f:
+                    return f.read()
+            except OSError:
+                pass
+    return None
+
+
+def read_cover_details(path):
+    """(bytes, picture type, description) of a file's cover.
+
+    A folder image stands in when the file carries no picture of its own; it has no
+    type or description stored anywhere, so it is reported as a front cover.
+    """
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        audio = None
+    if audio is not None:
+        try:
+            pics = getattr(audio, "pictures", None)
+            if pics:
+                pic = pics[0]
+                return (pic.data, int(getattr(pic, "type", FRONT_COVER) or 0),
+                        str(getattr(pic, "desc", "") or ""))
+            tags = audio.tags
+            if tags is not None:
+                for k in list(tags.keys()):
+                    if str(k).startswith("APIC"):
+                        frame = tags[k]
+                        return (frame.data, int(getattr(frame, "type", FRONT_COVER) or 0),
+                                str(getattr(frame, "desc", "") or ""))
+                if "covr" in tags:
+                    return bytes(tags["covr"][0]), FRONT_COVER, DEFAULT_COVER_DESC
+                if "metadata_block_picture" in tags:
+                    from mutagen.flac import Picture
+                    pic = Picture(base64.b64decode(tags["metadata_block_picture"][0]))
+                    return (pic.data, int(pic.type or 0), str(pic.desc or ""))
+        except Exception:
+            pass
+    folder = os.path.dirname(path)
+    for name in COVER_NAMES:
+        p = os.path.join(folder, name)
+        if os.path.isfile(p):
+            try:
+                with open(p, "rb") as f:
+                    return f.read(), FRONT_COVER, DEFAULT_COVER_DESC
+            except OSError:
+                pass
+    return None, FRONT_COVER, DEFAULT_COVER_DESC
+
+
+def _image_mime(data):
+    """Name a cover image from its first bytes (the tag formats do not carry a mime type)."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return "image"
+
+
+def spec_parts(specs):
+    """[FLAC] [24-bit / 96.0 kHz] [984 kbps] pill contents for the player bar."""
+    parts = []
+    ft = specs.get("filetype") or ""
+    if ft:
+        parts.append(ft)
+    rate = specs.get("sample_rate") or 0
+    depth = specs.get("bits_per_sample") or 0
+    if rate:
+        bits = f"{depth}-bit / " if depth else ""
+        parts.append(f"{bits}{rate / 1000:.1f} kHz")
+    elif depth:
+        parts.append(f"{depth}-bit")
+    br = specs.get("bitrate") or 0
+    if br:
+        parts.append(f"{round(br / 1000)} kbps")
+    return parts
+
+
+def fmt_specs(specs, sep=" · "):
+    return sep.join(spec_parts(specs))
+
+
+def trash_path(path):
+    """Move a file into the app's trash folder inside DATA_ROOT."""
+    path = os.path.abspath(path)
+    trash = os.path.join(DATA_ROOT, "trash")
+    files_dir = os.path.join(trash, "files")
+    info_dir = os.path.join(trash, "info")
+    os.makedirs(files_dir, exist_ok=True)
+    os.makedirs(info_dir, exist_ok=True)
+    name = os.path.basename(path)
+    stem, ext = os.path.splitext(name)
+    n = 1
+    while (os.path.exists(os.path.join(files_dir, name))
+           or os.path.exists(os.path.join(info_dir, name + ".trashinfo"))):
+        n += 1
+        name = "%s.%d%s" % (stem, n, ext)
+    info_file = os.path.join(info_dir, name + ".trashinfo")
+    with open(info_file, "w", encoding="utf-8") as f:
+        f.write("[Trash Info]\nPath=%s\nDeletionDate=%s\n"
+                % (quote(path, safe="/"), time.strftime("%Y-%m-%dT%H:%M:%S")))
+    try:
+        shutil.move(path, os.path.join(files_dir, name))
+    except Exception:
+        try:
+            os.remove(info_file)
+        except OSError:
+            pass
+        raise
+    return os.path.join(files_dir, name)
+
+
+def fmt_human_size(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+# ---------- mp3tag-style format strings: %artist% - %title% ----------
+_PLACEHOLDER = re.compile(r"%(\w+)%")
+_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def tags_from_filename(filename, pattern):
+    """Parse a filename (no extension) using a pattern like '%tracknumber% - %title%'."""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    regex, fields, pos = "", [], 0
+    for m in _PLACEHOLDER.finditer(pattern):
+        regex += re.escape(pattern[pos:m.start()])
+        regex += "(.+?)"
+        fields.append(m.group(1).lower())
+        pos = m.end()
+    regex += re.escape(pattern[pos:])
+    m = re.fullmatch(regex, stem)
+    if not m:
+        return None
+    return {f: v.strip() for f, v in zip(fields, m.groups()) if f in FIELDS}
+
+
+def filename_from_tags(tags, pattern, ext):
+    def sub(m):
+        key = m.group(1).lower()
+        val = str(tags.get(key, "") or "")
+        if key in ("tracknumber", "discnumber"):
+            val = val.split("/")[0]
+            if key == "tracknumber" and val.isdigit():
+                val = val.zfill(2)
+        return _BAD_CHARS.sub("_", val).strip()
+    name = _PLACEHOLDER.sub(sub, pattern).strip().rstrip(".")
+    return (name or "untitled") + ext
+# ======================================================================
+# core/library.py
+# ======================================================================
+DB_FILE = os.path.join(LIBRARY_DIR, "library.db")
+
+# extra tags Strawberry can group/filter by, plus the user's own rating state
+INFO_FIELDS = ["comment", "grouping", "performer"]
+STAT_FIELDS = ["rating", "loved", "skipcount"]
+RG_COLS = ["rg_track_gain", "rg_track_peak", "rg_album_gain", "rg_album_peak"]
+EXT_CORE_KEYS = {k.lower() for k in FIELDS + INFO_FIELDS} | EXT_HIDDEN_KEYS
+
+TRACK_COLS = (["path", "mtime", "added", "play_count", "last_played"] + FIELDS +
+              ["length", "sample_rate", "bits_per_sample", "bitrate", "channels", "filetype"] +
+              INFO_FIELDS + STAT_FIELDS + RG_COLS)
+
+SCHEMA_COLS = {"path": "TEXT PRIMARY KEY", "mtime": "REAL", "added": "REAL",
+               "play_count": "INTEGER DEFAULT 0", "last_played": "REAL", "length": "REAL",
+               "sample_rate": "INTEGER", "bits_per_sample": "INTEGER", "bitrate": "INTEGER",
+               "channels": "INTEGER", "filetype": "TEXT",
+               "rating": "INTEGER DEFAULT 0", "loved": "INTEGER DEFAULT 0",
+               "skipcount": "INTEGER DEFAULT 0"}
+SCHEMA_COLS.update({col: "REAL" for col in RG_COLS})
+SCHEMA_COLS.update({f: "TEXT" for f in FIELDS})
+SCHEMA_COLS.update({f: "TEXT" for f in INFO_FIELDS})
+
+# columns that survive a rescan / re-tag
+KEEP_ON_UPDATE = ("path", "added", "play_count", "last_played",
+                  "rating", "loved", "skipcount")
+
+
+class Library:
+    """SQLite catalogue with stream specs and play statistics."""
+
+    def __init__(self, db_file=DB_FILE):
+        self.db_file = db_file
+        self._lock = threading.Lock()
+        self._migrate()
+
+    def set_db_file(self, db_file):
+        """Switch this catalogue to another collection database."""
+        with self._lock:
+            self.db_file = db_file
+        self._migrate()
+
+    def _conn(self):
+        return sqlite3.connect(self.db_file, timeout=20)
+
+    def _migrate(self):
+        with self._lock, self._conn() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS tracks (path TEXT PRIMARY KEY)")
+            have = {row[1] for row in c.execute("PRAGMA table_info(tracks)")}
+            upgrading = "filetype" not in have
+            for col, decl in SCHEMA_COLS.items():
+                if col not in have:
+                    try:
+                        c.execute(f"ALTER TABLE tracks ADD COLUMN {col} {decl}")
+                    except sqlite3.OperationalError:
+                        pass
+            if upgrading and "length" in have:
+                # v2 rows carry no stream specs: backfill "added" from the file time,
+                # then force the next scan to re-read them (mtime NULL never matches).
+                c.execute("UPDATE tracks SET added = COALESCE(added, mtime, "
+                          "CAST(strftime('%s','now') AS REAL))")
+                c.execute("UPDATE tracks SET mtime = NULL")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album)")
+            version = c.execute("PRAGMA user_version").fetchone()[0]
+            if version < 1:
+                # older builds called every .m4a ALAC from its extension alone;
+                # clear their mtime so the next scan reads the real codec
+                c.execute("UPDATE tracks SET mtime=NULL WHERE lower(filetype)='alac' "
+                          "AND (path LIKE '%.m4a' OR path LIKE '%.mp4' OR path LIKE '%.alac')")
+                c.execute("PRAGMA user_version=1")
+                version = 1
+            if version < 2:
+                # 0.47 and earlier asked mutagen for the codec, which reported
+                # ALAC for AAC-in-M4A. Re-read the sample entry of every MP4 row.
+                c.execute("UPDATE tracks SET mtime=NULL, filetype=NULL "
+                          "WHERE (path LIKE '%.m4a' OR path LIKE '%.mp4' OR path LIKE '%.alac')")
+                c.execute("PRAGMA user_version=2")
+
+    # ---------- writing ----------
+    @staticmethod
+    def _row(path, tags, specs, mtime, added=None):
+        row = {col: None for col in TRACK_COLS}
+        row.update({f: tags.get(f, "") for f in FIELDS})
+        row.update({f: tags.get(f, "") for f in INFO_FIELDS})
+        row["path"] = path
+        row["rating"] = 0
+        row["loved"] = 0
+        row["skipcount"] = 0
+        row["mtime"] = mtime
+        row["added"] = added if added is not None else time.time()
+        row["play_count"] = 0
+        row["last_played"] = None
+        row["length"] = float(specs.get("length") or tags.get("length") or 0)
+        for k in ("sample_rate", "bits_per_sample", "bitrate", "channels"):
+            row[k] = int(specs.get(k) or 0)
+        row["filetype"] = specs.get("filetype") or filetype(path)
+        rg = read_replaygain(path)
+        for field in RG_FIELDS:
+            row["rg_" + field] = rg.get(field)
+        return row
+
+    def _upsert(self, c, row, added=None):
+        cols = TRACK_COLS
+        updates = ", ".join(f"{col}=excluded.{col}" for col in cols if col not in KEEP_ON_UPDATE)
+        c.execute(
+            f"INSERT INTO tracks ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
+            f"ON CONFLICT(path) DO UPDATE SET {updates}, "
+            f"added=COALESCE(tracks.added, excluded.added)",
+            [row[col] for col in cols])
+
+    def scan(self, folders, progress=None, cancel=lambda: False):
+        """Incremental scan. progress(done, total, path)."""
+        files = []
+        for folder in folders:
+            if not os.path.isdir(folder):
+                continue
+            for root, _dirs, names in os.walk(folder):
+                files.extend(os.path.join(root, n) for n in names if is_audio(n))
+        with self._lock, self._conn() as c:
+            known = dict(c.execute("SELECT path, mtime FROM tracks"))
+            seen = set()
+            for i, path in enumerate(files):
+                if cancel():
+                    return
+                seen.add(path)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if known.get(path) == mtime:
+                    continue
+                tags = read_tags(path)
+                tags.update(read_extra_tags(path))
+                specs = read_specs(path)
+                row = self._row(path, tags, specs, mtime)
+                self._upsert(c, row)
+                if progress and i % 10 == 0:
+                    progress(i, len(files), path)
+            gone = [p for p in known if p not in seen]
+            c.executemany("DELETE FROM tracks WHERE path=?", [(p,) for p in gone])
+        if progress:
+            progress(len(files), len(files), "")
+
+    def update_track(self, path):
+        tags = read_tags(path)
+        tags.update(read_extra_tags(path))
+        specs = read_specs(path)
+        row = self._row(path, tags, specs, os.path.getmtime(path))
+        with self._lock, self._conn() as c:
+            self._upsert(c, row)
+
+    def forget(self, path):
+        """Drop a row (used when a file is renamed)."""
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM tracks WHERE path=?", (path,))
+
+    def forget_prefix(self, folder):
+        """Drop every row below `folder` (used when a music folder is removed)."""
+        folder = os.path.abspath(folder)
+        prefix = folder.rstrip(os.sep) + os.sep
+        with self._lock, self._conn() as c:
+            paths = [r[0] for r in c.execute("SELECT path FROM tracks")]
+            gone = [p for p in paths if p == folder or p.startswith(prefix)]
+            c.executemany("DELETE FROM tracks WHERE path=?", [(p,) for p in gone])
+        return len(gone)
+
+    def play_count(self, path):
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE tracks SET play_count=COALESCE(play_count,0)+1, last_played=? "
+                      "WHERE path=?", (time.time(), path))
+
+    def reset_play_counts(self):
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE tracks SET play_count=0, last_played=NULL")
+
+    def increment_skip(self, path):
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE tracks SET skipcount=COALESCE(skipcount,0)+1 WHERE path=?",
+                      (path,))
+
+    def set_rating(self, paths, rating):
+        rating = max(0, min(5, int(rating)))
+        with self._lock, self._conn() as c:
+            c.executemany("UPDATE tracks SET rating=? WHERE path=?",
+                          [(rating, p) for p in paths])
+
+    def set_loved(self, paths, loved):
+        with self._lock, self._conn() as c:
+            c.executemany("UPDATE tracks SET loved=? WHERE path=?",
+                          [(1 if loved else 0, p) for p in paths])
+
+    def remove_paths(self, paths):
+        """Forget rows without touching the files on disk."""
+        with self._lock, self._conn() as c:
+            c.executemany("DELETE FROM tracks WHERE path=?", [(p,) for p in paths])
+
+    def delete_paths(self, paths, to_trash=True):
+        """Delete the files (to the trash by default) and drop their rows.
+
+        Returns (removed_paths, failures) where failures is [(path, message)].
+        """
+        removed, failed = [], []
+        for path in paths:
+            try:
+                if to_trash:
+                    trash_path(path)
+                else:
+                    os.remove(path)
+                removed.append(path)
+            except OSError as exc:
+                failed.append((path, str(exc)))
+        if removed:
+            self.remove_paths(removed)
+        return removed, failed
+
+    def set_replaygain(self, path, track_gain=None, track_peak=None,
+                       album_gain=None, album_peak=None):
+        with self._lock, self._conn() as c:
+            c.execute("UPDATE tracks SET rg_track_gain=?, rg_track_peak=?, "
+                      "rg_album_gain=?, rg_album_peak=? WHERE path=?",
+                      (track_gain, track_peak, album_gain, album_peak, path))
+
+    def set_replaygain_many(self, entries):
+        """Update several tracks' ReplayGain fields in one transaction."""
+        if not entries:
+            return
+        with self._lock, self._conn() as c:
+            c.executemany("UPDATE tracks SET rg_track_gain=?, rg_track_peak=?, "
+                          "rg_album_gain=?, rg_album_peak=? WHERE path=?", entries)
+
+    def set_comment(self, paths, text):
+        with self._lock, self._conn() as c:
+            c.executemany("UPDATE tracks SET comment=? WHERE path=?",
+                          [(text, p) for p in paths])
+
+    def duplicate_groups(self, fields=("albumartist", "album", "title")):
+        """Groups of rows sharing the chosen fields (Strawberry's duplicate finder)."""
+        groups = {}
+        for row in self.tracks():
+            key = tuple((row.get(f) or "").strip().lower() for f in fields)
+            if not any(key):
+                continue
+            groups.setdefault(key, []).append(row)
+        return [g for g in groups.values() if len(g) > 1]
+
+    def stats(self):
+        rows = self.tracks()
+        artists = {(r["albumartist"] or r["artist"] or "").strip().lower()
+                   for r in rows} - {""}
+        albums = {(r["album"] or "").strip().lower() for r in rows} - {""}
+        return {"tracks": len(rows), "artists": len(artists), "albums": len(albums),
+                "length": sum(float(r["length"] or 0) for r in rows),
+                "plays": sum(int(r["play_count"] or 0) for r in rows),
+                "size": sum(os.path.getsize(r["path"]) for r in rows
+                            if os.path.isfile(r["path"]))}
+
+    def folder_stats(self, folders):
+        """Per-folder counts for the music-folders page, keyed by the configured path.
+
+        A track is counted once, for the deepest configured folder that holds it, so
+        nested folders do not inflate the totals.
+        """
+        entries = []
+        for folder in folders:
+            base = os.path.abspath(folder).rstrip(os.sep) + os.sep
+            entries.append((folder, base, {"tracks": 0, "length": 0.0,
+                                           "albums": set(), "artists": set()}))
+        entries.sort(key=lambda e: len(e[1]), reverse=True)
+        for row in self.tracks():
+            path = row["path"] or ""
+            for _folder, prefix, acc in entries:
+                if not path.startswith(prefix):
+                    continue
+                acc["tracks"] += 1
+                acc["length"] += float(row["length"] or 0)
+                album = (row["album"] or "").strip().lower()
+                if album:
+                    acc["albums"].add(album)
+                artist = (row["albumartist"] or row["artist"] or "").strip().lower()
+                if artist:
+                    acc["artists"].add(artist)
+                break
+        return {folder: {"tracks": acc["tracks"], "length": acc["length"],
+                         "albums": len(acc["albums"]), "artists": len(acc["artists"]),
+                         "missing": not os.path.isdir(folder)}
+                for folder, _prefix, acc in entries}
+
+    # ---------- reading ----------
+    def tracks(self, search="", where="", args=(), order_by=None, limit=None):
+        sql = f"SELECT {', '.join(TRACK_COLS)} FROM tracks"
+        conds, params = [], list(args)
+        if search:
+            like = f"%{search}%"
+            conds.append("(title LIKE ? OR artist LIKE ? OR album LIKE ? OR albumartist LIKE ? "
+                         "OR genre LIKE ? OR composer LIKE ?)")
+            params += [like] * 6
+        if where:
+            conds.append(f"({where})")
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        if order_by:
+            sql += f" ORDER BY {order_by}"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        try:
+            with self._conn() as c:
+                rows = [dict(zip(TRACK_COLS, r)) for r in c.execute(sql, params)]
+        except sqlite3.Error:
+            return []
+        if not order_by:
+            def num(value):
+                try:
+                    return int(str(value).split("/")[0])
+                except (TypeError, ValueError):
+                    return 0
+            rows.sort(key=lambda r: ((r["albumartist"] or r["artist"] or "").lower(),
+                                     (r["album"] or "").lower(), num(r["discnumber"]),
+                                     num(r["tracknumber"]), r["path"]))
+        return rows
+
+    def by_path(self):
+        with self._conn() as c:
+            return {r[0]: dict(zip(TRACK_COLS, r)) for r in
+                    c.execute(f"SELECT {', '.join(TRACK_COLS)} FROM tracks")}
+
+    def count(self):
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+
+
+# ======================================================================
+# core/filter.py - the Strawberry collection filter language
+# ======================================================================
+# `artist:aphex`, `album:"Selected Ambient Works"`, `bitrate:>320k`,
+# `year:>=1990 year:<=1999`, `rating:>=4`, `-genre:pop`, `artist:x OR album:y`
+class FilterError(ValueError):
+    pass
+
+
+# field -> (sql expression, kind)
+FILTER_FIELDS = {
+    "title": ("title", "text"),
+    "artist": ("artist", "text"),
+    "albumartist": ("albumartist", "text"),
+    "album": ("album", "text"),
+    "composer": ("composer", "text"),
+    "performer": ("performer", "text"),
+    "grouping": ("grouping", "text"),
+    "genre": ("genre", "text"),
+    "comment": ("comment", "text"),
+    "format": ("filetype", "text"),
+    "filetype": ("filetype", "text"),
+    "filename": ("path", "path"),
+    "path": ("path", "path"),
+    "url": ("path", "path"),
+    "track": ("CAST(tracknumber AS INTEGER)", "number"),
+    "tracknumber": ("CAST(tracknumber AS INTEGER)", "number"),
+    "disc": ("CAST(discnumber AS INTEGER)", "number"),
+    "discnumber": ("CAST(discnumber AS INTEGER)", "number"),
+    "year": ("CAST(substr(date, 1, 4) AS INTEGER)", "number"),
+    "date": ("CAST(substr(date, 1, 4) AS INTEGER)", "number"),
+    "samplerate": ("sample_rate", "number"),
+    "bitdepth": ("bits_per_sample", "number"),
+    "bitrate": ("bitrate", "number"),
+    "length": ("length", "duration"),
+    "playcount": ("play_count", "number"),
+    "skipcount": ("skipcount", "number"),
+    "rating": ("rating", "number"),
+    "loved": ("loved", "number"),
+    "added": ("added", "number"),
+    "lastplayed": ("last_played", "number"),
+}
+FILTER_HELP = ("Filter with field:value terms, e.g.\n"
+               "  artist:aphex   album:\"Selected Ambient Works\"\n"
+               "  year:>=1990 year:<=1999   bitrate:>320k   rating:>=4\n"
+               "  -genre:pop   artist:boards OR artist:aphex\n\n"
+               "Fields: " + ", ".join(sorted(FILTER_FIELDS)) +
+               "\nOperators: : = != < > <= >=   use \"quotes\" for spaces.")
+
+SEARCH_COLUMNS = ("title", "artist", "albumartist", "album", "composer",
+                  "performer", "grouping", "comment", "genre")
+
+_FIELD_TERM = re.compile(r"^([A-Za-z_]+?)(!=|>=|<=|=|:|>|<)(.*)$", re.S)
+_NUM_SUFFIX = re.compile(r"^(.*?)([kKmM])$")
+
+
+def _filter_like(value):
+    return "%" + value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _unquote(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return value
+
+
+def _filter_tokens(text):
+    """Split into ( ) - AND OR and quoted words, keeping `field:"a b"` together."""
+    tokens, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "()":
+            tokens.append(ch)
+            i += 1
+            continue
+        if ch == "-":
+            tokens.append("-")
+            i += 1
+            continue
+        buf, quoted = [], False
+        while i < n:
+            c = text[i]
+            if c == '"':
+                quoted = not quoted
+                buf.append(c)
+                i += 1
+                continue
+            if not quoted and (c.isspace() or c in "()"):
+                break
+            buf.append(c)
+            i += 1
+        if quoted:
+            raise FilterError("unbalanced quote")
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _parse_filter_number(value, kind, field):
+    value = value.strip()
+    if field == "rating" and value.lower() in ("unrated", "none", "0"):
+        return 0.0
+    if kind == "duration" and ":" in value:
+        try:
+            total = 0.0
+            for part in value.split(":"):
+                total = total * 60 + float(part)
+            return total
+        except ValueError:
+            raise FilterError(f"not a duration: {value!r}")
+    multiplier = 1
+    m = _NUM_SUFFIX.match(value)
+    if m and field in ("bitrate", "samplerate", "size"):
+        value, multiplier = m.group(1), (1000 if m.group(2).lower() == "k" else 1000000)
+    try:
+        return float(value) * multiplier
+    except ValueError:
+        raise FilterError(f"not a number: {value!r}")
+
+
+def _filter_term_sql(token):
+    """One term -> (sql, params). Unknown fields fall back to a plain search."""
+    m = _FIELD_TERM.match(token)
+    if m:
+        field = m.group(1).lower()
+        op = m.group(2)
+        value = _unquote(m.group(3))
+        if op == ":":  # Strawberry writes the comparison after the colon: bitrate:>320k
+            for candidate in (">=", "<=", "!=", ">", "<", "="):
+                if value.startswith(candidate):
+                    op, value = candidate, value[len(candidate):]
+                    break
+        if field in FILTER_FIELDS and value != "":
+            column, kind = FILTER_FIELDS[field]
+            if kind == "text" or kind == "path":
+                if kind == "path":
+                    return f"{column} LIKE ? ESCAPE '\\'", [_filter_like(value)]
+                if op in (":", "="):
+                    return f"{column} LIKE ? ESCAPE '\\'", [_filter_like(value)]
+                if op == "!=":
+                    return (f"({column} IS NULL OR {column} NOT LIKE ? ESCAPE '\\')",
+                            [_filter_like(value)])
+                return f"{column} COLLATE NOCASE {op} ?", [value]
+            number = _parse_filter_number(value, kind, field)
+            if field == "rating" and op in (":", "=") and number == 0:
+                return f"COALESCE({column}, 0) = 0", []
+            sql_op = "=" if op == ":" else op
+            return f"COALESCE({column}, 0) {sql_op} ?", [number]
+    # plain word: match any of the text columns, like Strawberry's default search
+    like = _filter_like(_unquote(token))
+    sql = "(" + " OR ".join(f"{col} LIKE ? ESCAPE '\\'" for col in SEARCH_COLUMNS) + ")"
+    return sql, [like] * len(SEARCH_COLUMNS)
+
+
+def parse_filter(text):
+    """Turn a Strawberry-style query into (where_sql, params).
+
+    Raises FilterError for unbalanced quotes/parentheses or bad numbers;
+    callers can fall back to a plain search when that happens.
+    """
+    tokens = _filter_tokens(text or "")
+    if not tokens:
+        return "", []
+
+    pos = [0]
+
+    def peek():
+        return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+    def take():
+        token = peek()
+        pos[0] += 1
+        return token
+
+    def parse_or():
+        sql, params = parse_and()
+        while peek() == "OR":
+            take()
+            other, other_params = parse_and()
+            sql, params = f"({sql} OR {other})", params + other_params
+        return sql, params
+
+    def parse_and():
+        sql, params = parse_unary()
+        while True:
+            token = peek()
+            if token in (None, ")", "OR"):
+                break
+            if token == "AND":
+                take()
+                if peek() in (None, ")", "OR"):
+                    break
+            other, other_params = parse_unary()
+            sql, params = f"({sql} AND {other})", params + other_params
+        return sql, params
+
+    def parse_unary():
+        token = peek()
+        if token is None:
+            raise FilterError("query ended early")
+        if token == "-":
+            take()
+            sql, params = parse_unary()
+            return f"NOT ({sql})", params
+        if token == "(":
+            take()
+            sql, params = parse_or()
+            if peek() != ")":
+                raise FilterError("missing closing parenthesis")
+            take()
+            return sql, params
+        if token == ")":
+            raise FilterError("unexpected closing parenthesis")
+        take()
+        return _filter_term_sql(token)
+
+    where, params = parse_or()
+    if pos[0] < len(tokens):
+        raise FilterError(f"unexpected {tokens[pos[0]]!r}")
+    return where, params
+
+
+# ======================================================================
+# core/smart.py - dynamic playlists ("smart playlists")
+# ======================================================================
+SMART_FIELDS = {
+    "title": "Title", "artist": "Artist", "album": "Album", "albumartist": "Album artist",
+    "genre": "Genre", "composer": "Composer", "date": "Year",
+    "play_count": "Play count", "length": "Length (seconds)", "sample_rate": "Sample rate (Hz)",
+    "bits_per_sample": "Bit depth", "bitrate": "Bitrate (bps)", "filetype": "File type",
+}
+SMART_OPS = ["contains", "does not contain", "is", "is not", "starts with", "ends with",
+             "is greater than", "is less than", "is empty", "is not empty"]
+NUMERIC_FIELDS = {"play_count", "length", "sample_rate", "bits_per_sample", "bitrate"}
+TEXT_OPS = {"contains": "LIKE", "does not contain": "NOT LIKE", "is": "=", "is not": "!=",
+            "starts with": "LIKE", "ends with": "LIKE"}
+
+# name -> SQL. These are the six built-in smart playlists.
+SMART_PRESETS = [
+    {"name": "Recently Added", "icon": "🆕", "where": "", "order": "added DESC", "limit": 50,
+     "hint": "The 50 newest files in the library"},
+    {"name": "Top 50 Most Played", "icon": "🔥", "where": "play_count > 0",
+     "order": "play_count DESC, artist", "limit": 50, "hint": "Ranked by play count"},
+    {"name": "Random 100", "icon": "🎲", "where": "", "order": "RANDOM()", "limit": 100,
+     "hint": "A fresh shuffle every time"},
+    {"name": "Hi-Res Audio", "icon": "💎", "where": "bits_per_sample >= 24 OR sample_rate > 48000",
+     "order": "sample_rate DESC, bits_per_sample DESC, artist", "limit": 0,
+     "hint": "24-bit or above 48 kHz"},
+    {"name": "Never Played", "icon": "🕳", "where": "COALESCE(play_count, 0) = 0",
+     "order": "added DESC", "limit": 0, "hint": "Tracks with no plays yet"},
+    {"name": "80s & 90s Classics", "icon": "📼",
+     "where": "CAST(substr(date, 1, 4) AS INTEGER) BETWEEN 1980 AND 1999",
+     "order": "date, artist, album", "limit": 0, "hint": "Released 1980-1999"},
+]
+
+
+def _sql_like(value):
+    return "%" + value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def build_smart_where(rules, match="all"):
+    """Turn the rule-builder dicts into one parameterised SQL fragment."""
+    parts, params = [], []
+    for rule in rules or []:
+        fld = str(rule.get("field", "")).strip()
+        op = str(rule.get("op", "contains")).strip()
+        val = str(rule.get("value", ""))
+        if fld not in SMART_FIELDS:
+            continue
+        col = f"CAST(substr(date, 1, 4) AS INTEGER)" if fld == "date" else fld
+        if op == "is empty":
+            parts.append(f"({col} IS NULL OR {col} = '')")
+            continue
+        if op == "is not empty":
+            parts.append(f"NOT ({col} IS NULL OR {col} = '')")
+            continue
+        if not val.strip():
+            continue
+        if fld in NUMERIC_FIELDS or fld == "date":
+            try:
+                num = float(val)
+            except ValueError:
+                continue
+            if op in ("is", "contains"):
+                parts.append(f"{col} = ?")
+            elif op in ("is not", "does not contain"):
+                parts.append(f"{col} != ?")
+            elif op == "is greater than":
+                parts.append(f"{col} > ?")
+            elif op == "is less than":
+                parts.append(f"{col} < ?")
+            else:
+                parts.append(f"{col} = ?")
+            params.append(num)
+        elif op in TEXT_OPS:
+            if op == "contains":
+                parts.append(f"{col} LIKE ? ESCAPE '\\'")
+                params.append(_sql_like(val))
+            elif op == "does not contain":
+                parts.append(f"({col} NOT LIKE ? ESCAPE '\\' OR {col} IS NULL)")
+                params.append(_sql_like(val))
+            elif op in ("starts with", "ends with"):
+                parts.append(f"{col} LIKE ? ESCAPE '\\'")
+                safe = val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                params.append(safe + "%" if op == "starts with" else "%" + safe)
+            elif op == "is":
+                parts.append(f"{col} = ? COLLATE NOCASE")
+                params.append(val)
+            elif op == "is not":
+                parts.append(f"({col} != ? COLLATE NOCASE OR {col} IS NULL)")
+                params.append(val)
+    joiner = " AND " if match != "any" else " OR "
+    return joiner.join(parts) if parts else "", params
+
+
+class SmartStore:
+    """Custom smart playlists, stored next to the other config files."""
+
+    def __init__(self, library):
+        self.library = library
+        self.items = load_json(SMART_FILE, [])
+        if not isinstance(self.items, list):
+            self.items = []
+        self.items = [s for s in self.items if isinstance(s, dict) and s.get("name")]
+
+    def save(self):
+        save_json(SMART_FILE, self.items)
+
+    def add(self, item):
+        self.items.append(item)
+        self.save()
+
+    def remove(self, name):
+        self.items = [s for s in self.items if s.get("name") != name]
+        self.save()
+
+    def rename(self, old, new):
+        for s in self.items:
+            if s.get("name") == old:
+                s["name"] = new
+        self.save()
+
+    def tracks(self, item):
+        where, params = build_smart_where(item.get("rules"), item.get("match", "all"))
+        return self.library.tracks(where=where, args=params,
+                                   order_by=item.get("order") or None,
+                                   limit=item.get("limit") or None)
+
+    @staticmethod
+    def preset_tracks(library, preset):
+        return library.tracks(where=preset.get("where", ""), order_by=preset.get("order") or None,
+                              limit=preset.get("limit") or None)
+
+
+# ======================================================================
+# core/playlists.py - .m3u8 playlists with portable (relative) paths
+# ======================================================================
+class PlaylistStore:
+    def __init__(self, folders_getter):
+        self.folders = folders_getter
+
+    def names(self):
+        try:
+            files = os.listdir(PLAYLIST_DIR)
+        except OSError:
+            return []
+        return sorted(os.path.splitext(f)[0] for f in files
+                      if f.lower().endswith((".m3u8", ".m3u")))
+
+    @staticmethod
+    def path(name):
+        for ext in (".m3u8", ".m3u"):
+            p = os.path.join(PLAYLIST_DIR, name + ext)
+            if os.path.isfile(p):
+                return p
+        return os.path.join(PLAYLIST_DIR, name + ".m3u8")
+
+    def _entries(self, name):
+        try:
+            with open(self.path(name), encoding="utf-8", errors="replace") as f:
+                return [line.strip() for line in f
+                        if line.strip() and not line.startswith("#")]
+        except OSError:
+            return []
+
+    def _resolve(self, entry):
+        if os.path.isabs(entry):
+            return entry if os.path.exists(entry) else ""
+        bases = [PLAYLIST_DIR] + list(self.folders())
+        for base in bases:
+            p = os.path.normpath(os.path.join(base, entry))
+            if os.path.exists(p):
+                return p
+        return ""
+
+    def read(self, name):
+        return [p for p in (self._resolve(e) for e in self._entries(name)) if p]
+
+    def _relative(self, path):
+        for base in self.folders():
+            try:
+                rel = os.path.relpath(path, base)
+            except ValueError:
+                continue
+            if not rel.startswith(".."):
+                return rel.replace(os.sep, "/")
+        return path
+
+    def write_file(self, path, paths):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n")
+            for p in paths:
+                f.write(self._relative(p) + "\n")
+
+    def write(self, name, paths):
+        self.write_file(self.path(name), paths)
+
+    def remove(self, name):
+        try:
+            os.remove(self.path(name))
+        except OSError:
+            pass
+
+    def rename(self, old, new):
+        try:
+            os.replace(self.path(old), os.path.join(PLAYLIST_DIR, new + ".m3u8"))
+        except OSError:
+            return False
+        return True
+
+    def import_file(self, src):
+        """Import a .m3u/.m3u8 file; entries are resolved relative to it."""
+        base = os.path.dirname(os.path.abspath(src))
+        out = []
+        try:
+            with open(src, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    p = line if os.path.isabs(line) else os.path.normpath(os.path.join(base, line))
+                    if os.path.exists(p):
+                        out.append(p)
+        except OSError:
+            return ""
+        name = os.path.splitext(os.path.basename(src))[0]
+        n, base_name = 1, name
+        while name in self.names():
+            n += 1
+            name = f"{base_name} ({n})"
+        self.write(name, out)
+        return name
+# ======================================================================
+# core/devices.py
+# ======================================================================
+@dataclass(frozen=True)
+class Device:
+    id: str        # stable id: "mtp:host=..." or "mass:/media/user/LABEL"
+    name: str
+    kind: str      # "mtp" | "mass"
+    root: str      # readable local path (FUSE path for MTP)
+    uri: str = ""  # gio uri root for MTP ("mtp://host/")
+
+
+def _gvfs_dir():
+    return f"/run/user/{os.getuid()}/gvfs"
+
+
+def detect_devices():
+    devices = []
+    gv = _gvfs_dir()
+    if os.path.isdir(gv):
+        try:
+            entries = sorted(os.listdir(gv))
+        except OSError:
+            entries = []
+        for entry in entries:
+            if entry.startswith("mtp:host="):
+                host = entry[len("mtp:host="):]
+                name = host.replace("_", " ").replace("%20", " ")
+                devices.append(Device(id=entry, name=name, kind="mtp",
+                                      root=os.path.join(gv, entry), uri=f"mtp://{host}/"))
+    user = getpass.getuser()
+    for base in (f"/media/{user}", f"/run/media/{user}", "/media"):
+        if not os.path.isdir(base):
+            continue
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for entry in entries:
+            p = os.path.join(base, entry)
+            if os.path.ismount(p) and not any(d.root == p for d in devices):
+                devices.append(Device(id=f"mass:{p}", name=entry, kind="mass", root=p))
+    return devices
+
+
+def mtp_mount_hint():
+    """Return a list of MTP devices seen by gio but not mounted yet (best effort)."""
+    try:
+        out = subprocess.run(["gio", "mount", "-li"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted({line.split("activation_root=")[1].strip()
+                   for line in out.splitlines() if "activation_root=mtp://" in line})
+
+
+def mount_uri(uri):
+    try:
+        subprocess.run(["gio", "mount", uri], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def mtp_storages(device):
+    """The storage folders an MTP mount lists at its root; [] until it answers.
+
+    The root of a phone mount holds storages, not music. A phone left in charging
+    mode still leaves a gvfs mount behind, and that mount is either empty or lists
+    its storages without letting anything inside them be read.
+    """
+    try:
+        names = os.listdir(device.root)
+    except OSError:
+        return []
+    storages = []
+    for name in names:
+        try:
+            if os.path.isdir(os.path.join(device.root, name)):
+                storages.append(name)
+        except OSError:
+            continue
+    return storages
+
+
+def mtp_storage_ready(device, dest=""):
+    """Is the phone in file transfer mode, with the storage a copy needs readable?
+
+    Listing the root is not enough: in charging mode gvfs can mount the phone and
+    show its storages while every read inside a storage fails. This asks a storage
+    itself - the one dest names when it starts with a storage, any otherwise - so
+    a copy waits instead of failing with a permission error.
+
+    This reads the device, so it never runs on the GUI thread: one MTP request can
+    take as long as a file transfer, and every caller here goes through a worker.
+    """
+    if device is None:
+        return False
+    storages = mtp_storages(device)
+    if not storages:
+        return False
+    wanted = dest.split("/", 1)[0] if dest else ""
+    for name in ([wanted] if wanted in storages else storages):
+        try:
+            os.listdir(os.path.join(device.root, name))
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def device_ready(device, dest=""):
+    """True when the device storage can actually be read right now.
+
+    A phone that has not been switched to "File transfer" still shows up as a
+    gvfs mount, but the mount is empty or unreadable; syncing in that state only
+    produces errors, so autosync waits for the storage to answer.
+
+    This reads the device, so it never runs on the GUI thread: one MTP request can
+    take as long as a file transfer, and every caller here goes through a worker.
+    """
+    if device is None:
+        return False
+    if device.kind != "mtp":
+        return os.path.isdir(device.root)
+    return mtp_storage_ready(device, dest)
+
+
+class DeviceClaims:
+    """One device, one reader.
+
+    A compare, a sync, a verification or a copy owns the device it works on until it is
+    done. gvfs answers one MTP request at a time, so a second reader queues in front of
+    the running task and the window stops answering. Every device read asks here first;
+    a claim is on a path, so a profile pointed at a folder inside the mount is the same
+    device as the row that shows the mount.
+
+    Paths are compared without touching the filesystem: realpath() would stat an MTP
+    mount, which is the very thing this class exists to prevent.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._claims = []           # [(owner, path, reason)], newest last
+
+    @staticmethod
+    def _key(path):
+        try:
+            text = os.fspath(path)
+        except TypeError:
+            return ""
+        if not isinstance(text, str):
+            return ""
+        text = text.strip()
+        if not text:
+            return ""
+        return os.path.normpath(os.path.abspath(text))
+
+    def claim(self, path, owner, reason):
+        """Take this device for this owner; taking it again replaces the reason."""
+        key = self._key(path)
+        if not key or not owner:
+            return
+        with self._lock:
+            self._claims = [c for c in self._claims if c[0] != owner]
+            self._claims.append((owner, key, reason or "The device is busy"))
+
+    def release(self, owner):
+        if not owner:
+            return
+        with self._lock:
+            self._claims = [c for c in self._claims if c[0] != owner]
+
+    def reason(self, path):
+        """What owns this path right now, in words; "" when nothing does."""
+        key = self._key(path)
+        if not key:
+            return ""
+        with self._lock:
+            claims = list(self._claims)
+        for _owner, root, reason in claims:
+            if root == key or root.startswith(key + os.sep) \
+                    or key.startswith(root + os.sep):
+                return reason
+        return ""
+
+    def held(self, path):
+        return bool(self.reason(path))
+
+
+DEVICE_CLAIMS = DeviceClaims()
+
+
+class Backend:
+    """File operations on a device, all paths relative to device root, '/' separated."""
+
+    def __init__(self, device: Device):
+        self.device = device
+
+    def local(self, rel):
+        rel = self._relative(rel)
+        return os.path.join(self.device.root, *rel.split("/")) if rel else self.device.root
+
+    def _relative(self, rel):
+        rel = str(rel or "").replace("\\", "/")
+        parts = [part for part in rel.split("/") if part not in ("", ".")]
+        if any(part == ".." for part in parts):
+            raise ValueError("Device path must stay inside the device root")
+        return "/".join(parts)
+
+    def uri(self, rel):
+        """Build an MTP URI with slash separators and escaped path components."""
+        rel = self._relative(rel)
+        return self.device.uri + quote(rel, safe="/")
+
+    def copy_out_item(self, rel, dst):
+        """Copy a file or complete folder to a local destination."""
+        if os.path.isdir(self.local(rel)):
+            if self.device.kind == "mtp":
+                _gio(["copy", "-r", self.uri(rel), dst])
+            else:
+                shutil.copytree(self.local(rel), dst, dirs_exist_ok=True)
+        else:
+            self.copy_out(rel, dst)
+
+    def walk_files(self, rel, cancel=lambda: False):
+        """dict rel_path -> size for every file under rel."""
+        base = self.local(rel)
+        out = {}
+        for root, _dirs, names in os.walk(base):
+            if cancel():
+                break
+            for n in names:
+                full = os.path.join(root, n)
+                try:
+                    out[os.path.relpath(full, self.device.root).replace(os.sep, "/")] = os.path.getsize(full)
+                except OSError:
+                    pass
+        return out
+
+    def listing(self, rel, cancel=lambda: False):
+        """dict rel_path -> (size, mtime) for every file under rel, from one walk.
+
+        The fast compare uses one fresh listing to spot missing files, as the timestamp
+        hint for files the manifest already knows, and to find device files the library
+        does not claim (see _scan_extras).
+        """
+        base = self.local(rel)
+        out = {}
+        for root, _dirs, names in os.walk(base):
+            if cancel():
+                break
+            for n in names:
+                full = os.path.join(root, n)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                out[os.path.relpath(full, self.device.root).replace(os.sep, "/")] = (st.st_size, st.st_mtime)
+        return out
+
+    def listdir(self, rel):
+        base = self.local(rel)
+        try:
+            entries = sorted(os.listdir(base), key=str.lower)
+        except OSError:
+            return []
+        res = []
+        for e in entries:
+            p = os.path.join(base, e)
+            isdir = os.path.isdir(p)
+            res.append((e, isdir, 0 if isdir else _size(p)))
+        return res
+
+    def open_read(self, rel):
+        return open(self.local(rel), "rb")
+
+    def fetch_to_local(self, rel):
+        """Return a local path that can be played (temp copy for MTP)."""
+        if self.device.kind != "mtp":
+            return self.local(rel)
+        dst = os.path.join(TMP_DIR, "devplay", os.path.basename(rel))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        try:
+            shutil.copyfile(self.local(rel), dst)
+        except OSError:
+            _gio(["copy", self.uri(rel), dst])
+        return dst
+
+    def mkdirs(self, rel):
+        rel = self._relative(rel)
+        if not rel:
+            return
+        path = self.local(rel)
+        try:
+            os.makedirs(path, exist_ok=True)
+            return
+        except OSError as fuse_error:
+            if os.path.isdir(path):
+                return
+            if self.device.kind != "mtp":
+                raise
+            # the gvfs mount refused the directory: ask gvfs directly
+            try:
+                _gio(["mkdir", "-p", self.uri(rel)])
+            except OSError as gio_error:
+                raise OSError(f"could not create {rel}: {fuse_error} "
+                              f"(gio fallback: {gio_error})")
+
+    def copy_in(self, src, rel, progress=None):
+        """Copy a local file onto the device and confirm it arrived.
+
+        Writing through the gvfs mount keeps the device's own file names (no URI
+        escaping), which is what the phone-side MTP store expects; ``gio copy``
+        stays as the fallback for mounts that refuse writes. progress(fraction) is
+        called while the bytes are written, so a copy can say how far it is.
+        """
+        rel = self._relative(rel)
+        if not rel:
+            raise ValueError("A file name is required")
+        self.mkdirs(os.path.dirname(rel))
+        expected = os.path.getsize(src)
+        dst = self.local(rel)
+        if self.device.kind == "mtp":
+            try:
+                _copy_file(src, dst, progress)
+            except OSError as fuse_error:
+                try:
+                    if os.path.exists(dst):
+                        _gio(["remove", self.uri(rel)])
+                    _gio(["copy", src, self.uri(rel)])
+                except OSError as gio_error:
+                    raise OSError(f"could not copy {rel}: {fuse_error} "
+                                  f"(gio fallback: {gio_error})")
+                if progress:
+                    progress(1.0)   # gio does not report; the copy is done
+        else:
+            _copy_file(src, dst, progress)
+        _fsync_file(dst)
+        _fsync_dir(os.path.dirname(dst))
+        got = _size(dst)
+        if got != expected:
+            raise OSError(f"{rel}: device holds {got} bytes, expected {expected}")
+
+    def copy_out(self, rel, dst):
+        rel = self._relative(rel)
+        try:
+            shutil.copyfile(self.local(rel), dst)
+        except OSError:
+            if self.device.kind != "mtp":
+                raise
+            _gio(["copy", self.uri(rel), dst])
+
+    def remove(self, rel):
+        rel = self._relative(rel)
+        p = self.local(rel)
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+                return
+            if os.path.exists(p):
+                os.remove(p)
+                return
+            return
+        except OSError:
+            if self.device.kind != "mtp":
+                raise
+        _gio(["remove", "-f", self.uri(rel)])
+
+    def remove_empty_dirs(self, rel):
+        base = self.local(rel)
+        for root, _dirs, _files in os.walk(base, topdown=False):
+            if root == base:
+                continue
+            try:
+                if not os.listdir(root):
+                    self.remove(os.path.relpath(root, self.device.root).replace(os.sep, "/"))
+            except OSError:
+                pass
+
+    def free_space(self):
+        try:
+            st = os.statvfs(self.device.root)
+            return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+        except OSError:
+            return None
+
+
+class LocalFolderBackend(Backend):
+    """Sync to any plain folder (NAS, backup drive...) - same API."""
+
+    def __init__(self, path):
+        super().__init__(Device(id=f"folder:{path}", name=path, kind="mass", root=path))
+
+
+def _size(p):
+    try:
+        return os.path.getsize(p)
+    except OSError:
+        return 0
+
+
+def _device_mtime(backend, rel):
+    """The device file's timestamp when the device reports one, otherwise 0."""
+    try:
+        return os.path.getmtime(backend.local(rel))
+    except OSError:
+        return 0.0
+
+
+MTP_NOT_READY = ("The phone's storage is not readable yet. Unlock the phone, choose "
+                 "'File transfer' in its USB notification, then try again.")
+
+
+def _mtp_storage_path(backend, dest):
+    """On MTP the device root only lists storages, and folders can't be created there.
+
+    A folder given without its storage ("Music") goes inside a storage that answers.
+    Only a storage that can be listed is used, so a phone still in charging mode is
+    reported as not ready instead of failing later with a permission error.
+    Reads the device, so call it from a worker, never the GUI thread.
+    """
+    if backend.device.kind != "mtp":
+        return dest
+    try:
+        storages = [n for n, isdir, _s in backend.listdir("") if isdir]
+    except OSError:
+        raise OSError(MTP_NOT_READY)
+    if not storages:
+        raise OSError(MTP_NOT_READY)
+    wanted = dest.split("/", 1)[0] if dest else ""
+    if wanted in storages:
+        try:
+            os.listdir(backend.local(wanted))
+        except OSError:
+            raise OSError(MTP_NOT_READY)
+        return dest
+    # One read of each storage: it proves the storage answers, and it is where the
+    # folder is found when it already exists (the SD card may hold the music).
+    # Backend.listdir() turns a failed read into an empty list, which would look like
+    # a readable storage here, so ask the mount directly.
+    good, holds = [], ""
+    for storage in storages:
+        base = backend.local(storage)
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            continue
+        good.append(storage)
+        if dest and not holds:
+            for name in entries:
+                try:
+                    if name == dest and os.path.isdir(os.path.join(base, name)):
+                        holds = storage
+                        break
+                except OSError:
+                    continue
+    if not good:
+        raise OSError(MTP_NOT_READY)
+    if not dest:
+        return good[0]
+    if holds:
+        return f"{holds}/{dest}"
+    # Not found anywhere: create it on the SD card rather than the phone's internal storage.
+    sd = [s for s in good if "sd" in s.lower()]
+    return f"{(sd or good)[0]}/{dest}"
+
+
+MTP_WAIT_TIMEOUT = 180.0   # long enough to unlock the phone and choose File transfer
+
+
+def wait_for_mtp_target(backend, dest, cancel=lambda: False, log=None,
+                        label="the device", timeout=MTP_WAIT_TIMEOUT):
+    """Block until the phone's storage answers, then return the folder to write to.
+
+    A phone that is plugged in but still charging leaves a mount that cannot be
+    written: a copy started then fails with a permission error. This waits for a
+    storage, says once why, and gives up with the same advice when timeout passes.
+
+    Runs on a worker. log() is the worker's Qt signal, so it is safe from here.
+    """
+    deadline = time.monotonic() + max(timeout, 0)
+    announced = False
+    while True:
+        if cancel():
+            raise OSError("Copy cancelled.")
+        if not os.path.isdir(backend.device.root):
+            raise OSError("The device was disconnected.")
+        try:
+            return _mtp_storage_path(backend, dest)
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            if not announced:
+                announced = True
+                if log:
+                    log(f"Waiting for {label} \u2014 switch the phone to 'File transfer'\u2026")
+            time.sleep(0.5)
+
+
+def _gio(args):
+    try:
+        r = subprocess.run(["gio"] + args, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OSError(f"gio {' '.join(args)}: {e}")
+    if r.returncode != 0:
+        raise OSError(f"gio {' '.join(args)}: {r.stderr.strip()}")
+
+
+def files_equal(path_a, open_b, chunk=1024 * 1024):
+    """Compare every byte, streaming bounded chunks from local and device files.
+
+    Some GVFS/MTP readers return short reads before EOF; fill each comparison
+    block rather than treating a short read as a mismatch.
+    """
+    def read_block(stream):
+        pieces = []
+        remaining = chunk
+        while remaining:
+            piece = stream.read(remaining)
+            if not piece:
+                break
+            pieces.append(piece)
+            remaining -= len(piece)
+        return b"".join(pieces)
+
+    with open(path_a, "rb") as a, open_b() as b:
+        while True:
+            x, y = read_block(a), read_block(b)
+            if x != y:
+                return False
+            if not x:
+                return True
+
+
+
+# ======================================================================
+# core/sync.py
+# ======================================================================
+MODES = {
+    "mirror": "Mirror (device = library, deletes extras on device)",
+    "update": "Update (copy new/changed, never delete)",
+}
+COMPARE_METHODS = {
+    "bytes": "Bit-by-bit (exact) — reads every file on the device",
+    "hash": "Fast hash (SHA-256, cached) — trusts the sync manifest, not exact",
+}
+# What the device's filesystem can put in a file name. MTP sends names as UTF-16 and
+# exFAT stores them as UTF-16, so those carry the whole range and a synced file keeps
+# its PC name to the character. FAT32 refuses a few characters and cannot store a name
+# that ends in a space or a dot, so those names change a little on the device.
+FILESYSTEMS = {
+    "fat32": "FAT32 — a few characters cannot be stored, so names are adjusted",
+    "exfat": "exFAT — names are kept exactly as on the PC",
+    "mtp": "MTP (mtpfs) — names are kept exactly as on the PC",
+}
+PLAIN_NAME_FILESYSTEMS = ("exfat", "mtp")   # filesystems that store the name unchanged
+# Force transcode: what a file is re-encoded to on its way to the device. "" is off. The
+# quality is one fixed, perceptually transparent setting per codec (see RIP_QUALITY).
+TRANSCODE_CODECS = {
+    "": ("Off — copy the file as it is", ""),
+    "mp3": ("MP3 (LAME) — plays almost anywhere", ".mp3"),
+    "m4a": ("AAC (.m4a) — iPods, phones", ".m4a"),
+    "opus": ("Opus (.opus) — smallest", ".opus"),
+}
+TRANSCODE_DEFAULTS = {"mp3": ("vbr", 2), "m4a": ("cbr", 256), "opus": ("vbr", 128)}
+# The bitrates a forced transcode offers, per codec: (mode, value, label). The entry that
+# matches TRANSCODE_DEFAULTS is what a new profile starts on, so the old fixed setting is
+# still the default. MP3/AAC run 128–320 kbps; Opus runs 64–256.
+TRANSCODE_BITRATES = {
+    "mp3": [("vbr", 2, "V2 \u2014 about 190 kbps (VBR)"),
+            ("vbr", 0, "V0 \u2014 about 245 kbps (VBR)"),
+            ("cbr", 128, "128 kbps (CBR)"),
+            ("cbr", 192, "192 kbps (CBR)"),
+            ("cbr", 256, "256 kbps (CBR)"),
+            ("cbr", 320, "320 kbps (CBR)")],
+    "m4a": [("cbr", 128, "128 kbps"), ("cbr", 192, "192 kbps"),
+            ("cbr", 256, "256 kbps"), ("cbr", 320, "320 kbps")],
+    "opus": [("vbr", 64, "64 kbps"), ("vbr", 96, "96 kbps"),
+             ("vbr", 128, "128 kbps"), ("vbr", 160, "160 kbps"),
+             ("vbr", 192, "192 kbps"), ("vbr", 224, "224 kbps"),
+             ("vbr", 256, "256 kbps")],
+}
+
+
+def resolve_transcode_setting(codec, mode="", quality=0):
+    """Return a valid (mode, quality) for a forced transcode.
+
+    A profile written before the bitrate row existed has no mode or quality; it must
+    keep encoding at that codec's old fixed setting. An invalid value is treated the
+    same way rather than passed to ffmpeg.
+    """
+    if codec not in TRANSCODE_DEFAULTS:
+        return ("", 0)
+    try:
+        quality = int(quality)
+    except (TypeError, ValueError):
+        quality = 0
+    choices = {(m, int(v)) for m, v, _label in TRANSCODE_BITRATES.get(codec, [])}
+    if (mode, quality) in choices:
+        return (mode, quality)
+    return TRANSCODE_DEFAULTS[codec]
+
+
+def transcode_signature_for(codec, mode="", quality=0):
+    """The stable identity of an encode setting, recorded with a device copy."""
+    if not codec:
+        return ""
+    mode, quality = resolve_transcode_setting(codec, mode, quality)
+    return f"{codec}:{mode}:{quality}"
+
+
+def filesystem_hint(key):
+    """One line for the form. The profile box is squeezed when the window is short, and a
+    wrapped label there overlaps the rows below it, so the plain sentence is the line and
+    the full rule is the tooltip."""
+    return ("Names stay exactly as on the PC" if key in PLAIN_NAME_FILESYSTEMS
+            else "Names lose what FAT32 cannot store")
+
+
+FILESYSTEM_NOTES = {
+    "fat32": ("FAT32 cannot store * ? : \" < > | \\ in a name, nor a name that ends in a "
+              "space or a dot, so those are left out on the device. Spaces and every "
+              "other character are kept, and the log names any file whose name changed."),
+    "exfat": ("exFAT stores names as UTF-16, so every file reaches the device with the "
+              "name it has on the PC — not one character is changed."),
+    "mtp": ("MTP carries names as UTF-16, so every file reaches the device with the name "
+            "it has on the PC — not one character is changed. If the device still refuses "
+            "a name, the copy fails and the ERROR line names the file."),
+}
+HASH_DIR = os.path.join(SYNC_DIR, "hashdb")            # local hash cache, one file per profile
+MANIFEST_DIR = os.path.join(SYNC_DIR, "manifests")     # what was last written, one file per device
+
+
+@dataclass
+class Profile:
+    name: str = "New profile"
+    device_id: str = ""          # Device.id, or "folder:/path" for any folder
+    source: str = ""             # first local library folder (kept for old profiles)
+    sources: list = field(default_factory=list)  # every local folder this profile syncs
+    selection_mode: str = "folders"  # "folders" or "selected"
+    selection: list = field(default_factory=list)  # [{"path", "rel"}] when selected
+    # True means an empty selection has not been chosen yet, so the picker starts with
+    # everything ticked. After Unselect All it is False and the empty list means none.
+    selection_all: bool = True
+    target: str = "Music"        # selected folder on the device, relative to device root
+    # These subfolders sit below target. Each kind of audio gets its own tree, so a
+    # profile can carry music and books to one user-chosen device folder. Podcasts are
+    # paused for now; podcast_folder stays so older profiles and presets survive.
+    music_folder: str = "Artists"
+    audiobook_folder: str = "Audiobooks"
+    podcast_folder: str = "Podcasts"
+    # Local audiobook roots, used to tell a chapter .m4a in a book folder from music.
+    audiobook_roots: list = field(default_factory=list)
+    transcode: str = ""          # TRANSCODE_CODECS key: "" copies files as they are
+    transcode_mode: str = ""     # "vbr"/"cbr"; "" uses the codec's old fixed default
+    transcode_quality: int = 0   # VBR quality or kbps; 0 uses the codec's default
+    mode: str = "mirror"
+    method: str = "bytes"        # COMPARE_METHODS key
+    filesystem: str = "fat32"    # FILESYSTEMS key: what the device can store in a name
+    autosync: bool = False
+    audio_only: bool = True
+    include_lrc: bool = False   # also send the .lrc beside selected audio
+    last_sync: str = ""          # "YYYY-MM-DD HH:MM" when the last sync finished, "" if never
+    last_sync_method: str = ""   # COMPARE_METHODS key the last finished sync used
+    last_verified: str = ""      # when the device contents were last read in full
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    preset_id: str = ""          # shared preset this profile was last set to
+
+    def transcode_choice(self):
+        return resolve_transcode_setting(self.transcode, self.transcode_mode,
+                                         self.transcode_quality)
+
+    def transcode_signature(self):
+        return transcode_signature_for(self.transcode, self.transcode_mode,
+                                       self.transcode_quality)
+
+
+def _legacy_profile_target(target):
+    """Turn a 1.12 category target into the base folder 1.13 routes below.
+
+    Profiles written by 1.12 copied music to Music/Artists, audiobooks to Audiobooks
+    and podcasts to Music/Podcasts. Those targets were the whole destination; 1.13
+    treats the same value as a selected base plus its category subfolder.
+    """
+    value = str(target or "").strip("/")
+    low = value.lower()
+    for suffix in ("/artists", "/podcasts"):
+        if low.endswith(suffix):
+            return value[:-len(suffix)].strip("/")
+    if low == "audiobooks":
+        return ""
+    return value
+
+
+def load_profiles():
+    out = []
+    for p in load_json(PROFILES_FILE, []):
+        if isinstance(p, dict):
+            try:
+                profile = Profile(**{k: v for k, v in p.items()
+                                     if k in Profile.__dataclass_fields__})
+            except TypeError:
+                continue
+            if "music_folder" not in p:
+                profile.target = _legacy_profile_target(profile.target)
+            out.append(profile)
+    return out
+
+
+def save_profiles(profiles):
+    save_json(PROFILES_FILE, [asdict(p) for p in profiles])
+
+
+@dataclass
+class DevicePreset:
+    """A set of sync settings shared by every device.
+
+    A preset is what a device should look like, not which device it is: the folder on
+    the device, the variant, the compare method, the filesystem and any transcode codec
+    and bitrate. Any device can use it. device_id is kept only so presets saved by an
+    older build still load; it is no longer used to filter the list.
+    """
+    name: str = "Preset"
+    device_id: str = ""          # legacy: ignored when listing presets
+    source: str = ""
+    sources: list = field(default_factory=list)
+    target: str = "Music"
+    music_folder: str = "Artists"
+    audiobook_folder: str = "Audiobooks"
+    podcast_folder: str = "Podcasts"
+    audiobook_roots: list = field(default_factory=list)
+    mode: str = "mirror"
+    method: str = "bytes"
+    filesystem: str = "fat32"
+    transcode: str = ""
+    transcode_mode: str = ""
+    transcode_quality: int = 0
+    audio_only: bool = True
+    include_lrc: bool = False
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def apply_to(self, profile):
+        profile.sources = list(self.sources) or ([self.source] if self.source else [])
+        profile.source = profile.sources[0] if profile.sources else ""
+        profile.target = self.target
+        profile.music_folder = self.music_folder
+        profile.audiobook_folder = self.audiobook_folder
+        profile.podcast_folder = self.podcast_folder
+        profile.audiobook_roots = list(self.audiobook_roots)
+        profile.mode = self.mode
+        profile.method = self.method
+        profile.filesystem = self.filesystem
+        profile.transcode = self.transcode
+        profile.transcode_mode = self.transcode_mode
+        profile.transcode_quality = self.transcode_quality
+        profile.audio_only = self.audio_only
+        profile.include_lrc = self.include_lrc
+
+
+def load_presets():
+    out = []
+    for p in load_json(PRESETS_FILE, []):
+        if isinstance(p, dict):
+            try:
+                out.append(DevicePreset(**{k: v for k, v in p.items()
+                                           if k in DevicePreset.__dataclass_fields__}))
+            except TypeError:
+                continue
+    return out
+
+
+def save_presets(presets):
+    save_json(PRESETS_FILE, [asdict(p) for p in presets])
+
+
+# ---------------------------------------------------------------- settings backup
+# One small JSON file holds the parts of Nebula a user may want to carry to another
+# install. Credentials are deliberately left out; they are not settings a backup
+# should copy around. The queue, window geometry and transient view state are also
+# left out, so importing a backup does not restore a stale session.
+SETTINGS_BUNDLE_VERSION = 1
+SETTINGS_BUNDLE_GROUPS = ("preferences", "sync_profiles", "device_presets",
+                          "smart_playlists")
+SETTINGS_BUNDLE_LABELS = (("preferences", "Preferences and app settings"),
+                          ("sync_profiles", "Sync profiles"),
+                          ("device_presets", "Device presets"),
+                          ("smart_playlists", "Smart playlists"))
+SETTINGS_SECRET_KEYS = frozenset({"discogs_token", "discogs_secret"})
+SETTINGS_EXPORT_SKIP = frozenset({
+    "queue", "queue_index", "tab", "window", "split", "view", "lib_details",
+    "lib_mode", "lib_fold", "dev_fold", "grouping", "device_categories",
+    "audiobook_import_last", "ui_revision",
+}) | SETTINGS_SECRET_KEYS
+
+
+def settings_groups(groups=None):
+    """The selected backup groups, in the order the Preferences page shows them."""
+    if groups is None:
+        selected = set(SETTINGS_BUNDLE_GROUPS)
+    elif isinstance(groups, str):
+        selected = {groups}
+    else:
+        selected = set(groups)
+    return [key for key in SETTINGS_BUNDLE_GROUPS if key in selected]
+
+
+def build_settings_bundle(config, groups=None):
+    """Build the JSON object written by Preferences > Backup > Export settings."""
+    selected = settings_groups(groups)
+    if not selected:
+        raise ValueError("Choose at least one kind of setting to export.")
+    bundle = {"nebula_settings": SETTINGS_BUNDLE_VERSION,
+              "app_version": VERSION,
+              "exported_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if "preferences" in selected:
+        bundle["preferences"] = {key: value for key, value in (config or {}).items()
+                                 if key not in SETTINGS_EXPORT_SKIP}
+    if "sync_profiles" in selected:
+        bundle["sync_profiles"] = [asdict(profile) for profile in load_profiles()]
+    if "device_presets" in selected:
+        bundle["device_presets"] = [asdict(preset) for preset in load_presets()]
+    if "smart_playlists" in selected:
+        items = load_json(SMART_FILE, [])
+        bundle["smart_playlists"] = items if isinstance(items, list) else []
+    return bundle
+
+
+def write_settings_bundle(path, config, groups=None):
+    """Write a settings backup atomically (save_json uses a temporary file)."""
+    save_json(path, build_settings_bundle(config, groups))
+
+
+def read_settings_bundle(path):
+    """Read and identify a settings backup, raising ValueError for other JSON."""
+    data = load_json(path, None)
+    if not isinstance(data, dict) or data.get("nebula_settings") != SETTINGS_BUNDLE_VERSION:
+        raise ValueError("This is not a Nebula settings backup.")
+    return data
+
+
+def apply_settings_bundle(bundle, cfg, groups=None):
+    """Apply selected parts of a backup to cfg and the settings files.
+
+    Everything is validated before anything is written, so a malformed file leaves
+    the current settings untouched. Preferences are merged; profiles, presets and
+    smart playlists are replaced when their group is selected. Credentials are never
+    overwritten by a backup, even one that contains them by hand.
+    """
+    if not isinstance(bundle, dict):
+        raise ValueError("This is not a Nebula settings backup.")
+    selected = settings_groups(groups)
+    if not selected:
+        raise ValueError("Choose at least one kind of setting to import.")
+    missing = [key for key in selected if key not in bundle]
+    if missing:
+        labels = dict(SETTINGS_BUNDLE_LABELS)
+        raise ValueError("The backup does not contain " +
+                         ", ".join(labels.get(key, key) for key in missing) + ".")
+
+    preferences = None
+    profile_data = None
+    preset_data = None
+    smart_data = None
+    if "preferences" in selected:
+        preferences = bundle.get("preferences")
+        if not isinstance(preferences, dict):
+            raise ValueError("The backup's preferences are not a settings object.")
+    if "sync_profiles" in selected:
+        profile_data = bundle.get("sync_profiles")
+        if not isinstance(profile_data, list) or not all(isinstance(p, dict)
+                                                         for p in profile_data):
+            raise ValueError("The backup's sync profiles are not a list of profiles.")
+    if "device_presets" in selected:
+        preset_data = bundle.get("device_presets")
+        if not isinstance(preset_data, list) or not all(isinstance(p, dict)
+                                                        for p in preset_data):
+            raise ValueError("The backup's device presets are not a list of presets.")
+    if "smart_playlists" in selected:
+        smart_data = bundle.get("smart_playlists")
+        if not isinstance(smart_data, list) or not all(isinstance(s, dict)
+                                                       for s in smart_data):
+            raise ValueError("The backup's smart playlists are not a list.")
+
+    imported = {}
+    if preferences is not None:
+        for key, value in preferences.items():
+            if key not in SETTINGS_SECRET_KEYS:
+                cfg[key] = value
+        save_config(cfg)
+        imported["preferences"] = True
+    if profile_data is not None:
+        save_json(PROFILES_FILE, profile_data)
+        imported["sync_profiles"] = load_profiles()
+    if preset_data is not None:
+        save_json(PRESETS_FILE, preset_data)
+        imported["device_presets"] = load_presets()
+    if smart_data is not None:
+        save_json(SMART_FILE, [item for item in smart_data if item.get("name")])
+        imported["smart_playlists"] = True
+    return imported
+
+
+# ---------------------------------------------------------------- sync log
+# One list of finished runs per profile, newest last. Each entry is a plain dict so
+# the file stays readable and a missing field never stops the log from loading.
+def load_sync_log():
+    data = load_json(SYNC_LOG_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_sync_log(log):
+    save_json(SYNC_LOG_FILE, log)
+
+
+def sync_log_keep_entries(keep):
+    try:
+        return max(1, min(int(keep), 100))
+    except (TypeError, ValueError):
+        return 10
+
+
+def log_sync_run(profile, entry, keep=10):
+    """Add one finished run to a profile's log, keeping only the newest `keep`."""
+    log = load_sync_log()
+    entries = log.get(profile.id)
+    if not isinstance(entries, list):
+        entries = []
+    entries.append(entry)
+    log[profile.id] = entries[-sync_log_keep_entries(keep):]
+    save_sync_log(log)
+
+
+def delete_sync_log(profile_id):
+    log = load_sync_log()
+    if profile_id in log:
+        del log[profile_id]
+        save_sync_log(log)
+
+
+def trim_sync_log(keep):
+    """Apply a smaller limit to logs that already hold more than it allows."""
+    keep = sync_log_keep_entries(keep)
+    log = load_sync_log()
+    changed = False
+    for key in list(log):
+        entries = log.get(key)
+        if not isinstance(entries, list):
+            del log[key]
+            changed = True
+        elif len(entries) > keep:
+            log[key] = entries[-keep:]
+            changed = True
+    if changed:
+        save_sync_log(log)
+
+
+@dataclass
+class Action:
+    kind: str   # "new" | "restore" | "changed" | "delete" | "equal"
+    rel: str    # path relative to source/target root
+    size: int = 0
+    dev: str = ""  # device-side path for copies (sanitized); empty = same as rel
+    hash: str = ""  # SHA-256 of the local file (hash method only)
+    verified: bool = False  # equal because the contents were read, not just the manifest
+    extra: bool = False  # device file the library does not claim, found by the scan
+
+
+# characters FAT32 refuses in a file name; they are dropped
+def _fat_name(part):
+    """A name FAT32 can store: the characters it refuses and any control character are
+    left out, and a trailing space or dot goes too — FAT cannot store those at all.
+    Everything else, spaces included, is kept."""
+    cleaned = "".join(ch for ch in part if ch not in '*?:"<>|\\' and ord(ch) >= 32
+                      and ch != "\x7f")
+    return cleaned.rstrip(" .") or "_"
+
+
+def device_name(part, filesystem="fat32"):
+    """One name as the device stores it, according to the filesystem it has.
+
+    exFAT and MTP carry the whole UTF-16 range, so the PC name is used to the
+    character; FAT32 drops what it cannot store (see _fat_name).
+    """
+    return part if filesystem in PLAIN_NAME_FILESYSTEMS else _fat_name(part)
+
+
+def device_rel(rel, filesystem="fat32"):
+    """Relative path as it is written to the device, per the device's filesystem."""
+    return "/".join(device_name(p, filesystem) for p in rel.split("/"))
+
+
+def device_map(rels, filesystem="fat32"):
+    """Map source-relative paths to unique device paths. Devices are case-insensitive,
+    so two files that only differ by case or by dropped characters get a " (2)" suffix."""
+    out, taken = {}, set()
+    for rel in sorted(rels):
+        dev = device_rel(rel, filesystem)
+        n = 1
+        while dev.lower() in taken:
+            n += 1
+            stem, ext = os.path.splitext(device_rel(rel, filesystem))
+            dev = f"{stem} ({n}){ext}"
+        taken.add(dev.lower())
+        out[rel] = dev
+    return out
+
+
+def library_rel(path, folders):
+    """The path a library file keeps on the device: relative to the library folder it is in.
+
+    A file that is in no library folder keeps only its name, so it still lands in the
+    target folder instead of in a tree the library does not have.
+    """
+    for folder in folders or []:
+        try:
+            rel = os.path.relpath(path, folder)
+        except ValueError:
+            continue
+        if rel != os.pardir and not rel.startswith(os.pardir + os.sep) \
+                and not os.path.isabs(rel):
+            return rel.replace(os.sep, "/")
+    return os.path.basename(path)
+
+
+def _fsync_file(path):
+    """Make sure a finished copy is on the device, not only in the PC's cache."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path):
+    """Flush the directory entry for a newly copied file as well as its bytes."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _copy_file(src, dst, progress=None):
+    """Write dst from src, calling progress(fraction) as the bytes land on it.
+
+    Without a caller to report to this is shutil.copyfile, which can use the kernel's
+    fast paths. With one the file goes in bounded blocks, because a single copy of a
+    large track is what makes the percentage worth showing.
+    """
+    if progress is None:
+        shutil.copyfile(src, dst)
+        return
+    total = max(os.path.getsize(src), 1)
+    done = 0
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        while True:
+            block = fin.read(1024 * 1024)
+            if not block:
+                break
+            fout.write(block)
+            done += len(block)
+            progress(min(done / total, 1.0))
+    if done != total:
+        raise OSError(f"{src} changed size while it was copied")
+
+
+def _lrc_sidecar(path):
+    """The matching .lrc beside an audio file, case-insensitively, or ""."""
+    folder, name = os.path.split(str(path or ""))
+    stem = os.path.splitext(name)[0]
+    if not folder or not stem:
+        return ""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return ""
+    for candidate in sorted(names):
+        cstem, cext = os.path.splitext(candidate)
+        if cext.lower() == ".lrc" and cstem.lower() == stem.lower():
+            full = os.path.join(folder, candidate)
+            if os.path.isfile(full):
+                return full
+    return ""
+
+
+def _sibling_rel(rel, sibling):
+    """The relative path of a sidecar beside rel, keeping rel's directory."""
+    parent = str(rel or "").replace("\\", "/").rsplit("/", 1)[0]
+    name = os.path.basename(sibling)
+    return f"{parent}/{name}" if parent else name
+
+
+def _walk_local(folder, audio_only, include_lrc=False):
+    out = {}
+    for root, _d, names in os.walk(folder):
+        for n in names:
+            if audio_only and not (is_audiobook(n) or (include_lrc and is_lrc(n))):
+                continue
+            full = os.path.join(root, n)
+            try:
+                out[os.path.relpath(full, folder).replace(os.sep, "/")] = os.path.getsize(full)
+            except OSError:
+                pass
+    return out
+
+
+def profile_sources(profile):
+    """Every folder a profile syncs, with the old single source as the fallback."""
+    roots = [s for s in (getattr(profile, "sources", None) or [])
+             if isinstance(s, str) and s]
+    if not roots and getattr(profile, "source", ""):
+        roots = [profile.source]
+    return roots
+
+
+def profile_is_media(profile, name):
+    """What an audio-only profile may send: every audio format, plus LRC if asked."""
+    return (is_audiobook(name)
+            or (bool(getattr(profile, "include_lrc", False)) and is_lrc(name)))
+
+
+def _profile_can_delete(profile, rel):
+    """Mirror may remove media this profile sent; selected LRC sidecars count."""
+    if profile.mode != "mirror":
+        return False
+    if not profile.audio_only:
+        return True
+    return is_audio(rel) or (profile.selection_mode == "selected" and is_lrc(rel))
+
+
+def profile_files(profile, audio_only=True):
+    """{relative path: (absolute path, size)} for the folders or the chosen items.
+
+    In folder mode the folders are merged, the first folder winning a duplicate path.
+    In selected mode only the user's chosen files are listed, with the relative path
+    the selection dialog worked out when they were chosen. With include_lrc, the .lrc
+    beside a selected audio file travels with it even though the picker lists audio.
+    """
+    out = {}
+    include_lrc = bool(getattr(profile, "include_lrc", False))
+    if getattr(profile, "selection_mode", "folders") == "selected":
+        for entry in getattr(profile, "selection", None) or []:
+            if not isinstance(entry, dict):
+                continue
+            path, rel = entry.get("path"), entry.get("rel")
+            if not path or not rel or not os.path.isfile(path):
+                continue
+            if audio_only and not profile_is_media(profile, path):
+                continue
+            try:
+                out.setdefault(rel, (path, os.path.getsize(path)))
+                if include_lrc:
+                    lrc = _lrc_sidecar(path)
+                    if lrc:
+                        out.setdefault(_sibling_rel(rel, lrc),
+                                       (lrc, os.path.getsize(lrc)))
+            except OSError:
+                continue
+        return out
+    for root in profile_sources(profile):
+        for rel, size in _walk_local(root, audio_only, include_lrc).items():
+            out.setdefault(rel, (os.path.join(root, rel), size))
+    return out
+
+
+def profile_sync_folder(profile, kind):
+    """The subfolder one kind of audio keeps below the selected device folder."""
+    field_name = {"music": "music_folder",
+                  "audiobook": "audiobook_folder",
+                  "podcast": "podcast_folder"}.get(kind, "music_folder")
+    return str(getattr(profile, field_name, "") or "").strip().strip("/")
+
+
+def _rel_in_folder(rel, folder):
+    rel = str(rel or "").replace("\\", "/").strip("/")
+    folder = str(folder or "").replace("\\", "/").strip("/")
+    if not folder:
+        return True
+    low_rel, low_folder = rel.lower(), folder.lower()
+    return low_rel == low_folder or low_rel.startswith(low_folder + "/")
+
+
+def route_profile_rel(profile, rel, kind):
+    """Put a source-relative path below its media folder without repeating the folder.
+
+    A library root may already contain Artists/Podcasts (the user's Music folder, for
+    example), while an audiobook root may start directly at a book. Both reach the
+    same device layout: selected folder/Artists or /Audiobooks. Podcasts are paused
+    for now.
+    """
+    rel = str(rel or "").replace("\\", "/").strip("/")
+    folder = profile_sync_folder(profile, kind)
+    if folder and not _rel_in_folder(rel, folder):
+        return f"{folder}/{rel}"
+    return rel
+
+
+def profile_sync_files(profile, audio_only=True):
+    """{device-relative path: (absolute path, size)} with media folders applied.
+
+    This is the sync engine's view of the selection. profile_files() stays the
+    source-relative view used by the picker and its summaries. An included .lrc
+    sidecar is routed with the audio file it belongs to.
+    """
+    out = {}
+    include_lrc = bool(getattr(profile, "include_lrc", False))
+    roots = [r for r in (getattr(profile, "audiobook_roots", None) or []) if r]
+    if getattr(profile, "selection_mode", "folders") == "selected":
+        for entry in getattr(profile, "selection", None) or []:
+            if not isinstance(entry, dict):
+                continue
+            path, rel = entry.get("path"), entry.get("rel")
+            if not path or not rel or not os.path.isfile(path):
+                continue
+            if audio_only and not profile_is_media(profile, path):
+                continue
+            kind = entry.get("kind") or media_kind_for_path(
+                path, {"audiobook_folders": roots})
+            if kind == "podcast":
+                continue  # paused for now; legacy selections are ignored
+            try:
+                out.setdefault(route_profile_rel(profile, rel, kind),
+                               (path, os.path.getsize(path)))
+                if include_lrc:
+                    lrc = _lrc_sidecar(path)
+                    if lrc:
+                        out.setdefault(route_profile_rel(
+                            profile, _sibling_rel(rel, lrc), kind),
+                            (lrc, os.path.getsize(lrc)))
+            except OSError:
+                continue
+        return out
+    for root in profile_sources(profile):
+        for rel, size in _walk_local(root, audio_only, include_lrc).items():
+            path = os.path.join(root, rel)
+            kind = media_kind_for_path(path, {"audiobook_folders": roots})
+            if kind == "podcast":
+                continue  # paused for now
+            out.setdefault(route_profile_rel(profile, rel, kind), (path, size))
+    return out
+
+
+def _profile_media_folders(profile):
+    # Podcasts are paused, but keep the folder here so Mirror still knows
+    # that a device's existing Podcasts tree is not an extra it may delete.
+    return [f for f in (profile_sync_folder(profile, kind)
+                        for kind in ("music", "audiobook", "podcast")) if f]
+
+
+def _profile_active_media_folders(profile, src):
+    active = set()
+    for folder in _profile_media_folders(profile):
+        if any(_rel_in_folder(rel, folder) for rel in src):
+            active.add(folder)
+    return active
+
+
+def _other_media_folder(profile, rel, src):
+    """True when rel is in a media folder this profile is not sending this run.
+
+    A music-only mirror must not delete the Audiobooks tree beside it. Files directly
+    in the selected folder are still ordinary extras and keep their old behaviour.
+    """
+    active = _profile_active_media_folders(profile, src)
+    return any(folder not in active and _rel_in_folder(rel, folder)
+               for folder in _profile_media_folders(profile))
+
+
+def filter_other_media_rows(profile, rows, src, key=lambda row: row[0]):
+    return [row for row in rows if not _other_media_folder(profile, key(row), src)]
+
+
+def file_hash256(path, chunk=1 << 20):
+    """SHA-256 fingerprint of a local file as 64 hex characters.
+
+    A compact content fingerprint: the first hash of a file still reads every byte, so
+    hashing is what makes later compares cheap, not the hash itself.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+class HashStore:
+    """Local hash cache for one profile, saved as JSON on this PC. One record per
+    source-relative path:
+      size, mtime_ns, hash  - the local file at the last scan (cache key: size + mtime)
+      synced_hash, dev      - what this profile last wrote to the device; set only after a
+                              copy succeeds, so a record without it never reached the device
+    """
+
+    def __init__(self, profile):
+        self.path = os.path.join(HASH_DIR, f"{profile.id}.json")
+        data = load_json(self.path, {})
+        self.records = data if isinstance(data, dict) else {}
+
+    def save(self):
+        os.makedirs(HASH_DIR, exist_ok=True)
+        save_json(self.path, self.records)
+
+    def fingerprint(self, rel, full, force=False):
+        """Current hash of a local file. Re-hashes only when its size or mtime changed.
+
+        force=True is what Verify content uses: it must read the PC copy even when a
+        size and timestamp still match the cache, or a same-size edit whose timestamp
+        was put back would be invisible to the one pass that promises exactness.
+        """
+        st = os.stat(full)
+        rec = self.records.setdefault(rel, {})
+        if not force and len(str(rec.get("hash") or "")) == 64 \
+                and rec.get("size") == st.st_size \
+                and rec.get("mtime_ns") == st.st_mtime_ns:
+            return rec["hash"]
+        digest = file_hash256(full)
+        rec.update(size=st.st_size, mtime_ns=st.st_mtime_ns, hash=digest)
+        return digest
+
+
+class DeviceManifest:
+    """What this app last wrote to one device, keyed by device identity and device path.
+
+    A record carries the source path, the size, the SHA-256 of what was copied and the
+    device file's timestamp. It is a record of past transfers, not proof of what is on
+    the device now: an edit made outside the app can leave path, size and timestamp
+    unchanged, and only reading the file settles that.
+    """
+
+    def __init__(self, profile):
+        key = hashlib.sha1((profile.device_id or "unknown").encode("utf-8")).hexdigest()[:20]
+        self.path = os.path.join(MANIFEST_DIR, key + ".json")
+        self.device_id = profile.device_id or ""
+        data = load_json(self.path, {})
+        files = data.get("files") if isinstance(data, dict) else None
+        self.files = files if isinstance(files, dict) else {}
+
+    def save(self):
+        os.makedirs(MANIFEST_DIR, exist_ok=True)
+        save_json(self.path, {"device": self.device_id, "files": self.files})
+
+    def get(self, dev_path):
+        return self.files.get(str(dev_path).lower())
+
+    def record(self, dev_path, rel, size, digest, mtime=0.0, profile_id="", encode=""):
+        """Remember what the device holds for one path: written, or read and matched.
+
+        Called after a device write succeeded, when a copy found on the device was
+        adopted because its content matched, and for every file a verification read.
+        encode records the forced-transcode setting so a bitrate change cannot be
+        mistaken for an already-equal device copy.
+        """
+        self.files[str(dev_path).lower()] = {
+            "rel": rel, "dev": dev_path, "size": int(size), "hash": digest,
+            "mtime": float(mtime or 0.0), "profile": profile_id,
+            "encode": str(encode or ""),
+        }
+
+    def forget(self, dev_path):
+        self.files.pop(str(dev_path).lower(), None)
+
+
+def _device_mtime_moved(rec, dev_mtime):
+    """True when the device file's timestamp no longer matches the manifest's record.
+
+    Timestamps are only a hint: some devices report none, so an unknown value is
+    ignored. A moved timestamp means the file may have changed outside the app.
+    """
+    known = float(rec.get("mtime") or 0.0)
+    if not known or dev_mtime is None:
+        return False
+    return abs(float(dev_mtime) - known) > 2.0
+
+
+def _same_contents(profile, backend, rel, dev_path, source_path, fresh=False):
+    """Read both copies and compare every byte; False if either can't be read.
+
+    fresh=True makes the device side read through to the device instead of accepting
+    pages left in the PC's cache by the copy that wrote the file.
+    """
+    try:
+        def opener():
+            handle = backend.open_read(dev_path)
+            if fresh:
+                _drop_read_cache(handle)
+            return handle
+        return files_equal(source_path, opener)
+    except OSError:
+        return False
+
+
+def _drop_read_cache(handle):
+    """Discard the host's cached pages so a verification read reaches the device.
+
+    The copy just written is still in the page cache, and reading it there would
+    verify the PC's memory rather than the device. fsync first flushes any dirty
+    pages; DONTNEED then evicts the clean ones, so the next read has to ask the
+    device. Filesystems that do not support it simply keep the old behaviour.
+    """
+    try:
+        os.fsync(handle.fileno())
+    except OSError:
+        pass
+    try:
+        os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    except (AttributeError, OSError):
+        pass
+
+
+def _hash_device_file(backend, rel, chunk=1 << 20, fresh=False):
+    """SHA-256 of one file on the device, read in full through the backend.
+
+    fresh=True evicts the PC's cached copy first, so Verify content measures and
+    checks the device itself instead of the page cache left behind by a copy.
+    """
+    h = hashlib.sha256()
+    with backend.open_read(rel) as f:
+        if fresh:
+            _drop_read_cache(f)
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _library_match(src_sizes, store, size, digest, src_files):
+    """The library file that holds exactly this content, or "" if none does.
+
+    Equal content needs an equal size, so only library files of that size are hashed:
+    the search is a handful of files, not the whole library.
+    """
+    for rel, s in src_sizes.items():
+        if s == size and store.fingerprint(rel, src_files[rel][0]) == digest:
+            return rel
+    return ""
+
+
+def _recorded_device_copy(manifest, present, rel, size):
+    """Take the device copy this profile recorded for rel under a name of its own.
+
+    A file adopted by the quick scan is not where the source tree maps to, so the
+    manifest's own record is what keeps the next compare from planning it as new again.
+    Selected-item profiles never use this: for them there is exactly one canonical
+    device path per library file, and any other recorded path is a duplicate.
+    """
+    for rec in manifest.files.values():
+        if rec.get("rel") != rel:
+            continue
+        dev = str(rec.get("dev") or "")
+        hit = present.get(dev.lower())
+        if hit is not None and hit[1] == size:
+            return present.pop(dev.lower())
+    return None
+
+
+def _sync_names(profile, rels):
+    """Device-relative names for routed source paths, including forced transcode."""
+    names = device_map(rels, profile.filesystem)
+    if profile.transcode:
+        names = {rel: (dev if is_lrc(rel)
+                       else _transcoded_rel(dev, profile.transcode))
+                 for rel, dev in names.items()}
+    return names
+
+
+def _owned_manifest_paths(manifest, profile, prefix):
+    """{rel: [device path, ...]} this profile recorded below the current target.
+
+    A manifest can keep more than one device path for one source path after a target
+    or media-folder change. Only the canonical path is a live copy; every other path
+    is a duplicate that Mirror removes and Verify must never restore.
+    """
+    out = {}
+    for rec in manifest.files.values():
+        if rec.get("profile") != profile.id:
+            continue
+        rel = str(rec.get("rel") or "")
+        dev_path = str(rec.get("dev") or "")
+        if not rel or not dev_path:
+            continue
+        if not dev_path.lower().startswith(prefix.lower()):
+            continue
+        out.setdefault(rel, []).append(dev_path)
+    return out
+
+
+def _scan_extras(profile, backend, store, manifest, plan, where, src, prefix, candidates,
+                 planned_deletes, src_files=None, progress=None, log=None,
+                 cancel=lambda: False, hashes=None):
+    """The quick scan: device files the profile's manifest does not account for.
+
+    Nothing is removed before it has been checked. A size no library file shares cannot
+    be a library file's content, so that is settled without a read; otherwise the device
+    file is hashed and the library is searched for that content. When the library is
+    about to send exactly that content, the copy already on the device is kept and
+    adopted as that library file's copy, so a file put on the device by hand is neither
+    deleted nor written a second time. Mirror removes what the library does not have;
+    update only reports it and reads nothing, because it never deletes.
+
+    hashes is the {device path: SHA-256} a verification pass already read off the device,
+    so an extra is not read a second time; when it is given, every extra is also written
+    into the manifest, which is how a verification ends up holding an exact index of the
+    whole device folder rather than only of the files this profile syncs.
+
+    Returns (extras, kept, removed).
+    """
+    extras = kept = removed = 0
+    base, total = len(src), len(src) + len(candidates)
+    sizes = set(src.values())
+    if src_files is None:
+        src_files = {rel: (os.path.join(profile.source, rel), s) for rel, s in src.items()}
+    index = hashes is not None
+    for j, (dev_path, size, mtime) in enumerate(candidates):
+        if cancel():
+            break
+        extras += 1
+        dev = (dev_path[len(prefix):]
+               if prefix and dev_path.lower().startswith(prefix.lower()) else dev_path)
+        digest = hashes.get(dev_path.lower()) if index else None
+        if index and digest:
+            # Read in full by this pass: the manifest says what the device really holds.
+            # No timestamp is stored, so nothing here depends on one being trustworthy.
+            manifest.record(dev_path, "", size, digest, 0.0, "")
+        if profile.mode != "mirror":
+            if log:
+                log(f"EXTRA    {dev_path}: not in this profile's manifest, left alone (update)")
+            continue
+        if (prefix + dev).lower() in planned_deletes:
+            removed += 1  # already planned from the library side; do not plan it twice
+            if log:
+                log(f"EXTRA    {dev_path}: not in the library, removing (mirror)")
+            continue
+        if progress:
+            progress(base + j, total, f"Checking extra {dev_path}")
+        if digest is None and size not in sizes:
+            plan.append(Action(kind="delete", rel=dev, size=size, dev=dev, extra=True))
+            removed += 1
+            if log:
+                log(f"EXTRA    {dev_path}: no library file of this size, removing (mirror)")
+            continue
+        if digest is None:
+            try:
+                digest = _hash_device_file(backend, dev_path)
+            except OSError as e:
+                kept += 1
+                if log:
+                    log(f"EXTRA    {dev_path}: could not be read ({e}), left alone")
+                continue
+        rel = _library_match(src, store, size, digest, src_files)
+        at = where.get(rel)
+        if at is not None and plan[at].kind in ("new", "restore"):
+            # The library is about to send exactly this content: keep the copy that is
+            # already there rather than removing it and writing the same bytes again.
+            plan[at] = Action(kind="equal", rel=rel, size=size, dev=dev, hash=digest,
+                              verified=True, extra=True)
+            manifest.record(prefix + dev, rel, size, digest, 0.0 if index else mtime, profile.id)
+            store.records.setdefault(rel, {}).update(synced_hash=digest, dev=dev)
+            kept += 1
+            if log:
+                log(f"KEEP     {dev_path}: same content as {rel}, adopted where it is")
+            continue
+        plan.append(Action(kind="delete", rel=dev, size=size, dev=dev, extra=True))
+        removed += 1
+        if log:
+            if at is None:
+                reason = "not in the library"
+            elif plan[at].kind == "equal":
+                reason = f"a second copy of {rel}"
+            else:
+                reason = f"the older version of {rel}"
+            log(f"EXTRA    {dev_path}: {reason}, removing (mirror)")
+    return extras, kept, removed
+
+
+def _compare_hashed(profile, backend, progress=None, cancel=lambda: False, verify=False,
+                    log=None, stats=None):
+    """Cached compare: local SHA-256 records plus a manifest of what each device holds.
+
+    A device file counts as equal when the manifest says this app wrote that exact
+    content and a fresh listing still shows the same size and timestamp. Without a
+    manifest record — a file written by an older build, or by another profile — it is
+    read once and compared byte for byte rather than recopied blindly.
+
+    verify=True is Verify content, and it is a different shape of pass: every file in the
+    device folder is read in full and hashed, not only the ones this profile syncs, and
+    the manifest is rewritten from those hashes. Each record holds the SHA-256 of the
+    device's own bytes and no timestamp at all, so nothing about the result depends on a
+    device clock — a phone that rewrites its file times on every mount changes nothing.
+    Equality is then the digests being equal, which is exact: a record can only say "the
+    device holds these bytes" because those bytes were read, and the manifest ends the
+    pass as an exact index of what is on the device. Drop the record and the file is read
+    again; there is no size-or-time guess left in it.
+    A file missing from the device is restored from the PC copy; the PC original is
+    never deleted because the device lacks it.
+
+    One listing of the device folder drives both halves: what the library has and the
+    listing lacks is planned as new or restore, and what the listing holds and the
+    library does not claim goes through _scan_extras before mirror removes anything.
+
+    A selected-item profile deletes only what its own records name. Unticking a file it
+    synced before makes that copy stale, so Mirror removes it; a file no record of this
+    profile names is never a candidate, whichever media folder it sits in.
+    """
+    src_files = profile_sync_files(profile, profile.audio_only)
+    src = {rel: size for rel, (_path, size) in src_files.items()}
+    names = _sync_names(profile, src.keys())
+    store = HashStore(profile)
+    manifest = DeviceManifest(profile)
+    target = profile.target.strip("/")
+    prefix = (target + "/") if target else ""
+    listing = backend.listing(target, cancel)
+    present = {}
+    for rel, (size, mtime) in listing.items():
+        if profile.audio_only and not profile_is_media(profile, rel):
+            continue
+        present[rel.lower()] = (rel, size, mtime)
+    # Selected mode plans only its own copies, so it keeps the other media trees in
+    # the listing: that is how an item unticked from a book tree can still be removed.
+    if profile.selection_mode != "selected":
+        present = {key: row for key, row in present.items()
+                   if not _other_media_folder(profile, row[0], src)}
+    # The canonical path is the only place a selected library file may live. Device
+    # names are computed for the whole selection at once so a case-insensitive
+    # collision keeps the same " (2)" suffix on every compare.
+    canonical = {rel: prefix + names[rel] for rel in src}
+    canonical_by_low = {path.lower(): rel for rel, path in canonical.items()}
+    owned = (_owned_manifest_paths(manifest, profile, prefix)
+             if profile.selection_mode == "selected" else {})
+    considered = len(present)
+    plan, where = [], {}
+    matched = missing = 0
+    # Verify content reads the whole device folder first. Audio-only profiles still
+    # skip everything that is not audio, which is what "only audio files" means here.
+    device_hashes = None
+    on_device = sorted(present.values())
+    if verify:
+        device_hashes = {}
+        for j, (dev_path, _size, _mtime) in enumerate(on_device):
+            if cancel():
+                return plan
+            if progress:
+                progress(j, len(on_device) + len(src), f"Reading {dev_path}")
+            try:
+                device_hashes[dev_path.lower()] = _hash_device_file(
+                    backend, dev_path, fresh=True)
+            except OSError:
+                device_hashes[dev_path.lower()] = None   # unreadable: nothing is claimed
+    total = len(src) + (len(on_device) if verify else 0)
+    offset = len(on_device) if verify else 0
+    try:
+        for i, (rel, size) in enumerate(sorted(src.items())):
+            if cancel():
+                return plan
+            if progress:
+                progress(offset + i, total, f"Hashing {rel}")
+            dev = names[rel]
+            path = canonical[rel]
+            digest = store.fingerprint(rel, src_files[rel][0], force=verify)
+            hit = present.pop(path.lower(), None)
+            if hit is None and profile.selection_mode != "selected":
+                hit = _recorded_device_copy(manifest, present, rel, size)
+            if hit is None:
+                # Gone from the device: restore what this app put there, else it is new.
+                rec = manifest.get(path)
+                if rec is not None and rec.get("rel") == rel:
+                    kind = "restore"
+                else:
+                    # A hash record can outlive a lost manifest; its recorded path is
+                    # still evidence that this profile wrote the canonical copy once.
+                    stored = store.records.get(rel) or {}
+                    owns_path = (rec is None or rec.get("rel") != rel
+                                 or rec.get("profile") != profile.id)
+                    kind = ("restore" if owns_path and stored.get("synced_hash")
+                            and stored.get("dev") == dev else "new")
+                missing += 1
+                where[rel] = len(plan)
+                plan.append(Action(kind, rel, size, dev, digest))
+                continue
+            matched += 1
+            dev_path, dev_size, dev_mtime = hit
+            if dev_size != size:
+                where[rel] = len(plan)
+                plan.append(Action("changed", rel, size, dev, digest))
+                if verify:
+                    # the device copy is not this content: no record may claim it does
+                    manifest.forget(dev_path)
+                continue
+            if verify:
+                # Exact: this pass read the device bytes, so equality is the digests.
+                got = device_hashes.get(dev_path.lower()) if device_hashes else None
+                if got is not None and got == digest:
+                    # The record is the content that was just read, with no timestamp: a
+                    # device clock cannot make this record stale or force a re-read.
+                    manifest.record(dev_path, rel, size, got, 0.0, profile.id)
+                    where[rel] = len(plan)
+                    plan.append(Action("equal", rel, size, dev, digest, verified=True))
+                else:
+                    where[rel] = len(plan)
+                    plan.append(Action("changed", rel, size, dev, digest))
+                    manifest.forget(dev_path)
+                continue
+            rec = manifest.get(dev_path)
+            trusted = (rec is not None and rec.get("profile") == profile.id
+                       and rec.get("rel") == rel
+                       and rec.get("hash") == digest
+                       and int(rec.get("size", -1)) == dev_size
+                       and not _device_mtime_moved(rec, dev_mtime))
+            if trusted:
+                where[rel] = len(plan)
+                plan.append(Action("equal", rel, size, dev, digest))
+                continue
+            if (rec is None or rec.get("profile") != profile.id
+                    or rec.get("rel") != rel or _device_mtime_moved(rec, dev_mtime)):
+                # No record to trust, or its timestamp moved: read the device copy and
+                # let the bytes decide. A timestamp is a hint, not evidence of a change.
+                if _same_contents(profile, backend, rel, dev_path, src_files[rel][0],
+                                  fresh=True):
+                    manifest.record(dev_path, rel, size, digest, dev_mtime, profile.id)
+                    where[rel] = len(plan)
+                    plan.append(Action("equal", rel, size, dev, digest, verified=True))
+                    continue
+            where[rel] = len(plan)
+            plan.append(Action("changed", rel, size, dev, digest))
+        # A file the library dropped is still on the device: mirror removes it here, and
+        # its device path is remembered so the scan cannot plan the same removal twice.
+        # In selected mode only copies this profile recorded are candidates, so a file
+        # that left the selection is removed while everything else on the device stays.
+        # Every recorded path is considered, not just one per rel: an old target or
+        # media-folder setting can have left several copies of the same file behind.
+        planned_deletes = set()
+        seen_stale = set()
+        stale = []
+        for rel, rec in list(store.records.items()):
+            if rel in src:
+                continue
+            if profile.selection_mode != "selected" and _other_media_folder(profile, rel, src):
+                continue
+            if "synced_hash" not in rec:
+                if profile.selection_mode != "selected":
+                    del store.records[rel]
+                continue
+            stale.append((rel, rec.get("dev") or rel))
+        if profile.selection_mode == "selected":
+            # A profile that has changed method still owns what its manifest recorded.
+            for rec in manifest.files.values():
+                rel = str(rec.get("rel") or "")
+                dev_path = str(rec.get("dev") or "")
+                if (not rel or rel in src or rec.get("profile") != profile.id
+                        or not dev_path.lower().startswith(prefix.lower())):
+                    continue
+                stale.append((rel, dev_path[len(prefix):]))
+        for rel, dev in sorted(stale):
+            path = (prefix + dev).lower()
+            if rel in src or path in planned_deletes or path in seen_stale:
+                continue
+            seen_stale.add(path)
+            # Never remove the live canonical path of another selected file because a
+            # corrupt or stale record happens to point at it.
+            other = canonical_by_low.get(path)
+            if other is not None and other != rel:
+                continue
+            if not _profile_can_delete(profile, rel):
+                continue
+            size = store.records.get(rel, {}).get("size", 0)
+            if profile.selection_mode == "selected":
+                hit = present.pop(path, None)
+                if hit is None:
+                    # Already gone from the device: drop the record that outlived it.
+                    store.records.pop(rel, None)
+                    manifest.forget(path)
+                    continue
+                size = hit[1]
+            planned_deletes.add(path)
+            plan.append(Action("delete", rel, size, dev))
+        if profile.selection_mode == "selected":
+            # Step 1's duplicate branch: a still-selected file has exactly one canonical
+            # device path. Any other path this profile recorded for it (an old target,
+            # a doubled Artists folder, a former filesystem name) is a stale copy.
+            for rel in sorted(src):
+                canon = canonical[rel].lower()
+                for dev_path in owned.get(rel, ()):
+                    low = dev_path.lower()
+                    if low == canon or low in seen_stale:
+                        continue
+                    seen_stale.add(low)
+                    other = canonical_by_low.get(low)
+                    if other is not None and other != rel:
+                        continue
+                    hit = present.pop(low, None)
+                    if hit is None:
+                        manifest.forget(dev_path)
+                        continue
+                    if not _profile_can_delete(profile, rel):
+                        continue
+                    planned_deletes.add(low)
+                    plan.append(Action("delete", rel, hit[1], dev_path[len(prefix):]))
+        if profile.selection_mode == "selected":
+            extras = kept = removed = 0
+        else:
+            extras, kept, removed = _scan_extras(
+                profile, backend, store, manifest, plan, where, src, prefix,
+                sorted(present.values()), planned_deletes, src_files, progress, log,
+                cancel, hashes=device_hashes)
+        if stats is not None:
+            hashes = list((device_hashes or {}).values())
+            stats.update({
+                "device_files": len(on_device),
+                "device_read": sum(1 for h in hashes if h),
+                "device_unreadable": sum(1 for h in hashes if not h),
+                "matches": sum(1 for a in plan if a.kind == "equal" and not a.extra),
+            })
+        if log:
+            tail = f" ({kept} kept, {removed} removed)" if extras else ""
+            log(f"SCAN     {target or 'the device folder'}: listed {considered} file(s) · "
+                f"{matched} matched · {missing} missing · {extras} extra{tail}")
+            if verify:
+                log(f"VERIFIED {target or 'the device folder'}: read and hashed "
+                    f"{len([h for h in device_hashes.values() if h])} file(s) in full; the "
+                    f"manifest now records that content, not a timestamp")
+        if progress:
+            progress(total, total, "Compare finished")
+        return plan
+    finally:
+        store.save()
+        manifest.save()
+
+
+def _verify_device_names(profile, backend, manifest, prefix, queue, log=None, cancel=lambda: False):
+    """After a sync, check one canonical device path for each selected file.
+
+    The old implementation walked every record in the manifest and copied whatever it
+    named. After a target or media-folder change that resurrected legacy paths, giving
+    the device a second copy of a track. The canonical path is now the only path this
+    pass may write; records for any other path are duplicates for Mirror to remove,
+    never copies for Verify to restore. Returns how many files still failed.
+    """
+    present = {k.lower() for k in backend.walk_files(prefix.rstrip("/"), cancel)}
+    files = profile_sync_files(profile, False)
+    names = _sync_names(profile, files.keys())
+    owned = {}
+    for rec in manifest.files.values():
+        dev_path = str(rec.get("dev") or "")
+        if rec.get("profile") != profile.id \
+                or not dev_path.lower().startswith(prefix.lower()):
+            continue
+        owned.setdefault(rec.get("rel") or "", []).append(rec)
+    failed = 0
+    for rel, (src, _size) in sorted(files.items()):
+        if cancel():
+            break
+        if not src or not os.path.isfile(src):
+            continue
+        records = [rec for rec in owned.get(rel, ()) if rec.get("dev")]
+        if not records:
+            continue
+        # One live copy per source is enough. If any recorded path is still present,
+        # nothing is missing; this is what keeps an adopted folder-mode copy from
+        # growing a second canonical copy. If all are gone, restore one: the canonical
+        # path in selected mode, otherwise the canonical path or the adopted one.
+        if any(rec["dev"].lower() in present for rec in records):
+            continue
+        dest = prefix + names[rel]
+        canonical = next((rec for rec in records
+                          if rec["dev"].lower() == dest.lower()), None)
+        if profile.selection_mode == "selected":
+            targets = [canonical] if canonical is not None else []
+        else:
+            targets = [canonical or records[0]]
+        for rec in targets:
+            target = rec["dev"]
+            try:
+                queue.submit(backend.copy_in, src, target).result()
+                manifest.record(target, rel, os.path.getsize(src), file_hash256(src),
+                                _device_mtime(backend, target) or rec.get("mtime", 0),
+                                profile.id)
+                if profile.selection_mode == "selected":
+                    for key, other in list(manifest.files.items()):
+                        if (key != target.lower() and other.get("profile") == profile.id
+                                and other.get("rel") == rel):
+                            manifest.files.pop(key, None)
+                if log:
+                    log(f"MISSING  {rel}: not on device, copied again")
+            except Exception as e:
+                failed += 1
+                if log:
+                    log(f"ERROR    {rel}: missing on device and copy again failed: {e}")
+    return failed
+
+
+def _execute_hashed(profile, backend, plan, progress=None, log=None, cancel=lambda: False):
+    """Run a hash plan. Every device write and delete goes through one worker thread,
+    so MTP operations are serialized. Records change only after a device op succeeds,
+    so a failed or interrupted transfer is never mistaken for a verified file."""
+    target = profile.target.strip("/")
+    prefix = (target + "/") if target else ""
+    store = HashStore(profile)
+    manifest = DeviceManifest(profile)
+    files = profile_sync_files(profile, False)
+    work = [a for a in plan if a.kind != "equal"]
+    errors, done = 0, 0
+    queue = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="mtp")
+    try:
+        for i, a in enumerate(work):
+            if cancel():
+                break
+            if progress:
+                progress(i, len(work), f"{a.kind}: {a.rel}")
+            try:
+                if a.kind in ("new", "restore", "changed"):
+                    dev = a.dev or a.rel
+                    dest = prefix + dev
+                    source_path = files.get(a.rel, ("", 0))[0]
+                    if not source_path:
+                        raise OSError(f"{a.rel} is no longer in the sync selection")
+                    queue.submit(backend.copy_in, source_path, dest).result()
+                    store.records.setdefault(a.rel, {}).update(synced_hash=a.hash, dev=dev)
+                    manifest.record(dest, a.rel, a.size, a.hash,
+                                    _device_mtime(backend, dest), profile.id)
+                    if profile.selection_mode == "selected":
+                        # One canonical path per selected file. A successful write
+                        # discards every older path recorded for the same source.
+                        for key, rec in list(manifest.files.items()):
+                            if (key != dest.lower()
+                                    and rec.get("profile") == profile.id
+                                    and rec.get("rel") == a.rel):
+                                manifest.files.pop(key, None)
+                    if log and dev != a.rel:
+                        log(f"NAME     {a.rel}: stored on the device as {dev}")
+                elif a.kind == "delete":
+                    queue.submit(backend.remove, prefix + a.dev).result()
+                    manifest.forget(prefix + a.dev)
+                    if a.rel not in files:
+                        # Only a file that left the selection loses its hash record.
+                        # Deleting a duplicate must not forget the canonical copy.
+                        store.records.pop(a.rel, None)
+                if log:
+                    log(f"{a.kind.upper():8} {a.rel}")
+                done += 1
+                if done % 25 == 0:
+                    store.save()
+                    manifest.save()
+            except Exception as e:  # keep going, report at end
+                errors += 1
+                if log:
+                    log(f"ERROR    {a.rel}: {e}")
+        if not cancel():
+            errors += _verify_device_names(profile, backend, manifest, prefix, queue, log, cancel)
+        cleanup = profile.mode == "mirror" and (
+            profile.selection_mode != "selected" or any(a.kind == "delete" for a in plan))
+        if cleanup and not cancel():
+            try:
+                queue.submit(backend.remove_empty_dirs, target).result()
+            except OSError:
+                pass
+    finally:
+        queue.shutdown(wait=True)
+        store.save()
+        manifest.save()
+    if errors and log:
+        log(f"{errors} file(s) could not be written and were skipped; the rest was synced. "
+            "Check the ERROR lines above.")
+    if progress:
+        progress(len(work), len(work), "Sync finished")
+    return errors
+
+
+def _transcoded_rel(dev_rel, codec):
+    """Device path of a transcoded file: the same name with the codec's extension."""
+    stem, _ext = os.path.splitext(dev_rel)
+    return stem + TRANSCODE_CODECS[codec][1]
+
+
+def compare(profile, backend, progress=None, cancel=lambda: False, verify=False, log=None,
+            stats=None):
+    """Build the plan. "bytes": equal-size files are compared byte by byte. "hash":
+    cached fingerprints and a device manifest, with verify=True forcing a full read.
+    log receives the quick scan's lines (what was listed, kept and removed); stats,
+    when given, receives what the verification actually read. In selected mode Mirror
+    deletes only the copies it recorded for files that are no longer selected."""
+    if profile.method == "hash" and not profile.transcode:
+        return _compare_hashed(profile, backend, progress, cancel, verify, log, stats)
+    src_files = profile_sync_files(profile, profile.audio_only)
+    src = {rel: size for rel, (_path, size) in src_files.items()}
+    target = profile.target.strip("/")
+    dst_raw = backend.walk_files(target, cancel)
+    prefix = (target + "/") if target else ""
+    # devices (FAT/exFAT/MTP) are case-insensitive -> match case-insensitively
+    dst = {}
+    for rel, size in dst_raw.items():
+        r = rel[len(prefix):] if rel.startswith(prefix) else rel
+        if profile.audio_only and not profile_is_media(profile, r):
+            continue
+        dst[r.lower()] = (r, size)
+    if profile.selection_mode != "selected":
+        dst = {key: row for key, row in dst.items()
+               if not _other_media_folder(profile, row[0], src)}
+
+    plan, total = [], len(src)
+    names = device_map(src.keys(), profile.filesystem)
+    # Bytes mode keeps its old "new" label for a missing file; the manifest is needed
+    # for transcode records and for knowing which copies a selected-item Mirror owns.
+    manifest = (DeviceManifest(profile)
+                if profile.transcode or profile.selection_mode == "selected" else None)
+    if profile.transcode:
+        names = {rel: (dev if is_lrc(rel)
+                       else _transcoded_rel(dev, profile.transcode))
+                 for rel, dev in names.items()}
+    for i, (rel, size) in enumerate(sorted(src.items())):
+        if cancel():
+            return plan
+        if progress:
+            progress(i, total, f"Comparing {rel}")
+        dev = names[rel]
+        hit = dst.pop(dev.lower(), None)
+        if hit is None:
+            rec = manifest.get(prefix + dev) if profile.transcode else None
+            kind = "restore" if rec is not None and rec.get("rel") == rel else "new"
+            plan.append(Action(kind, rel, size, dev))
+        elif profile.transcode:
+            # The device copy is an encode of this file: it matches when the manifest says it
+            # was made from the same source bytes at the same encode setting. A size check
+            # is meaningless here, and changing the bitrate must make the copy stale.
+            rec = manifest.get(prefix + hit[0])
+            wanted = profile.transcode_signature()
+            made_with = rec.get("encode") if rec else None
+            fresh = (bool(rec) and rec.get("hash")
+                     == file_hash256(src_files[rel][0])
+                     and made_with == wanted)
+            plan.append(Action("equal" if fresh else "changed", rel, size, dev, verified=fresh))
+        elif hit[1] != size:
+            plan.append(Action("changed", rel, size, dev))
+        else:
+            try:
+                same = files_equal(src_files[rel][0],
+                                   lambda: backend.open_read(prefix + hit[0]))
+            except OSError:
+                same = False
+            plan.append(Action("equal" if same else "changed", rel, size, dev, verified=same))
+    if profile.mode == "mirror":
+        if profile.selection_mode != "selected":
+            for r, size in sorted(dst.values()):
+                plan.append(Action("delete", r, size))
+        else:
+            # A selected-item Mirror owns only what this profile has written before.
+            # The manifest names those copies, so unticking an item removes its file
+            # while a file the app never wrote is left alone.
+            stale = []
+            for rec in manifest.files.values():
+                rel = str(rec.get("rel") or "")
+                dev_path = str(rec.get("dev") or "")
+                if (not rel or rel in src or rec.get("profile") != profile.id
+                        or not dev_path.lower().startswith(prefix.lower())):
+                    continue
+                dev = dev_path[len(prefix):]
+                hit = dst.pop(dev.lower(), None)
+                if hit is None:
+                    continue  # already gone from the device
+                stale.append((rel, hit[1], dev))
+            for rel, size, dev in sorted(stale):
+                plan.append(Action("delete", rel, size, dev))
+    if progress:
+        progress(total, total, "Compare finished")
+    return plan
+
+
+def execute(profile, backend, plan, progress=None, log=None, cancel=lambda: False):
+    """Run a plan. Bit-by-bit transfers are recorded in the device manifest too, so
+    switching a profile to Fast hash can trust them without reading the device."""
+    if profile.method == "hash" and not profile.transcode:
+        return _execute_hashed(profile, backend, plan, progress, log, cancel)
+    target = profile.target.strip("/")
+    prefix = (target + "/") if target else ""
+    manifest = DeviceManifest(profile)
+    files = profile_sync_files(profile, False)
+    work = [a for a in plan if a.kind != "equal"]
+    errors = 0
+    tmp = tempfile.mkdtemp(prefix="nebula-transcode-", dir=TMP_DIR) if profile.transcode else None
+    transcode_mode, transcode_quality = (profile.transcode_choice()
+                                         if profile.transcode else (None, None))
+    try:
+        for i, a in enumerate(work):
+            if cancel():
+                break
+            if progress:
+                progress(i, len(work), f"{a.kind}: {a.rel}")
+            try:
+                if a.kind in ("new", "restore", "changed"):
+                    src = files.get(a.rel, ("", 0))[0]
+                    if not src:
+                        raise OSError(f"{a.rel} is no longer in the sync selection")
+                    dest = prefix + (a.dev or a.rel)
+                    send = (src if tmp is None or is_lrc(src)
+                            else transcode_for_device(src, profile.transcode, tmp,
+                                                      transcode_mode, transcode_quality))
+                    try:
+                        backend.copy_in(send, dest)
+                    finally:
+                        if send != src and os.path.exists(send):
+                            os.remove(send)
+                    manifest.record(dest, a.rel, _size(src), file_hash256(src),
+                                    _device_mtime(backend, dest), profile.id,
+                                    encode=profile.transcode_signature())
+                    if log and (a.dev or a.rel) != a.rel:
+                        log(f"NAME     {a.rel}: stored on the device as {a.dev or a.rel}")
+                elif a.kind == "delete":
+                    dest = prefix + (a.dev or a.rel)
+                    backend.remove(dest)
+                    manifest.forget(dest)
+                if log:
+                    log(f"{a.kind.upper():8} {a.rel}")
+            except Exception as e:  # keep going, report at end
+                errors += 1
+                if log:
+                    log(f"ERROR    {a.rel}: {e}")
+        if errors and log:
+            log(f"{errors} file(s) could not be written and were skipped; the rest was synced. "
+                "Check the ERROR lines above.")
+        cleanup = profile.mode == "mirror" and (
+            profile.selection_mode != "selected" or any(a.kind == "delete" for a in plan))
+        if cleanup and not cancel():
+            try:
+                backend.remove_empty_dirs(target)
+            except OSError:
+                pass
+    finally:
+        manifest.save()
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if progress:
+        progress(len(work), len(work), "Sync finished")
+    return errors
+# ======================================================================
+# ui/common.py - worker thread, theme, player bar, spectrum, cover viewer
+# ======================================================================
+# ---------------------------------------------------------------- audio CDs
+# Linux only: the drive is read through its /dev/sr* node with the CDROM ioctls.
+# The user needs read access to that node (the cdrom group).
+CD_IOCTL_TOC_HEADER = 0x5305      # CDROMREADTOCHDR
+CD_IOCTL_TOC_ENTRY = 0x5306       # CDROMREADTOCENTRY
+CD_IOCTL_EJECT = 0x5309           # CDROMEJECT
+CD_IOCTL_LOCK_DOOR = 0x5329      # CDROM_LOCKDOOR
+CD_IOCTL_DRIVE_STATUS = 0x5326    # CDROM_DRIVE_STATUS
+CD_STATUS_NO_DISC = 1             # CDS_NO_DISC
+CD_STATUS_TRAY_OPEN = 2           # CDS_TRAY_OPEN
+CD_STATUS_NOT_READY = 3           # CDS_DRIVE_NOT_READY (spinning up or moving the tray)
+CD_STATUS_DISC_OK = 4             # CDS_DISC_OK
+CD_EJECT_WAIT = 15                # seconds to wait for the tray to open after an eject
+CD_BUSY_GONE = 30                 # seconds a drive may fail to answer before its disc is given up on
+CD_SCAN_RETRY = 10                # seconds before a disc whose table of contents failed is tried again
+CD_POLL_SECONDS = 2               # how often the drives are checked for a disc, off the GUI thread
+CD_SLOT_CURRENT = 0x7FFFFFFF      # CDSL_CURRENT
+CD_LBA_FORMAT = 1                 # CDROM_LBA
+CD_LEADOUT = 0xAA                 # track number that addresses the lead-out
+CD_PREGAP = 150                   # frames of lead-in before LBA 0 (2 seconds)
+CD_FRAMES_PER_SECOND = 75
+CD_CTRL_DATA = 0x04               # control bit set on data tracks
+
+
+@dataclass
+class CdTrack:
+    number: int
+    start: int        # LBA of the first frame
+    frames: int
+    audio: bool
+    title: str = ""
+
+
+@dataclass
+class CdDisc:
+    device: str
+    tracks: list
+    leadout: int      # LBA of the lead-out
+    disc_id: str = ""
+    mb_id: str = ""
+    artist: str = ""
+    album: str = ""
+    date: str = ""
+    genre: str = ""
+
+    @property
+    def audio_tracks(self):
+        return [t for t in self.tracks if t.audio]
+
+    def track(self, number):
+        return next(t for t in self.tracks if t.number == number)
+
+
+def mb_disc_id(first, last, leadout, starts):
+    """The MusicBrainz disc ID (the CD Index SHA-1 of the table of contents).
+
+    first/last are the first and last audio track numbers, leadout the lead-out
+    LBA and starts maps track number to its start LBA. The hashed values are in
+    hex and include the 150-frame pregap; the 99 track slots are zero-padded.
+    """
+    offsets = [0] * 99
+    for number, lba in starts.items():
+        if 1 <= number <= 99:
+            offsets[number - 1] = lba + CD_PREGAP
+    text = "%02X%02X%08X" % (first, last, leadout + CD_PREGAP)
+    text += "".join("%08X" % off for off in offsets)
+    digest = hashlib.sha1(text.encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii").translate(str.maketrans("+/=", "._-"))
+
+
+def cd_drive_nodes():
+    """The optical drive nodes on this machine."""
+    try:
+        names = os.listdir("/dev")
+    except OSError:
+        return []
+    return sorted(os.path.join("/dev", n) for n in names if re.fullmatch(r"sr\d+", n))
+
+
+def cd_drive_state(device):
+    """What one drive reports right now: "disc", "empty" or "busy".
+
+    "empty" is the drive saying there is no disc in it, or that its tray is open: the disc
+    that was there has gone, whoever and whatever took it out, so it is the only answer
+    that counts as proof. "busy" is a drive that is spinning up, moving its tray, or cannot
+    be asked at all (the node is not openable right now), which says nothing about whether
+    its disc is still in it: a disc left in a slow drive must not lose its buffer during
+    the seconds that drive takes to answer. A drive that is no longer there - unplugged -
+    is not listed by cd_drive_nodes() at all.
+    """
+    try:
+        fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return "busy"
+    try:
+        try:
+            status = fcntl.ioctl(fd, CD_IOCTL_DRIVE_STATUS, CD_SLOT_CURRENT)
+        except OSError:
+            return "busy"
+    finally:
+        os.close(fd)
+    if status == CD_STATUS_DISC_OK:
+        return "disc"
+    if status in (CD_STATUS_NO_DISC, CD_STATUS_TRAY_OPEN):
+        return "empty"
+    return "busy"
+
+
+def cd_drive_states():
+    """What every optical drive reports now: {node: "disc", "empty" or "busy"}.
+
+    This is the one look at the drives a check makes, so a disc is never reported present
+    by one probe and gone by another: everything - which drive holds a disc, which drives
+    are certainly empty - is read from this answer.
+    """
+    return {node: cd_drive_state(node) for node in cd_drive_nodes()}
+
+
+def cd_disc_device(states=None):
+    """The first drive that holds a disc, or None. Takes the states if they are in hand."""
+    states = cd_drive_states() if states is None else states
+    for node in sorted(states):
+        if states[node] == "disc":
+            return node
+    return None
+
+
+def read_cd_toc(device):
+    """Read the table of contents of the disc in device. Raises OSError when it can't be read."""
+    fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        header = bytearray(2)
+        fcntl.ioctl(fd, CD_IOCTL_TOC_HEADER, header)
+        first, last = header[0], header[1]
+        entries = {}
+        for number in list(range(first, last + 1)) + [CD_LEADOUT]:
+            # struct cdrom_tocentry: track, adr/ctrl, format, lba, datamode (padded to 12 bytes)
+            entry = bytearray(struct.pack("=BBBxiBxxx", number, 0, CD_LBA_FORMAT, 0, 0))
+            fcntl.ioctl(fd, CD_IOCTL_TOC_ENTRY, entry)
+            _, adr_ctrl, _, lba = struct.unpack_from("=BBBxi", entry, 0)
+            # the control nibble (low four bits) carries the data flag; the ADR nibble is high
+            is_audio = not (adr_ctrl & CD_CTRL_DATA)
+            entries[number] = (lba, is_audio)
+    finally:
+        os.close(fd)
+    leadout = entries[CD_LEADOUT][0]
+    numbers = list(range(first, last + 1))
+    tracks = []
+    for i, number in enumerate(numbers):
+        start, is_audio = entries[number]
+        end = entries[numbers[i + 1]][0] if i + 1 < len(numbers) else leadout
+        tracks.append(CdTrack(number, start, max(0, end - start), is_audio))
+    disc = CdDisc(device, tracks, leadout)
+    if not disc.audio_tracks:
+        raise OSError("no audio tracks on this disc")
+    # The disc ID covers the whole table of contents, data tracks included.
+    disc.disc_id = mb_disc_id(tracks[0].number, tracks[-1].number, leadout,
+                              {t.number: t.start for t in tracks})
+    return disc
+
+
+def cd_tray_open(device, seconds):
+    """Wait up to seconds for the drive to report its tray open with no disc in it. True once it does.
+
+    Only that state counts. While the tray moves the drive reports not ready, and a disc that is
+    still in the drive reports disc OK, so neither is taken as ejected.
+    """
+    end = time.monotonic() + seconds
+    while True:
+        try:
+            fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                status = fcntl.ioctl(fd, CD_IOCTL_DRIVE_STATUS, CD_SLOT_CURRENT)
+            finally:
+                os.close(fd)
+            if status in (CD_STATUS_NO_DISC, CD_STATUS_TRAY_OPEN):
+                return True
+        except OSError:
+            pass
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.2)
+
+
+def eject_cd(device):
+    """Open the drive tray and confirm the disc has left the drive. Raises OSError otherwise."""
+    fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        try:
+            fcntl.ioctl(fd, CD_IOCTL_LOCK_DOOR, 0)   # unlock the door first, in case it is locked
+        except OSError:
+            pass
+        fcntl.ioctl(fd, CD_IOCTL_EJECT, 0)
+    finally:
+        os.close(fd)
+    if cd_tray_open(device, CD_EJECT_WAIT):
+        return
+    # Some drives and kernels ignore the ioctl; the eject program has other ways to open the tray.
+    exe = shutil.which("eject")
+    if exe:
+        try:
+            subprocess.run([exe, device], capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+        if cd_tray_open(device, CD_EJECT_WAIT):
+            return
+    raise OSError("the drive did not open its tray, so the disc is still in the drive")
+
+
+class CdWatcher(QThread):
+    """Watch the optical drives, and read a new disc's table of contents, off the GUI thread.
+
+    Opening a drive node and asking the kernel for its status can block for seconds while a
+    disc spins up, and the tray poll after an eject waits on the drive too. None of that may
+    run in the GUI thread: while the drive settles the window stops responding and the
+    desktop offers to force-quit it. One pass per tick keeps the checks from overlapping, so
+    a slow drive never piles up work.
+    """
+    reading = Signal(str)      # a disc is in this drive and its table of contents is being read
+    found = Signal(object)     # a CdDisc whose table of contents has been read
+    failed = Signal(str)       # a disc is in a drive but can't be read, such as a data disc
+    gone = Signal(str)         # this drive says it is empty: the disc that was in it has left
+    lost = Signal()            # the drives hold no disc at all
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._paused = False
+        self._epoch = 0
+        self.device = None        # the drive holding a disc, as last seen by this thread
+        self._state = "none"      # none: no disc; ready: table of contents read; failed: can't read it
+        self._retry_at = 0.0      # when a disc that couldn't be read may be tried again
+        self._bad_device = None   # the drive whose table of contents last failed
+        self._unconfirmed = False  # a drive couldn't answer: confirm the disc when it can
+        self._busy_since = 0.0    # when the drives stopped being able to confirm anything
+
+    def start(self, *args, **kwargs):
+        """Start watching; a watcher that was stopped can be started again."""
+        self._stop.clear()
+        super().start(*args, **kwargs)
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def poke(self):
+        """Check the drives now instead of waiting for the next tick."""
+        self._retry_at = 0.0
+        self._wake.set()
+
+    def pause(self):
+        """Stop touching the drive while the app itself moves the tray.
+
+        Whatever the drive was showing before the eject no longer holds, so it is forgotten;
+        any read still in flight when the tray starts moving is dropped, not reported.
+        """
+        self._paused = True
+        self._epoch += 1
+        self._state = "none"
+        self.device = None
+        self._wake.set()
+
+    def resume(self):
+        self._paused = False
+        self._retry_at = 0.0
+        self._bad_device = None
+        self._unconfirmed = False
+        self._busy_since = 0.0
+        self._wake.set()
+
+    def _drives_gone(self, states):
+        """Whether the disc that was in a drive has certainly left it.
+
+        Only a drive that says it is empty counts, so a disc left in one during the seconds
+        it spends spinning up, or in a drive that is not answering right now, keeps its
+        buffer. A drive that cannot answer at all for CD_BUSY_GONE seconds is the one
+        exception: the app can no longer confirm anything about its disc, and the disc that
+        was read from it is not going to be trusted either.
+        """
+        if not states or all(state == "empty" for state in states.values()):
+            self._busy_since = 0.0
+            return True
+        if not self._busy_since:
+            self._busy_since = time.monotonic()
+        if time.monotonic() - self._busy_since >= CD_BUSY_GONE:
+            self._busy_since = 0.0
+            return True
+        return False
+
+    def _report_gone_drives(self, states, holder):
+        """Every other drive that says it is empty has lost the disc it was buffered from.
+
+        A drive that says it is empty is sure about it, so the disc that was read in it has
+        gone and what was buffered from it goes too. The drive holding the disc the app is
+        looking at is not one of them, so this never reports the disc in use.
+        """
+        for node, state in states.items():
+            if node != holder and state == "empty" and CD_BUFFER.disc_in(node):
+                self.gone.emit(node)
+
+    def run(self):
+        while not self._stop.is_set():
+            self._check()
+            self._wake.wait(CD_POLL_SECONDS)
+            self._wake.clear()
+
+    def _check(self):
+        """One pass over the drives. Runs in this thread, or in the caller's thread for tests."""
+        if self._paused:
+            return
+        epoch = self._epoch
+        states = cd_drive_states()
+        device = cd_disc_device(states)
+        if device is None:
+            # Nothing holds a disc that can be read. That is only the same as "the disc has
+            # gone" when a drive says so: a drive that is still answering is taken at its
+            # word, and the disc is confirmed again once one of them reports a disc.
+            if not self._drives_gone(states):
+                self._unconfirmed = True
+                return
+            self._state = "none"
+            self.device = None
+            self._retry_at = 0.0
+            self._bad_device = None
+            self._unconfirmed = False
+            self.lost.emit()
+            return
+        self._busy_since = 0.0
+        self._report_gone_drives(states, device)
+        if self._state == "ready" and device == self.device and not self._unconfirmed:
+            return                                  # still the disc we already know about
+        if self._state == "failed" and device == self._bad_device and time.monotonic() < self._retry_at:
+            return                                  # let the drive settle before trying again
+        self._unconfirmed = False
+        self.device = device
+        if self._bad_device != device:
+            self.reading.emit(device)
+        try:
+            disc = read_cd_toc(device)
+        except OSError as exc:
+            if epoch != self._epoch:
+                return
+            self._state = "failed"
+            self._retry_at = time.monotonic() + CD_SCAN_RETRY
+            if self._bad_device != device:
+                self._bad_device = device
+                self.failed.emit(str(exc) or "the disc could not be read")
+            return
+        if epoch != self._epoch:
+            return                                  # the tray moved while the disc was being read
+        self._state = "ready"
+        self._bad_device = None
+        self._retry_at = 0.0
+        self.found.emit(disc)
+
+
+def _mb_credit(credit):
+    """Join a MusicBrainz artist-credit list into one display name."""
+    return "".join((c.get("name") or (c.get("artist") or {}).get("name", "")) + c.get("joinphrase", "")
+                   for c in credit or [] if isinstance(c, dict)).strip()
+
+
+def _mb_disc_query(url):
+    """GET one discid lookup; None when MusicBrainz doesn't know the disc."""
+    try:
+        return json.loads(mb_get(url).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+def mb_lookup_disc(disc):
+    """Find the release for an audio CD on MusicBrainz, by disc ID then by table of contents.
+
+    Fills in artist, album, date, genre, mb_id and the track titles. True on a match.
+    """
+    inc = "inc=recordings+artist-credits+genres"
+    data = _mb_disc_query(f"{MB_ROOT}/discid/{disc.disc_id}?{inc}&fmt=json")
+    if not (data or {}).get("releases"):
+        toc = [disc.tracks[0].number, disc.tracks[-1].number, disc.leadout + CD_PREGAP]
+        toc += [t.start + CD_PREGAP for t in disc.tracks]
+        toc_text = "+".join(str(v) for v in toc)
+        data = _mb_disc_query(f"{MB_ROOT}/discid/-?toc={toc_text}&{inc}&fmt=json")
+    releases = (data or {}).get("releases") or []
+    if not releases:
+        return False
+    _mb_apply_release(disc, releases[0])
+    return True
+
+
+def _mb_apply_release(disc, release):
+    """Copy a MusicBrainz release onto the disc: names, date, genre, ID and track titles."""
+    disc.mb_id = release.get("id", "")
+    disc.album = release.get("title", "")
+    disc.date = release.get("date", "")
+    disc.artist = _mb_credit(release.get("artist-credit"))
+    genres = release.get("genres") or []
+    disc.genre = genres[0].get("name", "") if genres and isinstance(genres[0], dict) else ""
+    media = release.get("media") or []
+    medium = next((m for m in media if any(d.get("id") == disc.disc_id for d in m.get("discs") or [])),
+                  media[0] if media else {})
+    titles = {}
+    for track in medium.get("tracks") or []:
+        titles[int(track.get("position") or 0)] = (track.get("title")
+                                                   or (track.get("recording") or {}).get("title", ""))
+    for track in disc.tracks:
+        track.title = titles.get(track.number, "")
+
+
+def mb_apply_release_id(disc, release_id):
+    """Fill in the disc from one MusicBrainz release the user picked."""
+    data = json.loads(mb_get(f"{MB_ROOT}/release/{release_id}?inc=recordings+artist-credits&fmt=json")
+                      .decode("utf-8"))
+    _mb_apply_release(disc, data)
+
+
+def mb_text_search(query):
+    """Text search of MusicBrainz releases, for the Find release dialog."""
+    data = json.loads(mb_get(f"{MB_ROOT}/release/?query={quote(query)}&limit=20&fmt=json").decode("utf-8"))
+    hits = []
+    for rel in data.get("releases") or []:
+        title = " \u2014 ".join(x for x in (_mb_credit(rel.get("artist-credit")), rel.get("title", "")) if x)
+        hits.append({"source": "musicbrainz", "id": rel.get("id", ""), "title": title,
+                     "year": (rel.get("date") or "")[:4]})
+    return hits
+
+
+# Discogs has no disc ID lookup, so it is searched by text (Find release) after an OAuth sign-in,
+# the same way Mp3tag does it: the user approves the app in the browser and pastes the code back.
+# Register the app at discogs.com/settings/developers and set both values. Until then, sign-in is off.
+DISCOGS_ROOT = "https://api.discogs.com"
+DISCOGS_WEB = "https://www.discogs.com"
+DISCOGS_CONSUMER_KEY = "bsunsiTXAcMMmvswmFTH"
+DISCOGS_CONSUMER_SECRET = "hvjGYjyGQLSglxDnIPtaXVphKgAGmIbI"
+# Identification sources: key -> label. Preferences > Identification stores the order and on/off state.
+ID_SOURCES = {"cddb": "CDDB", "discogs": "Discogs", "musicbrainz": "MusicBrainz"}
+DEFAULT_ID_ORDER = [["cddb", True], ["discogs", True], ["musicbrainz", True]]
+# Sources that can name a disc from its table of contents. Discogs has no disc ID lookup.
+DISC_ID_SOURCES = ("cddb", "musicbrainz")
+
+
+def id_order_entries(cfg):
+    """The source order as the preferences list shows it, with new sources appended.
+
+    A config saved by an older version has no CDDB row. It is added at the front
+    and switched on, so an upgraded library gets CDDB's wider coverage without the
+    user having to reorder anything; the Up/Down buttons still change it.
+    """
+    saved = [[key, bool(enabled)] for key, enabled in (cfg.get("id_order") or [])
+             if key in ID_SOURCES]
+    known = {key for key, _enabled in saved}
+    for key, enabled in reversed(DEFAULT_ID_ORDER):
+        if key not in known:
+            saved.insert(0, [key, enabled])
+    return saved
+
+
+def id_order(cfg):
+    """The enabled identification sources, in the priority order the user set."""
+    return [key for key, enabled in id_order_entries(cfg) if enabled]
+
+
+def discogs_connected(cfg):
+    return bool(DISCOGS_CONSUMER_KEY and cfg.get("discogs_token") and cfg.get("discogs_secret"))
+
+
+def discogs_request(method, path, params=None, token="", token_secret="", extra=None):
+    """One Discogs API call, signed with OAuth 1.0a using the PLAINTEXT signature Discogs supports."""
+    if not DISCOGS_CONSUMER_KEY:
+        raise OSError("Discogs sign-in is not set up in this build")
+    oauth = {"oauth_consumer_key": DISCOGS_CONSUMER_KEY,
+             "oauth_nonce": uuid.uuid4().hex,
+             "oauth_signature_method": "PLAINTEXT",
+             "oauth_timestamp": str(int(time.time())),
+             "oauth_signature": f"{DISCOGS_CONSUMER_SECRET}&{token_secret}"}
+    if token:
+        oauth["oauth_token"] = token
+    oauth.update(extra or {})
+    header = "OAuth " + ", ".join(f'{k}="{quote(str(v), safe="~")}"' for k, v in oauth.items())
+    url = DISCOGS_ROOT + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, data=b"" if method == "POST" else None, method=method, headers={
+        "User-Agent": MB_UA,
+        "Authorization": header,
+        "Accept": "application/vnd.discogs.v2.discogs+json",
+    })
+    with urllib.request.urlopen(req, timeout=15) as response:
+        body = response.read().decode("utf-8")
+        ctype = response.headers.get("Content-Type", "")
+    return json.loads(body) if "json" in ctype else dict(urllib.parse.parse_qsl(body))
+
+
+def discogs_begin_auth():
+    """Sign-in step 1: a request token, and the Discogs page where the user approves the app."""
+    tok = discogs_request("POST", "/oauth/request_token", extra={"oauth_callback": "oob"})
+    return tok["oauth_token"], tok["oauth_token_secret"], f"{DISCOGS_WEB}/oauth/authorize?oauth_token={tok['oauth_token']}"
+
+
+def discogs_finish_auth(token, token_secret, verifier):
+    """Sign-in step 2: trade the code the user copied from Discogs for an access token."""
+    acc = discogs_request("POST", "/oauth/access_token", token=token, token_secret=token_secret,
+                          extra={"oauth_verifier": verifier})
+    return acc["oauth_token"], acc["oauth_token_secret"]
+
+
+def discogs_search(query, token, token_secret):
+    """Release search on Discogs, for the Find release dialog."""
+    data = discogs_request("GET", "/database/search", {"q": query, "type": "release", "per_page": 20},
+                           token, token_secret)
+    return [{"source": "discogs", "id": str(item.get("id", "")), "title": item.get("title", ""),
+             "year": str(item.get("year") or "")} for item in data.get("results") or []]
+
+
+def discogs_apply_release(disc, release_id, token, token_secret):
+    """Fill in the disc from one Discogs release: names, year and the audio track titles."""
+    rel = discogs_request("GET", f"/releases/{release_id}", None, token, token_secret)
+    disc.album = rel.get("title", "")
+    disc.artist = ", ".join(re.sub(r" \(\d+\)$", "", a.get("name", "")) for a in rel.get("artists") or [])
+    disc.date = str(rel.get("year") or "")
+    styles = [str(x) for x in (rel.get("styles") or rel.get("genres") or []) if x]
+    disc.genre = ", ".join(styles[:2])
+    titles = [t.get("title", "") for t in rel.get("tracklist") or [] if t.get("type_", "track") == "track"]
+    for track, title in zip(disc.audio_tracks, titles):
+        track.title = title
+
+
+# CDDB through the freedb protocol. GNUdb is freedb's successor; dBpoweramp's freedb server
+# still holds the old freedb catalogue, and RetroBridge is a public CDDB gateway backed by
+# MusicBrainz. All three are HTTP CGI endpoints and are tried in turn: a host that can't be
+# reached costs one short wait, then the next one is asked, so one dead service no longer
+# leaves a disc unnamed. Protocol level 6 means the answer is UTF-8. CDDB is matched by disc
+# ID only (there is no text search in the protocol), so Find release stays on MusicBrainz and
+# Discogs.
+CDDB_SERVERS = (
+    ("GNUdb", "http://gnudb.gnudb.org/~cddb/cddb.cgi"),
+    ("dBpoweramp freedb", "http://freedb.dbpoweramp.com/~cddb/cddb.cgi"),
+    ("RetroBridge", "http://cddb.retrobridge.org/~cddb/cddb.cgi"),
+)
+CDDB_TIMEOUT = 6                 # seconds per server, so a black-holed host can't stall a lookup
+CDDB_DEAD_SECONDS = 300          # how long a server that didn't answer is skipped
+CDDB_STATE = {"url": "", "dead": {}}   # the server that last answered, and those that didn't
+CDDB_HELLO = f"nebula spectra-player.github.io {APP_SHORT} {VERSION}"
+
+
+def cddb_digit_sum(value):
+    """The sum of the decimal digits of value, as the CDDB disc ID is built from."""
+    total = 0
+    while value:
+        total += value % 10
+        value //= 10
+    return total
+
+
+def cddb_disc_id(disc):
+    """The eight-digit CDDB disc ID for a table of contents.
+
+    CDDB adds up the decimal digits of every track's start in whole seconds (frames are
+    dropped), then packs that sum modulo 255 with the disc's length in seconds and the
+    number of tracks. It is a different ID from the MusicBrainz one.
+    """
+    starts = [(track.start + CD_PREGAP) // CD_FRAMES_PER_SECOND for track in disc.tracks]
+    checksum = sum(cddb_digit_sum(value) for value in starts) % 255
+    seconds = (disc.leadout + CD_PREGAP) // CD_FRAMES_PER_SECOND - starts[0]
+    return "%08x" % ((checksum << 24) | (seconds << 8) | len(starts))
+
+
+def cddb_endpoints(server=""):
+    """The CDDB URLs to try, in order: a chosen server, the one that worked, then the rest."""
+    now = time.monotonic()
+    urls = []
+    for url in (server, CDDB_STATE["url"]) + tuple(url for _name, url in CDDB_SERVERS):
+        if not url or url in urls:
+            continue
+        dead = CDDB_STATE["dead"].get(url)
+        if dead is not None and now - dead < CDDB_DEAD_SECONDS and url != server:
+            continue
+        urls.append(url)
+    return urls
+
+
+def cddb_request(command, server=""):
+    """Run one CDDB command, trying each server until one answers.
+
+    Returns (answer text, the URL that answered). A server that can't be reached is
+    remembered and skipped for CDDB_DEAD_SECONDS, so a dead host costs one wait rather
+    than one on every insert, and the server that answered is tried first from then on.
+    """
+    query = urllib.parse.urlencode({"cmd": command, "hello": CDDB_HELLO, "proto": "6"})
+    last = ""
+    for url in cddb_endpoints(server):
+        host = urllib.parse.urlsplit(url).netloc
+        try:
+            text = http_get(url + "?" + query, timeout=CDDB_TIMEOUT,
+                            accept="text/plain").decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            last = f"HTTP {exc.code} from {host}"   # a reachable server that refused the command
+            continue
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last = f"{host}: {getattr(exc, 'reason', None) or exc}"
+            CDDB_STATE["dead"][url] = time.monotonic()
+            continue
+        CDDB_STATE["url"] = url
+        CDDB_STATE["dead"].pop(url, None)
+        return text, url
+    raise OSError("no server answered" + (f" (last: {last})" if last else ""))
+
+
+def cddb_query(disc, server=""):
+    """The CDDB entries for this disc, as (category, disc id, title) tuples, best first.
+
+    Returns (entries, the server URL that answered).
+    """
+    offsets = [track.start + CD_PREGAP for track in disc.tracks]
+    command = "cddb query %s %d %s %d" % (
+        cddb_disc_id(disc), len(offsets), " ".join(str(offset) for offset in offsets),
+        (disc.leadout + CD_PREGAP) // CD_FRAMES_PER_SECOND)
+    text, url = cddb_request(command, server)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise OSError("CDDB sent an empty answer")
+    status = lines[0]
+    if status.startswith("202"):
+        return [], url                              # the database doesn't know this disc
+    if not status.startswith(("200", "210", "211")):
+        raise OSError(f"unexpected answer ({status})")
+    entries = []
+    if status.startswith("200"):
+        parts = status.split(None, 3)               # 200 category discid "Artist / Album"
+        if len(parts) >= 3:
+            entries.append((parts[1], parts[2], parts[3] if len(parts) > 3 else ""))
+    for line in lines[1:]:
+        if line == ".":
+            break
+        parts = line.split(None, 2)
+        if len(parts) >= 2:
+            entries.append((parts[0], parts[1], parts[2] if len(parts) > 2 else ""))
+    return entries, url
+
+
+def cddb_unescape(value):
+    """Resolve the \\n, \\t and \\\\ escapes CDDB uses inside a field."""
+    out, i = [], 0
+    while i < len(value):
+        char = value[i]
+        if char == "\\" and i + 1 < len(value):
+            out.append({"n": "\n", "t": "\t", "\\": "\\"}.get(value[i + 1], "\\" + value[i + 1]))
+            i += 2
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def cddb_read(category, disc_id, server=""):
+    """The fields of one CDDB entry. Repeated keys are continuation lines, so they join."""
+    text, _url = cddb_request(f"cddb read {category} {disc_id}", server)
+    lines = text.splitlines()
+    status = lines[0].strip() if lines else ""
+    if not status.startswith(("210", "211")):
+        raise OSError("read failed (" + (status or "empty answer") + ")")
+    fields = {}
+    for raw in lines[1:]:
+        line = raw.rstrip("\r")
+        if line.strip() == ".":
+            break
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            key = key.strip().upper()
+            fields[key] = fields.get(key, "") + value
+    return fields
+
+
+def cddb_apply_entry(disc, fields):
+    """Fill the disc from a CDDB entry: DTITLE is 'Artist / Album', plus year and titles."""
+    title = cddb_unescape(fields.get("DTITLE", "")).strip()
+    artist, sep, album = title.partition(" / ")
+    disc.artist = artist.strip()
+    disc.album = (album if sep else title).strip()
+    year = fields.get("DYEAR", "").strip()
+    disc.date = year if year and year != "0" else ""      # CDDB writes 0 for an unknown year
+    disc.genre = cddb_unescape(fields.get("DGENRE", "")).strip()
+    for track in disc.tracks:
+        track.title = cddb_unescape(fields.get("TTITLE%d" % (track.number - 1), "")).strip()
+
+
+def cddb_lookup_disc(disc):
+    """Fill the disc in from CDDB. True when one of the servers knows this disc ID."""
+    entries, url = cddb_query(disc)
+    if not entries:
+        return False
+    category, disc_id, _title = entries[0]
+    cddb_apply_entry(disc, cddb_read(category, disc_id, url))
+    return bool(disc.artist or disc.album)      # an empty entry is no better than none
+
+
+def identify_disc(disc, cfg):
+    """Identify a disc with the enabled disc-ID sources, in the user's order.
+
+    Returns (source key, errors, answered). A source that is down is reported and the next
+    one tried, so one bad service never costs the disc its names. answered says whether any
+    source gave a real answer, which tells "no match anywhere" from "nothing could be asked".
+    """
+    errors, answered = [], False
+    for key in id_order(cfg):
+        if key not in DISC_ID_SOURCES:
+            continue
+        try:
+            found = cddb_lookup_disc(disc) if key == "cddb" else mb_lookup_disc(disc)
+        except Exception as exc:
+            errors.append("%s: %s" % (ID_SOURCES[key], lookup_error_text(exc)))
+            continue
+        if found:
+            return key, errors, True
+        answered = True
+    return "", errors, answered
+
+
+def lookup_error_text(exc):
+    """One line for a failed lookup, whichever source it came from."""
+    lines = [line for line in str(exc or "").strip().splitlines() if line.strip()]
+    return lines[-1] if lines else "unknown error"
+
+
+def apply_release_hit(disc, hit, cfg):
+    """Fill in the disc from a search result the user picked in the Find release dialog."""
+    if hit["source"] == "discogs":
+        discogs_apply_release(disc, hit["id"], cfg.get("discogs_token", ""), cfg.get("discogs_secret", ""))
+    else:
+        mb_apply_release_id(disc, hit["id"])
+
+
+# codec key -> (menu label, file extension)
+RIP_CODECS = {
+    "flac": ("FLAC (lossless)", ".flac"),
+    "alac": ("ALAC (lossless, .m4a)", ".m4a"),
+    "mp3": ("MP3 (LAME)", ".mp3"),
+    "m4a": ("AAC (.m4a)", ".m4a"),
+    "opus": ("Opus (.opus)", ".opus"),
+}
+RIP_LOSSLESS = ("flac", "alac")
+# (codec, mode) -> (min, max, default, label, decimals); lossless codecs use mode ""
+RIP_QUALITY = {
+    ("flac", ""): (0, 12, 5, "Compression level (0 fastest, 12 smallest)", 0),
+    ("mp3", "vbr"): (0, 9, 0, "VBR quality (V0 best, V9 smallest)", 0),
+    ("mp3", "cbr"): (96, 320, 320, "Bitrate (kbps)", 0),
+    ("m4a", "vbr"): (0.1, 2.0, 1.5, "VBR scale (ffmpeg -q:a, higher is better)", 1),
+    ("m4a", "cbr"): (96, 320, 256, "Bitrate (kbps)", 0),
+    ("opus", "vbr"): (32, 256, 128, "Target bitrate (kbps)", 0),
+    ("opus", "cbr"): (32, 256, 256, "Bitrate (kbps)", 0),
+}
+# The perceptually lossless starting point for each lossy setting (average bitrates measured
+# on a sample clip where noted). Confirm with an ABX test on your own gear.
+RIP_PERCEPTUAL = {
+    ("mp3", "vbr"): (0, "Perceptually lossless: V0 is the usual transparent setting, "
+                         "about 260 kbps average on the clip measured here. V2 (about 200 kbps) is a common smaller choice."),
+    ("mp3", "cbr"): (320, "Perceptually lossless: CBR cannot adapt to easy passages, so 320 kbps is the "
+                           "closest CBR gets. VBR V0 is more efficient."),
+    ("m4a", "vbr"): (1.5, "Perceptually lossless: scale 1.5 averages about 280 kbps on the clip measured here."),
+    ("m4a", "cbr"): (256, "Perceptually lossless: AAC at 256 kbps CBR is the usual transparent setting."),
+    ("opus", "vbr"): (128, "Perceptually lossless: Opus VBR at 128 kbps is generally transparent for stereo music."),
+    ("opus", "cbr"): (256, "Perceptually lossless: Opus is designed for VBR. CBR at 256 kbps is a generous ceiling "
+                           "that wastes bits; use VBR 128 kbps instead."),
+}
+RIP_LOSSLESS_NOTE = {
+    "flac": "Lossless: the level changes only file size and encode time. The audio is bit-identical at every level.",
+    "alac": "Lossless (Apple Lossless): there is no quality setting. The audio is bit-identical to the disc.",
+}
+
+
+def rip_ffmpeg_args(codec, mode, quality, src, dst, meta):
+    """The ffmpeg arguments that encode the WAV src to dst. meta is a list of (tag, value)."""
+    args = ["-hide_banner", "-nostdin", "-y", "-i", src, "-vn", "-map_metadata", "-1"]
+    for key, value in meta:
+        if value:
+            args += ["-metadata", f"{key}={value}"]
+    if codec == "flac":
+        args += ["-c:a", "flac", "-compression_level", str(int(quality))]
+    elif codec == "alac":
+        args += ["-c:a", "alac"]
+    elif codec == "mp3":
+        args += ["-c:a", "libmp3lame"]
+        args += ["-q:a", str(int(quality))] if mode == "vbr" else ["-b:a", f"{int(quality)}k"]
+    elif codec == "m4a":
+        args += ["-c:a", "aac"]
+        args += ["-q:a", f"{float(quality):.2f}"] if mode == "vbr" else ["-b:a", f"{int(quality)}k"]
+    elif codec == "opus":
+        args += ["-c:a", "libopus", "-b:a", f"{int(quality)}k", "-vbr", "on" if mode == "vbr" else "off"]
+    else:
+        raise ValueError(f"unknown codec {codec!r}")
+    return args + [dst]
+
+
+def encode_wav(src, dst, codec, mode, quality, meta):
+    """Encode the WAV src to dst with ffmpeg. Raises RuntimeError on failure."""
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise RuntimeError("ffmpeg is not installed")
+    proc = subprocess.run([exe] + rip_ffmpeg_args(codec, mode, quality, src, dst, meta),
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0 or not os.path.exists(dst):
+        if os.path.exists(dst):
+            os.remove(dst)
+        raise RuntimeError(f"ffmpeg could not encode {os.path.basename(dst)}: "
+                           f"{(proc.stderr or '').strip()[-300:]}")
+
+
+def transcode_for_device(src, codec, out_dir, mode=None, quality=None):
+    """Encode a library file to codec (a TRANSCODE_CODECS key) in out_dir for copying to a
+    device. mode/quality pick one of TRANSCODE_BITRATES; left out, the codec's default is
+    used. Returns the new path. ffmpeg reads the source directly, so any format it decodes
+    works. Raises RuntimeError on failure."""
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise RuntimeError("ffmpeg is not installed")
+    if mode is None:
+        mode, quality = TRANSCODE_DEFAULTS[codec]
+    elif quality is None:
+        quality = TRANSCODE_DEFAULTS[codec][1]
+    ext = TRANSCODE_CODECS[codec][1]
+    stem = os.path.splitext(os.path.basename(src))[0]
+    dst = os.path.join(out_dir, stem + ext)
+    args = ["-hide_banner", "-nostdin", "-y", "-i", src, "-vn", "-map_metadata", "0"]
+    if codec == "mp3":
+        args += ["-c:a", "libmp3lame"]
+        args += (["-q:a", str(int(quality))] if mode == "vbr"
+                 else ["-b:a", f"{int(quality)}k"])
+    elif codec == "m4a":
+        args += ["-c:a", "aac"]
+        args += (["-q:a", f"{float(quality):.2f}"] if mode == "vbr"
+                 else ["-b:a", f"{int(quality)}k"])
+    else:
+        args += ["-c:a", "libopus", "-b:a", f"{int(quality)}k",
+                 "-vbr", "on" if mode == "vbr" else "off"]
+    proc = subprocess.run([exe] + args + [dst], capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0 or not os.path.exists(dst):
+        if os.path.exists(dst):
+            os.remove(dst)
+        raise RuntimeError(f"ffmpeg could not convert {os.path.basename(src)}: "
+                           f"{(proc.stderr or '').strip()[-300:]}")
+    return dst
+
+
+RIP_TRACK_SECONDS = 4 * 3600         # cdparanoia reads at about 1.5x with error correction
+CD_BYTES_PER_FRAME = 2352
+
+
+def cdparanoia_rip(device, number, wav_path, frames=0, progress=None, cancel=lambda: False):
+    """Rip one track to a WAV with cdparanoia, which reads with error correction.
+
+    frames is the track length, used to report progress from the size of the WAV being
+    written: progress(fraction) is called while it runs. Returns False when cancel() asks
+    to stop (the track is not finished), True when the track was ripped.
+    """
+    exe = shutil.which("cdparanoia")
+    if not exe:
+        raise RuntimeError("cdparanoia is not installed (install the cdparanoia package)")
+    expected = 44 + frames * CD_BYTES_PER_FRAME if frames > 0 else 0
+    with tempfile.TemporaryFile(mode="w+", dir=TMP_DIR) as err:
+        proc = subprocess.Popen([exe, "-q", "-d", device, str(number), wav_path],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err)
+        started = time.monotonic()
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if cancel():
+                    proc.kill()
+                    proc.wait()
+                    return False
+                if time.monotonic() - started > RIP_TRACK_SECONDS:
+                    proc.kill()
+                    proc.wait()
+                    raise RuntimeError(f"cdparanoia took too long to rip track {number}")
+                if progress and expected:
+                    try:
+                        size = os.path.getsize(wav_path)
+                    except OSError:
+                        size = 0
+                    progress(min(size / expected, 1.0))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        err.seek(0)
+        message = err.read()
+    if proc.returncode != 0 or not os.path.exists(wav_path):
+        raise RuntimeError(f"cdparanoia could not rip track {number}: {message.strip()[-300:]}")
+    if progress:
+        progress(1.0)
+    return True
+
+
+def cd_safe_name(text):
+    """A file-system safe name for a track or album."""
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text or "").strip(" .")
+    return cleaned[:120] or "_"
+
+
+def cd_track_meta(disc, number):
+    track = disc.track(number)
+    tags = [("title", track.title or f"Track {number:02d}"), ("artist", disc.artist),
+            ("album_artist", disc.artist), ("album", disc.album), ("date", disc.date),
+            ("track", str(number))]
+    if disc.genre:
+        tags.append(("genre", disc.genre))
+    return tags
+
+
+def cd_cache_path(disc, number):
+    """Where a track is ripped (as FLAC) when it is added to the queue."""
+    return os.path.join(TMP_DIR, "cd", disc.disc_id, f"{number:02d}.flac")
+
+
+def rip_cd_tracks(disc, jobs, progress=None, cancel=lambda: False, skip_existing=False):
+    """Rip and encode tracks. jobs holds (track number, output path, codec, mode, quality).
+
+    Each track is ripped to a temporary WAV with cdparanoia and encoded with ffmpeg.
+    Returns the output paths that were written, in job order.
+    """
+    os.makedirs(TMP_DIR, exist_ok=True)
+    done = []
+    tmp = tempfile.mkdtemp(prefix="cdrip-", dir=TMP_DIR)
+    per = 1000                      # progress is reported in tenths of a percent of each track
+    total = len(jobs) * per
+    try:
+        for i, (number, out, codec, mode, quality) in enumerate(jobs):
+            if cancel():
+                break
+            label = f"Ripping track {number} ({i + 1} of {len(jobs)})"
+            if progress:
+                progress(i * per, total, label)
+            if skip_existing and os.path.exists(out) and os.path.getsize(out) > 0:
+                done.append(out)
+                continue
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            wav = os.path.join(tmp, f"track{number:02d}.wav")
+
+            def on_rip(fraction, i=i, label=label):
+                progress(i * per + int(fraction * per), total, label)
+
+            frames = disc.track(number).frames
+            ripped = cdparanoia_rip(disc.device, number, wav, frames,
+                                    on_rip if progress else None, cancel)
+            if not ripped:
+                break
+            if progress:
+                progress((i + 1) * per - 1, total, f"Encoding track {number} ({i + 1} of {len(jobs)})")
+            encode_wav(wav, out, codec, mode, quality, cd_track_meta(disc, number))
+            os.remove(wav)
+            done.append(out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return done
+
+
+# ---------------- playing CDs without ripping ----------------
+CD_QUEUE_PREFIX = "cd://"
+CD_STREAM_CHUNK = 64 * 1024
+CD_WAV_HEADER = 44                   # bytes of the canonical WAV header cd_wav_header writes
+CD_ENTRIES = {}                      # queue entry -> the disc metadata it was queued from
+
+
+def cd_entry_key(device, number):
+    """The queue entry for one track of a disc, named the same way by the stream server."""
+    return CD_QUEUE_PREFIX + quote(device or "", safe="") + "/" + str(int(number))
+
+
+def cd_entry(disc, number):
+    """The queue entry for a track played straight off the disc, with its metadata."""
+    entry = cd_entry_key(disc.device, number)
+    track = disc.track(number)
+    CD_ENTRIES[entry] = {
+        "device": disc.device,
+        "disc_id": disc.disc_id,
+        "track": int(number),
+        "tracknumber": int(number),
+        "title": track.title or "Track %02d" % number,
+        "artist": disc.artist,
+        "album": disc.album,
+        "length": (track.frames / CD_FRAMES_PER_SECOND) if track.frames else 0.0,
+    }
+    return entry
+
+
+def is_cd_entry(path):
+    """True for a queue entry that plays from the disc instead of a file."""
+    return bool(path) and str(path).startswith(CD_QUEUE_PREFIX)
+
+
+def cd_entry_parts(entry):
+    """(device, track number) from a cd:// queue entry."""
+    rest = str(entry)[len(CD_QUEUE_PREFIX):]
+    device, _sep, number = rest.rpartition("/")
+    try:
+        return unquote(device), int(number)
+    except ValueError:
+        return unquote(device), 0
+
+
+def cd_entry_meta(entry):
+    """Library-style metadata for a cd:// queue entry."""
+    meta = CD_ENTRIES.get(entry)
+    if meta is None:
+        device, number = cd_entry_parts(entry)
+        meta = {"device": device, "disc_id": "", "track": number, "tracknumber": number,
+                "title": "Track %02d" % number, "artist": "", "album": "",
+                "length": 0.0}
+    return meta
+
+
+# A device's music is queued as the file on the device, not as a PC copy: the row keeps
+# where it came from so the queue can say MTP / iPod / USB, playback can use the device
+# buffer, and a device that goes away takes its tracks with it.
+DEVICE_QUEUE = {}          # mounted device path -> device, relative name and row metadata
+DEVICE_SOURCE_LABELS = (("mtp", "MTP device"), ("ipod", "iPod"), ("usb", "USB device"))
+
+
+def device_source_label(device):
+    """What the Source column says for music queued from this device."""
+    kind = getattr(device, "kind", "") or ""
+    if kind == "mtp":
+        return "MTP device"
+    name = (getattr(device, "name", "") or "").lower()
+    if "ipod" in name or "iphone" in name:
+        return "iPod"
+    return "USB device"
+
+
+def is_device_entry(path):
+    """True for a queue entry that belongs to a connected device."""
+    return bool(path) and str(path) in DEVICE_QUEUE
+
+
+def register_device_entry(path, device, rel, meta=None):
+    """Remember that this queue entry is a file on a device."""
+    DEVICE_QUEUE[str(path)] = {
+        "device_id": device.id, "name": device.name, "kind": device.kind,
+        "root": device.root, "source": device_source_label(device), "rel": rel or "",
+        "meta": dict(meta or {}),
+    }
+    return path
+
+
+def device_entry_info(path):
+    return DEVICE_QUEUE.get(str(path)) if path else None
+
+
+def device_entry_row(path):
+    """Library-style metadata for a device queue entry, or None if it is not one."""
+    info = device_entry_info(path)
+    return dict(info.get("meta") or {}) if info else None
+
+
+def unregister_device_entries(paths):
+    for path in paths:
+        DEVICE_QUEUE.pop(str(path), None)
+
+
+def remember_device_queue_row(path):
+    """Keep a device queue entry's origin in queue-meta.json, for the next launch."""
+    info = device_entry_info(path)
+    if not info:
+        return
+    row = dict(info.get("meta") or {})
+    row.update(device_id=info.get("device_id") or "",
+               device_name=info.get("name") or "",
+               device_kind=info.get("kind") or "",
+               device_source=info.get("source") or "",
+               device_rel=info.get("rel") or "",
+               device_root=info.get("root") or "")
+    previous = QUEUE_META.get(str(path)) or {}
+    if "stat" in previous:
+        row["stat"] = previous["stat"]
+    QUEUE_META[str(path)] = row
+
+
+def restore_device_queue_entries(paths):
+    """Rebuild the device origin of queued tracks that outlived the app.
+
+    The path itself is the source of truth; queue-meta.json only says which device it
+    belonged to, so a restored queue still shows MTP / iPod as its source and a device
+    that is gone can still have its tracks removed.
+    """
+    load_queue_meta()
+    for path in paths:
+        if is_device_entry(path):
+            continue
+        row = QUEUE_META.get(str(path)) or {}
+        device_id = row.get("device_id") or ""
+        root = row.get("device_root") or ""
+        rel = row.get("device_rel") or ""
+        if not (device_id and root and rel):
+            continue
+        try:
+            if not os.path.isfile(path):
+                continue
+        except OSError:
+            continue
+        device = Device(id=device_id, name=row.get("device_name") or device_id,
+                        kind=row.get("device_kind") or "", root=root)
+        meta = {k: row.get(k) for k in ("title", "artist", "album", "albumartist",
+                                        "tracknumber", "length", "filetype", "size",
+                                        "sample_rate", "bits_per_sample", "bitrate",
+                                        "cover_path") if row.get(k) is not None}
+        register_device_entry(path, device, rel, meta)
+
+
+def cd_wav_header(data_bytes, rate=44100, channels=2, depth=16):
+    """A canonical WAV header for the raw PCM cdparanoia writes."""
+    block = channels * depth // 8
+    return (b"RIFF" + struct.pack("<I", 36 + data_bytes) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, rate,
+                                    rate * block, block, depth)
+            + b"data" + struct.pack("<I", data_bytes))
+
+
+def cd_track_span(number, sector=0):
+    """cdparanoia's span for a track, or part-way into it: track[seconds.sectors]."""
+    if not sector:
+        return str(int(number))
+    return "%d[%d.%02d]" % (int(number), sector // CD_FRAMES_PER_SECOND,
+                            sector % CD_FRAMES_PER_SECOND)
+
+
+def cd_stream_reader(device, number, sector=0):
+    """A cdparanoia process streaming one track as raw 16-bit stereo PCM.
+
+    sector starts the stream part-way into the track, which is how seeking works.
+    """
+    exe = shutil.which("cdparanoia")
+    if not exe:
+        raise RuntimeError("cdparanoia is not installed (install the cdparanoia package)")
+    return subprocess.Popen([exe, "-q", "-r", "-d", device, cd_track_span(number, sector), "-"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, bufsize=0)
+
+
+class _CdStreamHandler(BaseHTTPRequestHandler):
+    """Serves one CD track as WAV, honouring a single Range so the player can seek."""
+
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, *_args):
+        pass
+
+    def _open_reader(self, device, number, at, report=False):
+        """Start reading the drive at this byte of the track, and hold it while we read.
+
+        The buffer stands back while this request reads (see CdBuffer.live_begin), so the
+        disc is never read in two places at once. report answers 503 for a drive that can't
+        be read at all, which is only possible before the response has started.
+        """
+        pcm = max(at - CD_WAV_HEADER, 0)
+        sector = pcm // CD_BYTES_PER_FRAME
+        CD_BUFFER.live_begin(device)
+        try:
+            return cd_stream_reader(device, number, sector)
+        except Exception as exc:
+            CD_BUFFER.live_end(device)
+            if report:
+                self.send_error(503, str(exc))
+            return None
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        if url.path != "/cd":
+            self.send_error(404)
+            return
+        query = urllib.parse.parse_qs(url.query)
+        try:
+            device = query["device"][0]
+            number = int(query["track"][0])
+            frames = int(query["frames"][0])
+        except (KeyError, IndexError, ValueError):
+            self.send_error(400, "Bad CD stream request")
+            return
+        disc_id = query.get("disc", [""])[0]
+        data_bytes = max(frames, 0) * CD_BYTES_PER_FRAME
+        total = CD_WAV_HEADER + data_bytes
+        start, end, partial = 0, total - 1, False
+        header = self.headers.get("Range") or ""
+        if header.startswith("bytes="):
+            first, _sep, last = header[6:].split(",")[0].strip().partition("-")
+            try:
+                if first:
+                    start = int(first)
+                    end = int(last) if last else total - 1
+                elif last:
+                    start = max(total - int(last), 0)
+            except ValueError:
+                self.send_error(400, "Bad range")
+                return
+            partial = True
+        end = min(end, total - 1)
+        if start < 0 or start > end or start >= total:
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % total)
+            self.end_headers()
+            return
+        length = end - start + 1
+        key = cd_entry_key(device, number)
+        cache = cd_cache_file(device, number, frames, disc_id)
+        source = proc = None
+        skip = 0
+        buffered = _buffered_bytes(cache)
+        if cd_cache_size(cache) == total:        # a buffered copy of the whole track
+            try:
+                source = open(cache, "rb")
+                source.seek(start)
+            except OSError:
+                source = None
+        elif CD_BUFFER.buffering(key) and (buffered >= start
+                                          or (buffered <= CD_WAV_HEADER
+                                              and start < CD_WAV_HEADER + CD_STREAM_CHUNK)):
+            # The buffer is reading this track, so playback rides on that read: the bytes
+            # are served as they arrive, which needs no second reader on the drive and
+            # doesn't wait for the whole track to be read. A seek past what has been read
+            # does read the drive, so it never waits for the buffer to catch up.
+            source = GrowingTrackReader(cache, key, start)
+        if source is None:
+            proc = self._open_reader(device, number, start, report=True)
+            if proc is None:
+                return                            # the drive could not be read: 503 sent
+            skip = max(start - CD_WAV_HEADER, 0) % CD_BYTES_PER_FRAME
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if partial:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, total))
+        self.end_headers()
+        # The drive is being read for this track anyway, so the bytes are kept as they go
+        # past: the track is then on disk, and playing it again needs no drive at all.
+        tee = (cd_tee_open(cache, start)
+               if proc is not None and CD_BUFFER.teeing and not CD_BUFFER.buffering(key)
+               else None)
+        try:
+            left = length
+            at = start
+
+            def emit(chunk):
+                nonlocal at
+                self.wfile.write(chunk)
+                if tee is not None:
+                    cd_tee_write(cache, at, chunk, total)
+                at += len(chunk)
+
+            while left > 0:
+                if source is not None:
+                    try:
+                        chunk = source.read(min(CD_STREAM_CHUNK, left))
+                    except BufferBehind:
+                        source.close()
+                        source = None             # carry on with the drive from here
+                        chunk = b""
+                    if chunk:
+                        emit(chunk)
+                        left -= len(chunk)
+                        continue
+                    if source is not None:
+                        break
+                if at < CD_WAV_HEADER:            # part of the header, then the first samples
+                    head = cd_wav_header(data_bytes)[at:CD_WAV_HEADER][:left]
+                    emit(head)
+                    left -= len(head)
+                    continue
+                if proc is None:
+                    proc = self._open_reader(device, number, at)
+                    if proc is None:
+                        break
+                    skip = max(at - CD_WAV_HEADER, 0) % CD_BYTES_PER_FRAME
+                chunk = proc.stdout.read(min(CD_STREAM_CHUNK, left + skip))
+                if not chunk:
+                    break
+                if skip:
+                    if len(chunk) <= skip:
+                        skip -= len(chunk)
+                        continue
+                    chunk = chunk[skip:]
+                    skip = 0
+                emit(chunk)
+                left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if source is not None:
+                source.close()
+            if proc is not None:
+                stop_process(proc)
+                CD_BUFFER.live_end(device)
+
+
+class CdStreamServer:
+    """A local HTTP server that plays a CD track by streaming it off the disc."""
+
+    def __init__(self):
+        self._server = None
+        self._lock = threading.Lock()
+        self.port = 0
+
+    def start(self):
+        with self._lock:
+            if self._server is not None:
+                return self.port
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _CdStreamHandler)
+            server.daemon_threads = True
+            self._server = server
+            self.port = server.server_address[1]
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            return self.port
+
+    def stop(self):
+        with self._lock:
+            server, self._server = self._server, None
+        if server is not None:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+
+
+CD_STREAM = CdStreamServer()
+atexit.register(CD_STREAM.stop)
+
+
+def cd_stream_url(entry):
+    """A local URL that streams the disc track, with Range support for seeking."""
+    meta = cd_entry_meta(entry)
+    frames = cd_entry_frames(entry)
+    query = urllib.parse.urlencode({"device": meta.get("device", ""),
+                                    "track": meta.get("track", 0), "frames": frames,
+                                    "disc": meta.get("disc_id", "")})
+    return "http://127.0.0.1:%d/cd?%s" % (CD_STREAM.start(), query)
+
+
+# ---------------- buffering CD tracks ahead of playback ----------------
+# PCM is about 10 MB a minute, so the budget stops "all" from ever filling the disk.
+CD_BUFFER_DIR = os.path.join(TMP_DIR, "cd-buffer")
+CD_BUFFER_BUDGET = 2 * 1024 ** 3
+CD_BUFFER_RETRY = 30                 # seconds before a track that failed to read is tried again
+CD_BUFFER_DEFAULT = 3                # tracks buffered ahead when the setting is untouched
+CD_BUFFER_STALL_WAIT = 5.0           # seconds playback waits for the buffer to write more
+CD_BUFFER_START_WAIT = 2.0           # seconds it waits for the buffer's first bytes
+CD_BUFFER_SEEK_SLACK = 4 << 20       # past this much unread audio, a seek reads the drive
+
+
+def cd_drive_dir(device):
+    """The buffer directory of one drive: everything buffered from it lives in here.
+
+    A disc leaves its drive in more ways than one, and when it does its buffer has to go
+    with it, whatever was half-read at the time. A directory per drive makes that one
+    removal, and makes it a single thing to check afterwards.
+    """
+    name = re.sub(r"[^A-Za-z0-9]+", "-", device or "").strip("-") or "drive"
+    return os.path.join(CD_BUFFER_DIR, name)
+
+
+def cd_cache_file(device, number, frames, disc_id=""):
+    """The cache file for one disc track; the key covers the disc, the track and its length."""
+    raw = "%s|%s|%d|%d" % (device, disc_id or "", int(number), int(frames))
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(cd_drive_dir(device), digest + ".wav")
+
+
+def cd_buffer_files():
+    """Every file in the CD buffer, across the per-drive directories."""
+    out = []
+    try:
+        names = os.listdir(CD_BUFFER_DIR)
+    except OSError:
+        return out
+    for name in names:
+        path = os.path.join(CD_BUFFER_DIR, name)
+        if os.path.isdir(path):
+            try:
+                out.extend(os.path.join(path, inner) for inner in os.listdir(path))
+            except OSError:
+                continue
+        else:
+            out.append(path)          # a buffer written before the directories existed
+    return out
+
+
+def cd_entry_frames(entry):
+    """The track's length in CD frames, from the metadata the entry was queued with."""
+    return int(round(float(cd_entry_meta(entry).get("length") or 0) * CD_FRAMES_PER_SECOND))
+
+
+def cd_entry_cache_file(entry):
+    """The buffered WAV for a cd:// queue entry."""
+    meta = cd_entry_meta(entry)
+    return cd_cache_file(meta.get("device", ""), meta.get("track", 0),
+                         cd_entry_frames(entry), meta.get("disc_id", ""))
+
+
+def cd_cache_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def cd_part_path(cache):
+    """The half-written file for a track: the read in progress, under its final name."""
+    return os.path.join(os.path.dirname(cache), "." + os.path.basename(cache) + ".part")
+
+
+def stop_process(proc):
+    """Stop a cdparanoia process and wait for it, so the drive is free afterwards."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _buffered_bytes(cache):
+    """How much of a track is on disk so far: the finished file, or the read in progress."""
+    return max(cd_cache_size(cd_part_path(cache)), cd_cache_size(cache))
+
+
+class BufferBehind(Exception):
+    """The buffer stopped reading a track before the bytes the player asked for arrived."""
+
+    def __init__(self, offset):
+        super().__init__("the buffer stopped at byte %d" % offset)
+        self.offset = offset
+
+
+class GrowingTrackReader:
+    """Reads a track's cache file while the buffer thread is still writing it.
+
+    A track that is being buffered can be played straight away without a second reader on
+    the drive: this hands out the bytes that have arrived and waits for the ones that have
+    not, so the drive is read once, in one pass, and playback follows it. If the buffer
+    stops reading the track before the file is whole, it raises BufferBehind so the stream
+    can carry on with the drive itself.
+    """
+
+    def __init__(self, cache, entry, start=0, wait=CD_BUFFER_STALL_WAIT,
+                 start_wait=CD_BUFFER_START_WAIT):
+        self._cache = cache
+        self._entry = entry
+        self._start = start
+        self._wait = wait
+        self._start_wait = start_wait
+        self._fh = None
+        self._pos = start
+
+    def size(self):
+        """The bytes written so far, so a caller can tell how far the read has come."""
+        if self._fh is not None:
+            try:
+                return os.fstat(self._fh.fileno()).st_size
+            except OSError:
+                pass
+        return _buffered_bytes(self._cache)
+
+    def _open(self):
+        """Open the half-written file, or the finished one, at the position wanted."""
+        for path in (cd_part_path(self._cache), self._cache):
+            try:
+                fh = open(path, "rb")
+            except OSError:
+                continue
+            self._fh = fh
+            fh.seek(self._pos)
+            return True
+        return False
+
+    def read(self, count):
+        """The next bytes, waiting for the buffer to write them."""
+        got = b""
+        deadline = time.monotonic() + self._start_wait
+        while len(got) < count:
+            if self._fh is None:
+                if not self._open():
+                    if not self._following() or time.monotonic() > deadline:
+                        raise BufferBehind(self._pos)
+                    time.sleep(0.05)
+                    continue
+                deadline = time.monotonic() + self._wait
+            chunk = self._fh.read(count - len(got))
+            if chunk:
+                self._pos += len(chunk)
+                got += chunk
+                deadline = time.monotonic() + self._wait
+                continue
+            if self._pos < self.size():        # more arrived while we were reading
+                self._fh.seek(self._pos)
+                continue
+            if not self._following() or time.monotonic() > deadline:
+                if got:
+                    return got             # keep what has arrived; the next read gives up
+                raise BufferBehind(self._pos)
+            time.sleep(0.05)
+        return got
+
+    def _following(self):
+        """Whether the buffer is still reading this track, so more bytes are on their way."""
+        return CD_BUFFER.buffering(self._entry)
+
+    def close(self):
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+
+
+# A track playing straight off the disc is being read anyway, so those bytes are kept as
+# they go past: the buffer then holds a track that has only ever been played live, and
+# playing it again needs no drive at all. One reader fills a file; the buffer thread and
+# later requests leave it alone.
+_CD_TEES = {}
+_CD_TEE_LOCK = threading.Lock()
+
+
+def cd_tee_open(cache, start):
+    """Say whether this request may fill the cache file while it streams, or None.
+
+    start is the byte the request begins at. A request that begins where a half-written
+    file stopped carries on from there; one that begins at the start takes the file over,
+    since the bytes it is about to serve are the ones already in it.
+    """
+    if os.path.exists(cache):
+        return None
+    part = cd_part_path(cache)
+    with _CD_TEE_LOCK:
+        if cache in _CD_TEES:
+            return cache if start == _CD_TEES[cache] else None
+        written = cd_cache_size(part)
+        if start == 0 and written:
+            try:
+                os.truncate(part, 0)          # this request serves those bytes again
+            except OSError:
+                return None
+            written = 0
+        if start != written:
+            return None
+        _CD_TEES[cache] = written
+        return cache
+
+
+def cd_tee_write(cache, offset, data, total):
+    """Write the bytes served at their own offset, and name the file once all of the track
+    has been served. Only a run that follows what is already written is kept, so a seek
+    drops the fill and leaves the half-written file for the buffer thread to carry on."""
+    part = cd_part_path(cache)
+    with _CD_TEE_LOCK:
+        written = _CD_TEES.get(cache)
+        if written is None:
+            return
+        if offset != written:
+            del _CD_TEES[cache]
+            return
+        complete = offset + len(data) >= total
+        try:
+            with open(part, "r+b" if os.path.exists(part) else "wb") as out:
+                out.seek(offset)
+                out.write(data)
+                out.flush()
+                if complete:
+                    os.fsync(out.fileno())
+        except OSError:
+            _CD_TEES.pop(cache, None)
+            return
+        if complete:
+            try:
+                os.replace(part, cache)
+            except OSError:
+                pass
+            del _CD_TEES[cache]
+        else:
+            _CD_TEES[cache] = offset + len(data)
+
+
+class CdBuffer:
+    """Keeps the CD tracks coming up next on disk, so playback doesn't wait for the drive.
+
+    A daemon thread reads each wanted track with cdparanoia into a .part file that is
+    renamed when complete, so a half-read file is never served. plan() replaces the
+    wanted list whenever the queue or the current track changes; a read that is no
+    longer wanted, or whose drive is needed for the track that is playing, is killed
+    at the next chunk.
+
+    The track playing now comes first in that list, and playback rides on the read itself
+    (GrowingTrackReader), so one pass of the drive serves the track being played and the
+    tracks after it. When playback does need the drive - a seek past what has been read -
+    it says so with live_begin(), which stops this thread at its next chunk.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._keep = []          # entries to hold on disk, in play order
+        self._allow = False      # whether new reads may start now
+        self.teeing = True       # whether a track playing live keeps what it reads
+        self._gen = 0            # bumped whenever the wanted list changes
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread = None
+        self._proc = None
+        self._filling = ""       # the entry being read now, for the status line
+        self._failed = {}        # the file a read fills -> when that read last failed
+        self._live = {}          # drive -> streams reading it for playback right now
+        self._starting = False   # a read is opening the drive at this moment
+        self._filling_device = ""  # the drive the read in progress is reading
+        self._discs = {}         # drive -> the disc that was last read in it
+
+    def plan(self, entries, allow_fetch):
+        """Hold these entries on disk and, when allow_fetch, read the missing ones."""
+        keep = []
+        for entry in entries:
+            if is_cd_entry(entry) and entry not in keep:
+                keep.append(entry)
+        for entry in keep:
+            try:
+                os.makedirs(cd_drive_dir(cd_entry_meta(entry).get("device", "")), exist_ok=True)
+            except OSError:
+                pass
+        with self._lock:
+            self._keep = keep
+            self._allow = bool(allow_fetch)
+            self._gen += 1
+            self._prune_locked()
+        self._wake.set()
+        self._start()
+
+    def ready(self, entry):
+        """True when the whole track is on disk and can be served without the drive."""
+        frames = cd_entry_frames(entry)
+        if frames <= 0:
+            return False
+        return cd_cache_size(cd_entry_cache_file(entry)) == CD_WAV_HEADER + frames * CD_BYTES_PER_FRAME
+
+    def buffering(self, entry):
+        """Whether this track is one the buffer is reading, or has next in line.
+
+        Playback rides on that read (see GrowingTrackReader): the track's bytes are served
+        as the buffer writes them, so playing a track the buffer is working on never opens
+        a second reader on the drive and never waits for the whole track to arrive.
+        """
+        with self._lock:
+            if not self._allow or entry not in self._keep:
+                return False
+        return not self.ready(entry)
+
+    def status(self):
+        """What the buffer is reading now, for the status bar, or "" when it is idle."""
+        with self._lock:
+            allow = self._allow
+            pending = [e for e in self._keep if not self.ready(e)]
+            filling = self._filling
+        if not allow or not pending:
+            return ""
+        meta = cd_entry_meta(filling or pending[0])
+        title = meta.get("title") or "Track %02d" % int(meta.get("track") or 0)
+        return "Buffering CD: %s (%d track(s) left to read)" % (title, len(pending))
+
+    def stop(self):
+        """Stop the thread and the read in progress (used on quit, so cdparanoia is not orphaned)."""
+        self._stop.set()
+        self._wake.set()
+        with self._lock:
+            proc, self._proc = self._proc, None
+        stop_process(proc)
+
+    # ---- sharing the one drive with playback ----
+    def live_begin(self, device):
+        """A stream is about to read this drive for the track that is playing.
+
+        Playback goes first: a read ahead that is running is asked to stop at its next
+        chunk, keeping the part it has read so it can carry on later, and this returns
+        once the drive is free, so the two never read the disc at the same time.
+        """
+        device = device or ""
+        with self._lock:
+            self._live[device] = self._live.get(device, 0) + 1
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with self._lock:
+                if not self._starting and self._proc is None:
+                    return
+            time.sleep(0.02)
+
+    def live_end(self, device):
+        """The stream has stopped reading: the buffer may use the drive again."""
+        device = device or ""
+        with self._lock:
+            count = self._live.get(device, 1) - 1
+            if count > 0:
+                self._live[device] = count
+            else:
+                self._live.pop(device, None)
+        self._wake.set()
+
+    def _drive_free(self, device):
+        with self._lock:
+            return not self._live.get(device or "")
+
+    def _wanted_locked(self, gen, entry):
+        """Whether this read is still wanted. The lock must be held."""
+        return self._gen == gen and self._allow and entry in self._keep
+
+    # ---- the disc that is in the drive, and its buffer ----
+    def set_disc(self, device, disc_id=""):
+        """A disc has been read in this drive: the buffer of the disc it replaced goes first."""
+        device = device or ""
+        with self._lock:
+            previous = self._discs.get(device)
+            self._discs[device] = disc_id or ""
+        if previous is not None and previous != (disc_id or ""):
+            self.forget(device)
+
+    def disc_in(self, device):
+        """The disc last read in this drive, or None when nothing from it is accounted for.
+
+        Used to tell a drive whose disc has gone from one that never had a disc: only the
+        first one has a buffer to delete.
+        """
+        with self._lock:
+            return self._discs.get(device or "")
+
+    def forget(self, device=""):
+        """Delete everything buffered from a drive, because the disc in it has gone.
+
+        Called whenever a disc leaves a drive, by whatever means: the app's eject, the
+        tray's own button, the disc being pulled out, the drive being unplugged, or another
+        disc taking its place. A read in progress is stopped first, and the directory is
+        removed while no read can be naming its file, so a buffer never outlives its disc.
+        device="" means no drive holds a disc: every buffer goes.
+        """
+        device = device or ""
+        with self._lock:
+            self._gen += 1                     # a read in progress is no longer wanted
+            if device:
+                self._keep = [e for e in self._keep
+                              if cd_entry_meta(e).get("device", "") != device]
+            else:
+                self._keep = []
+            self._allow = bool(self._keep)
+            mine = (not device) or self._filling_device == device
+            proc = self._proc if mine else None
+            if mine:
+                self._proc = None
+                self._starting = False
+                self._filling = ""
+                self._filling_device = ""
+            if device:
+                self._discs.pop(device, None)
+            else:
+                self._discs.clear()
+            # A read that failed belongs to the disc it was reading: with that disc gone,
+            # the record of it goes too, so it cannot hold up the same track number of the
+            # disc that comes next.
+            gone_dir = cd_drive_dir(device)
+            if device:
+                self._failed = {k: v for k, v in self._failed.items()
+                                if os.path.dirname(k) != gone_dir}
+            else:
+                self._failed.clear()
+        stop_process(proc)
+        with self._lock:
+            # the lock keeps a read that was about to name its file from landing it after
+            # the directory has gone; everything those tracks held is dropped with it
+            shutil.rmtree(cd_drive_dir(device) if device else CD_BUFFER_DIR, ignore_errors=True)
+        self._wake.set()
+
+    # ---- the background thread ----
+    def _start(self):
+        with self._lock:
+            if self._stop.is_set() or (self._thread is not None and self._thread.is_alive()):
+                return
+            self._thread = threading.Thread(target=self._run, name="cd-buffer", daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            entry, gen = self._next_wanted()
+            if entry is None:
+                self._wake.wait(1.0)
+                self._wake.clear()
+                continue
+            if not self._drive_free(cd_entry_meta(entry).get("device", "")):
+                # the drive is reading the track that is playing: wait for it, then go on
+                self._wake.wait(0.2)
+                self._wake.clear()
+                continue
+            self._fill(entry, gen)
+
+    def _next_wanted(self):
+        """The first wanted track that is not cached yet, or None."""
+        with self._lock:
+            if not self._allow:
+                return None, self._gen
+            used = self._cached_bytes_locked()
+            for entry in self._keep:
+                if self.ready(entry):
+                    continue
+                cache = cd_entry_cache_file(entry)
+                with _CD_TEE_LOCK:
+                    if cache in _CD_TEES:
+                        continue          # a live stream is filling this one
+                frames = cd_entry_frames(entry)
+                if frames <= 0:
+                    continue
+                failed = self._failed.get(cache)
+                if failed is not None and time.monotonic() - failed < CD_BUFFER_RETRY:
+                    continue
+                if used + CD_WAV_HEADER + frames * CD_BYTES_PER_FRAME > CD_BUFFER_BUDGET:
+                    return None, self._gen
+                return entry, self._gen
+            return None, self._gen
+
+    def _fill(self, entry, gen):
+        """Read a track to its .part file, then rename it when the whole track arrived.
+
+        A read that was interrupted (the queue changed, the drive was needed for the track
+        that is playing) is taken up where it stopped, so audio already read from the disc
+        is never read a second time. The half-written file is also what a live stream
+        leaves behind, and this continues it.
+        """
+        path = cd_entry_cache_file(entry)
+        part = cd_part_path(path)
+        meta = cd_entry_meta(entry)
+        frames = cd_entry_frames(entry)
+        expect = CD_WAV_HEADER + frames * CD_BYTES_PER_FRAME
+        if cd_cache_size(part) >= expect:
+            try:
+                os.replace(part, path)           # a finished read that never got its name
+            except OSError:
+                pass
+            self._failed.pop(path, None)
+            return
+        written = min(cd_cache_size(part), expect)
+        if written < CD_WAV_HEADER:
+            written = 0
+        sector = max(written - CD_WAV_HEADER, 0) // CD_BYTES_PER_FRAME
+        written = CD_WAV_HEADER + sector * CD_BYTES_PER_FRAME if written else 0
+        device = meta.get("device", "")
+        with self._lock:
+            if self._live.get(device) or not self._wanted_locked(gen, entry):
+                return                    # playback is reading the drive, or the disc has gone
+            self._filling = entry
+            self._filling_device = device
+            self._starting = True         # live_begin waits for this before it reads
+        proc = None
+        try:
+            proc = cd_stream_reader(device, int(meta.get("track") or 0), sector)
+            with self._lock:
+                self._starting = False
+                self._proc = proc
+                if not self._wanted_locked(gen, entry) or self._live.get(device):
+                    return                # the disc left, or playback wants the drive now
+            # Creating the file is the one step that has to happen under the lock. forget()
+            # removes the drive's directory under that same lock, so a write that starts
+            # after the disc has gone finds its entry unwanted and writes nothing, while a
+            # write that started before it is unlinked along with the directory.
+            out = None
+            with self._lock:
+                if self._wanted_locked(gen, entry):
+                    try:
+                        os.makedirs(os.path.dirname(part), exist_ok=True)
+                        out = open(part, "r+b" if written else "wb")
+                    except OSError:
+                        self._failed[path] = time.monotonic()
+            if out is None:
+                return
+            with out:
+                if written:
+                    out.truncate(written)        # continue at a frame boundary
+                    out.seek(written)            # truncate leaves the position at the start
+                else:
+                    out.write(cd_wav_header(frames * CD_BYTES_PER_FRAME))
+                    written = CD_WAV_HEADER
+                while written < expect:
+                    if not self._still_wanted(gen, entry):
+                        return      # the half-written file stays for the next attempt
+                    chunk = proc.stdout.read(min(CD_STREAM_CHUNK, expect - written))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            named = False
+            if written == expect:
+                with self._lock:
+                    # naming the file under the lock is what keeps a buffer that is being
+                    # deleted from reappearing: forget() bumps the generation first
+                    if self._wanted_locked(gen, entry):
+                        os.replace(part, path)
+                        named = True
+            if named:
+                self._failed.pop(path, None)
+            else:
+                # A record is per buffered file, not per queue entry: a queue entry is only
+                # this drive and this track number, so one disc's stalled read would
+                # otherwise hold up the same track number of the next disc to arrive.
+                self._failed[path] = time.monotonic()
+        except OSError:
+            self._failed[path] = time.monotonic()
+        except Exception:
+            self._failed[path] = time.monotonic()
+        finally:
+            with self._lock:
+                self._starting = False
+                if self._proc is proc:
+                    self._proc = None
+                if self._filling == entry:
+                    self._filling = ""
+                    self._filling_device = ""
+            stop_process(proc)
+
+    def _still_wanted(self, gen, entry):
+        device = cd_entry_meta(entry).get("device", "")
+        cache = cd_entry_cache_file(entry)
+        with self._lock:
+            wanted = self._wanted_locked(gen, entry)
+            playback = bool(self._live.get(device))
+        if not wanted or playback:
+            return False          # the drive is (or is about to be) reading for playback
+        with _CD_TEE_LOCK:
+            return cache not in _CD_TEES
+
+    def _cached_bytes_locked(self):
+        total = 0
+        for path in cd_buffer_files():
+            if path.endswith(".wav"):
+                total += cd_cache_size(path)
+        return total
+
+    def _prune_locked(self):
+        """Drop every cached track that is no longer wanted (a .part belongs to a live read)."""
+        wanted = {cd_entry_cache_file(e) for e in self._keep}
+        for path in cd_buffer_files():
+            if path in wanted or path.endswith(".part"):
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+CD_BUFFER = CdBuffer()
+atexit.register(CD_BUFFER.stop)
+
+
+# ---------------- reading local tracks ahead of playback ----------------
+# Plain reads into the page cache: nothing is decoded and no copy is kept, so the player
+# still opens the file it always did - the bytes are simply in memory when it gets there.
+FILE_BUFFER_LOOKAHEAD = 30           # seconds of each track coming up that is read first
+FILE_BUFFER_STEP = 1 << 20           # bytes per read
+FILE_BUFFER_MB = (0, 30, 64, 128, 256, 512, 1024, 2048)   # the sizes the setting offers
+FILE_BUFFER_DEFAULT = 30             # on by default, as asked for
+BYTES_PER_SECOND_CD = CD_BYTES_PER_FRAME * CD_FRAMES_PER_SECOND      # 176400: 16-bit stereo
+
+
+def file_buffer_choices():
+    """(value, label) pairs for the Preferences picker: Off, then megabytes."""
+    out = [(0, "Off: read each track when it starts")]
+    out += [(mb, f"{mb} MB") for mb in FILE_BUFFER_MB[1:]]
+    return out
+
+
+def buffer_seconds(path, seconds):
+    """Bytes for a length in seconds, never more than the file itself.
+
+    The bitrate is not known without decoding, so 16-bit stereo CD audio (176 kB a second)
+    is assumed: that is more audio than the length asked for, never less.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return 0
+    return min(int(seconds * BYTES_PER_SECOND_CD), size)
+
+
+class FileBuffer:
+    """Reads the tracks coming up in the queue into memory ahead of the player.
+
+    Only reads happen here - no decode and no copy on disk - so playback still opens the
+    file it always did, by which time the bytes are in the page cache instead of waiting for
+    a slow disk or a share. The order is the point: every track coming up has its first
+    FILE_BUFFER_LOOKAHEAD seconds read before the budget is spent going deeper, so the next
+    track is always ready to start and a large budget fills whole tracks ahead.
+
+    A plan that changes starts again from the new one: re-reading bytes that are already in
+    the page cache costs almost nothing, so nothing is remembered about half-read files.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._wanted = []        # (path, offset, length) segments, in read order
+        self._gen = 0
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = None
+        self._reading = ""       # the file being read now, for the status line
+        self.read_bytes = 0      # bytes read for the plan in hand
+
+    def plan(self, paths, budget):
+        """Read these files in this order, for at most this many bytes (0 = nothing).
+
+        A shallow pass first - the first FILE_BUFFER_LOOKAHEAD seconds of every track, in
+        play order - and then a deep pass over the same order with what is left of the
+        budget. So the track after this one is ready to start whatever the budget is.
+        """
+        shallow, deep = [], []
+        for path in paths:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            head = buffer_seconds(path, FILE_BUFFER_LOOKAHEAD)
+            if head:
+                shallow.append((path, 0, head))
+            if size > head:
+                deep.append((path, head, size - head))
+        wanted, total = [], 0
+        for path, offset, length in shallow + deep:
+            if total >= budget:
+                break
+            take = min(length, budget - total)
+            if take > 0:
+                wanted.append((path, offset, take))
+                total += take
+        with self._lock:
+            self._wanted = wanted
+            self.read_bytes = 0
+            self._gen += 1
+        self._wake.set()
+        if wanted:
+            self._start()
+
+    def stop(self):
+        """Stop the thread (used on quit)."""
+        self._stop.set()
+        self._wake.set()
+
+    def status(self):
+        """A short line for the status bar while tracks are being read, otherwise ""."""
+        with self._lock:
+            if not self._reading or not self._wanted:
+                return ""
+            return "Buffering ahead: %s" % os.path.basename(self._reading)
+
+    # ---- the background thread ----
+    def _start(self):
+        with self._lock:
+            if self._stop.is_set() or (self._thread is not None and self._thread.is_alive()):
+                return
+            self._thread = threading.Thread(target=self._run, name="file-buffer", daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            job, gen = self._next()
+            if job is None:
+                with self._lock:
+                    self._reading = ""
+                self._wake.wait(1.0)
+                self._wake.clear()
+                continue
+            self._read(job, gen)
+
+    def _next(self):
+        with self._lock:
+            if not self._wanted:
+                return None, self._gen
+            return self._wanted[0], self._gen
+
+    def _read(self, job, gen):
+        path, offset, length = job
+        with self._lock:
+            self._reading = path
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                left = length
+                while left > 0:
+                    if not self._still_wanted(gen, job):
+                        return
+                    chunk = f.read(min(FILE_BUFFER_STEP, left))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+                    with self._lock:
+                        if self._gen == gen:      # a chunk in flight when the plan changed
+                            self.read_bytes += len(chunk)   # belongs to the old plan
+        except OSError:
+            pass
+        with self._lock:
+            if self._gen == gen and job in self._wanted:
+                self._wanted.remove(job)
+            if not self._wanted:
+                self._reading = ""
+
+    def _still_wanted(self, gen, job):
+        with self._lock:
+            return self._gen == gen and job in self._wanted
+
+
+FILE_BUFFER = FileBuffer()
+atexit.register(FILE_BUFFER.stop)
+
+
+# ---------------- device track buffer ----------------
+DEVICE_BUFFER_DIR = os.path.join(TMP_DIR, "device-buffer")
+DEVICE_BUFFER_MB = (0, 64, 128, 256, 512, 1024, 2048)
+DEVICE_BUFFER_DEFAULT = 128
+
+
+def device_buffer_choices():
+    """(value, label) pairs for the Preferences picker: Off, then megabytes."""
+    out = [(0, "Off: read each track from the device when it starts")]
+    out += [(mb, f"{mb} MB") for mb in DEVICE_BUFFER_MB[1:]]
+    return out
+
+
+class DeviceBuffer:
+    """Copies the device tracks coming up into a local cache before the player needs them.
+
+    A device is much slower to read than a disk, and an MTP mount cannot seek cheaply, so
+    the track playing now is copied first and the tracks after it follow while the budget
+    lasts. Playback uses the cached copy once it is complete and reads the device directly
+    until then. Every copy belongs to a device and is deleted when that device goes away,
+    so nothing read from a phone outlives it. The cache is disposable at any time.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._wanted = []        # (entry, cache path, size), in play order
+        self._ready = {}         # entry -> complete cache path
+        self._gen = 0
+        self._reading = ""
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = None
+
+    @staticmethod
+    def _device_dir(entry):
+        info = DEVICE_QUEUE.get(str(entry)) or {}
+        tag = hashlib.sha1(str(info.get("device_id") or "device").encode(
+            "utf-8", "surrogateescape")).hexdigest()[:12]
+        return os.path.join(DEVICE_BUFFER_DIR, tag)
+
+    def _path_for(self, entry):
+        name = hashlib.sha1(str(entry).encode("utf-8", "surrogateescape")).hexdigest()[:16]
+        ext = os.path.splitext(str(entry))[1].lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,9}", ext):
+            ext = ".audio"
+        return os.path.join(self._device_dir(entry), name + ext)
+
+    def cached(self, entry):
+        """The finished local copy of this device track, or "" if it is not ready yet."""
+        if not entry:
+            return ""
+        dst = self._path_for(entry)
+        return dst if os.path.isfile(dst) else ""
+
+    def plan(self, entries, budget):
+        """Buffer these device entries in this order, for at most this many bytes.
+
+        A whole file is copied at a time, because half a track cannot be played. The first
+        entry is copied whatever its size; later ones only while the budget lasts. Files
+        already buffered cost nothing and are kept. Turning the buffer off (budget 0)
+        deletes what was buffered.
+        """
+        entries = [e for e in dict.fromkeys(entries or []) if is_device_entry(e)]
+        with self._lock:
+            self._gen += 1
+            self._reading = ""
+            keep = set(entries) if budget else set()
+            for entry, dst in list(self._ready.items()):
+                if entry not in keep:
+                    self._ready.pop(entry, None)
+                    try:
+                        os.remove(dst)
+                    except OSError:
+                        pass
+            wanted, total = [], 0
+            for entry in entries:
+                dst = self._path_for(entry)
+                if os.path.isfile(dst):
+                    self._ready[entry] = dst
+                    continue
+                try:
+                    size = os.path.getsize(entry)
+                except OSError:
+                    continue
+                if size <= 0:
+                    continue
+                if wanted and total + size > budget:
+                    break
+                wanted.append((entry, dst, size))
+                total += size
+            self._wanted = wanted
+        if wanted:
+            self._wake.set()
+            self._start()
+
+    def status(self):
+        """A short status-bar line while a copy is running, otherwise ""."""
+        with self._lock:
+            if not self._reading or not self._wanted:
+                return ""
+            info = DEVICE_QUEUE.get(self._reading) or {}
+            title = (info.get("meta") or {}).get("title") or os.path.basename(self._reading)
+            return "Buffering from device: %s" % title
+
+    def forget(self, device_id=None):
+        """Delete what was buffered from this device (or from all devices)."""
+        with self._lock:
+            self._gen += 1
+            self._wanted = []
+            self._reading = ""
+            gone = []
+            for entry, dst in list(self._ready.items()):
+                info = DEVICE_QUEUE.get(entry) or {}
+                if device_id is None or info.get("device_id") == device_id:
+                    gone.append((entry, dst))
+            for entry, dst in gone:
+                self._ready.pop(entry, None)
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+        if device_id is None:
+            shutil.rmtree(DEVICE_BUFFER_DIR, ignore_errors=True)
+            return
+        tag = hashlib.sha1(str(device_id).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        shutil.rmtree(os.path.join(DEVICE_BUFFER_DIR, tag), ignore_errors=True)
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    # ---- the background thread ----
+    def _start(self):
+        with self._lock:
+            if self._stop.is_set() or (self._thread is not None and self._thread.is_alive()):
+                return
+            self._thread = threading.Thread(target=self._run, name="device-buffer", daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            job, gen = self._next()
+            if job is None:
+                self._wake.wait(1.0)
+                self._wake.clear()
+                continue
+            self._copy(job, gen)
+
+    def _next(self):
+        with self._lock:
+            if not self._wanted:
+                return None, self._gen
+            return self._wanted[0], self._gen
+
+    def _copy(self, job, gen):
+        entry, dst, size = job
+        part = dst + ".part"
+        with self._lock:
+            self._reading = entry
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            left = size
+            with open(entry, "rb") as src, open(part, "wb") as out:
+                while left > 0:
+                    with self._lock:
+                        if self._gen != gen:
+                            raise InterruptedError
+                    chunk = src.read(min(FILE_BUFFER_STEP, left))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    left -= len(chunk)
+            with self._lock:
+                if self._gen != gen:
+                    raise InterruptedError
+                os.replace(part, dst)
+                self._ready[entry] = dst
+                if job in self._wanted:
+                    self._wanted.remove(job)
+                if not self._wanted:
+                    self._reading = ""
+        except (OSError, InterruptedError):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            with self._lock:
+                # A new plan may want the same entry again; that job is not this one and
+                # must survive the stale copy's cleanup.
+                if self._gen == gen and job in self._wanted:
+                    self._wanted.remove(job)
+                if self._gen == gen and not self._wanted and self._reading == entry:
+                    self._reading = ""
+
+
+DEVICE_BUFFER = DeviceBuffer()
+atexit.register(DEVICE_BUFFER.stop)
+
+
+# ---------------- burning discs ----------------
+BURN_SPEEDS = (1, 2, 4, 8, 12, 16, 20, 24, 32, 40, 48, 52)
+BURN_LEADIN = 2                      # seconds cdrdao adds before each audio track
+BURN_MIN_TRACK = 4                   # cdrdao refuses audio tracks shorter than this; shorter ones get silence
+BURN_CONVERT = {"mp3": ("mp3", "vbr", 2), "opus": ("opus", "vbr", 128)}
+BURN_CONVERT_BPS = {"mp3": 200000, "opus": 128000}   # estimated bits per second, for splitting
+BURN_WAIT_SECONDS = 1800             # how long to wait for a blank disc to be inserted
+BURN_TIMEOUT = 4 * 3600              # a 1x audio disc takes about 90 minutes
+
+
+def burn_disc_seconds(minutes):
+    """Playing time that fits on a disc of this length, leaving room for the lead-out."""
+    return minutes * 60 - 4
+
+
+def burn_data_bytes(minutes):
+    """Data that fits on a disc of this length, less a margin for the ISO 9660 filesystem."""
+    return int(minutes * 60 * 75 * 2048 * 0.98)
+
+
+def burn_split(items, limit, weight, album):
+    """Split items, in order, into discs whose weights add up to no more than limit.
+
+    A disc is cut at an album change when that keeps it at least half full, so a long
+    playlist breaks between albums rather than in the middle of one. Raises ValueError
+    when a single item is too big for a disc.
+    """
+    discs = []
+    start, n = 0, len(items)
+    while start < n:
+        total, end = 0, start
+        while end < n and total + weight(items[end]) <= limit:
+            total += weight(items[end])
+            end += 1
+        if end == start:
+            raise ValueError(f"{items[start].get('title') or 'a track'} is too big for one disc")
+        if end < n:
+            for cut in range(end, start, -1):
+                filled = sum(weight(x) for x in items[start:cut])
+                if album(items[cut - 1]) != album(items[cut]) and filled >= limit / 2:
+                    end = cut
+                    break
+        discs.append(items[start:end])
+        start = end
+    return discs
+
+
+def burn_speed_choices(max_speed):
+    """Write speeds for a drive whose fastest speed is max_speed: every standard step from 1x up."""
+    top = max(1, int(max_speed))
+    return sorted({s for s in BURN_SPEEDS if s <= top} | {top})
+
+
+def burn_max_speed(device):
+    """The fastest CD write speed the drive reports, or 52 when it doesn't say."""
+    exe = shutil.which("wodim")
+    if not exe:
+        return 52
+    try:
+        out = subprocess.run([exe, f"dev={device}", "-prcap"], capture_output=True, text=True,
+                             timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 52
+    match = re.search(r"Maximum write speed:.*?CD\s+(\d+)x", out)
+    return int(match.group(1)) if match else 52
+
+
+def burn_missing_tools(kind, convert):
+    """The command-line tools a burn needs that aren't installed."""
+    needed = ["cdrdao"] if kind == "audio" else ["wodim", "genisoimage"]
+    if kind == "audio" or convert:
+        needed.append("ffmpeg")
+    return [tool for tool in needed if shutil.which(tool) is None]
+
+
+def burn_disc_status(device):
+    """'blank', 'used', 'none' (no disc) or 'unknown', read from cdrdao disk-info."""
+    exe = shutil.which("cdrdao")
+    if not exe:
+        return "unknown"
+    try:
+        proc = subprocess.run([exe, "disk-info", "--device", device], capture_output=True, text=True,
+                              timeout=30)
+    except subprocess.TimeoutExpired:
+        return "none"
+    except OSError:
+        return "unknown"
+    out = (proc.stdout + proc.stderr).lower()
+    if "unit not ready" in out or "no disk" in out or "no medium" in out:
+        return "none"
+    # 'appendable' is left out on purpose: a blank disc reports it too
+    if re.search(r"not empty|\b(in)?complete\b|sessions?\s*:\s*[1-9]", out):
+        return "used"
+    if re.search(r"\bempty\b|\bblank\b", out):
+        return "blank"
+    return "unknown"
+
+
+def burn_disc_title(tracks):
+    """The album name for CD-TEXT when every track is from one album, else empty."""
+    albums = {t.get("album", "") for t in tracks}
+    return albums.pop() if len(albums) == 1 else ""
+
+
+def burn_cd_text_value(text):
+    """A CD-TEXT string: one line, no quotes or backslashes, at most 79 characters."""
+    return '"' + re.sub(r'["\\]', "'", " ".join(str(text or "").split()))[:79] + '"'
+
+
+def burn_toc_text(tracks, cdtext=True):
+    """A cdrdao table of contents for disc-at-once audio. tracks holds dicts with wav (a
+    44.1 kHz stereo WAV path), title, artist and album. With cdtext, names go on the disc."""
+    lines = ["CD_DA", ""]
+    if cdtext:
+        artists = {t.get("artist", "") for t in tracks}
+        performer = artists.pop() if len(artists) == 1 else "Various Artists"
+        lines += ["CD_TEXT {", "  LANGUAGE_MAP {", "    0 : EN", "  }", "  LANGUAGE 0 {",
+                  f"    TITLE {burn_cd_text_value(burn_disc_title(tracks))}",
+                  f"    PERFORMER {burn_cd_text_value(performer)}", "  }", "}", ""]
+    for number, track in enumerate(tracks, 1):
+        lines.append("TRACK AUDIO")
+        if cdtext:
+            title = track.get("title") or f"Track {number:02d}"
+            lines += ["  CD_TEXT {", "    LANGUAGE 0 {",
+                      f"      TITLE {burn_cd_text_value(title)}",
+                      f"      PERFORMER {burn_cd_text_value(track.get('artist'))}", "    }", "  }"]
+        lines += [f'  FILE "{track["wav"]}" 0', ""]
+    return "\n".join(lines) + "\n"
+
+
+def burn_to_wav(src, dst, pad_to=0.0):
+    """Decode src to a 44.1 kHz, 16-bit, stereo WAV, padded with silence to pad_to seconds if given."""
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise RuntimeError("ffmpeg is not installed")
+    args = ["-hide_banner", "-nostdin", "-y", "-i", src, "-vn", "-map_metadata", "-1",
+            "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le"]
+    if pad_to:
+        args += ["-af", "apad", "-t", f"{pad_to:.3f}"]
+    proc = subprocess.run([exe] + args + [dst], capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0 or not os.path.exists(dst):
+        if os.path.exists(dst):
+            os.remove(dst)
+        raise RuntimeError(f"ffmpeg could not convert {os.path.basename(src)}: "
+                           f"{(proc.stderr or '').strip()[-300:]}")
+
+
+def burn_iso(entries, label, out_iso):
+    """Build an ISO 9660 image with Rock Ridge and Joliet names. entries holds (source, name) pairs."""
+    exe = shutil.which("genisoimage")
+    if not exe:
+        raise RuntimeError("genisoimage is not installed (install the genisoimage package)")
+    stage = tempfile.mkdtemp(prefix="isostage-", dir=TMP_DIR)
+    try:
+        for src, name in entries:
+            dst = os.path.join(stage, name)
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copyfile(src, dst)
+        volume = re.sub(r"[^A-Za-z0-9_]", "_", label or "")[:32] or "DATA"
+        proc = subprocess.run([exe, "-quiet", "-R", "-J", "-V", volume, "-o", out_iso, stage],
+                              capture_output=True, text=True, timeout=1800)
+        if proc.returncode != 0 or not os.path.exists(out_iso):
+            raise RuntimeError(f"genisoimage failed: {(proc.stderr or '').strip()[-300:]}")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def burn_run(cmd, cancel):
+    """Run a burner command. Kills it if cancel() turns true; raises RuntimeError on failure."""
+    with tempfile.TemporaryFile(mode="w+", dir=TMP_DIR) as log:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        started = time.monotonic()
+        while proc.poll() is None:
+            if cancel():
+                proc.kill()
+                proc.wait()
+                raise RuntimeError("the burn was cancelled, so the disc may not be usable")
+            if time.monotonic() - started > BURN_TIMEOUT:
+                proc.kill()
+                proc.wait()
+                raise RuntimeError(f"{os.path.basename(cmd[0])} timed out")
+            time.sleep(0.5)
+        log.seek(0)
+        output = log.read()
+    if proc.returncode != 0:
+        raise RuntimeError(f"{os.path.basename(cmd[0])} failed (exit {proc.returncode}): "
+                           f"{output.strip()[-400:]}")
+
+
+def burn_one_disc(job, index, progress, log, cancel):
+    """Burn disc index (0-based) of job: wait for a blank disc, convert the files, then burn.
+
+    Audio discs are written with cdrdao in disc-at-once mode, with CD-TEXT names when asked.
+    Data discs are built as an ISO 9660 image and written with wodim.
+    """
+    device, speed = job["device"], job["speed"]
+    number, total = index + 1, len(job["discs"])
+    items = job["discs"][index]
+    deadline = time.monotonic() + BURN_WAIT_SECONDS
+    while True:
+        if cancel():
+            raise RuntimeError("the burn was cancelled")
+        status = burn_disc_status(device)
+        if status in ("blank", "unknown"):
+            if status == "unknown":
+                log("Could not confirm that the disc is blank; burning anyway")
+            break
+        reason = "no disc in the drive" if status == "none" else "this disc is not blank"
+        progress(number, total, f"Disc {number} of {total}: insert a blank disc ({reason})")
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"no blank disc was inserted for disc {number}")
+        time.sleep(2)
+
+    workdir = os.path.join(job["tmp"], f"disc{number:02d}")
+    os.makedirs(workdir, exist_ok=True)
+    try:
+        if job["kind"] == "audio":
+            tracks = []
+            for n, item in enumerate(items, 1):
+                if cancel():
+                    raise RuntimeError("the burn was cancelled")
+                progress(number, total, f"Disc {number} of {total}: converting track {n} of {len(items)}")
+                wav = os.path.join(workdir, f"track{n:02d}.wav")
+                pad = BURN_MIN_TRACK if item["seconds"] < BURN_MIN_TRACK else 0
+                burn_to_wav(item["path"], wav, pad)
+                tracks.append(dict(wav=wav, title=item["title"], artist=item["artist"], album=item["album"]))
+            toc = os.path.join(workdir, "disc.toc")
+            with open(toc, "w", encoding="utf-8") as fh:
+                fh.write(burn_toc_text(tracks, job["cdtext"]))
+            progress(number, total, f"Disc {number} of {total}: burning at {speed}x")
+            burn_run(["cdrdao", "write", "--device", device, "--speed", str(speed), "--eject", toc], cancel)
+        else:
+            entries = []
+            for n, item in enumerate(items, 1):
+                if cancel():
+                    raise RuntimeError("the burn was cancelled")
+                stem = os.path.splitext(os.path.basename(item["path"]))[0]
+                if job["convert"]:
+                    codec, mode, quality = job["convert"]
+                    ext = RIP_CODECS[codec][1]
+                    progress(number, total, f"Disc {number} of {total}: converting file {n} of {len(items)}")
+                    out = os.path.join(workdir, f"{n:03d}{ext}")
+                    meta = [("title", item["title"]), ("artist", item["artist"]), ("album", item["album"])]
+                    encode_wav(item["path"], out, codec, mode, quality, meta)
+                    entries.append((out, f"{n:03d} {cd_safe_name(stem)}{ext}"))
+                else:
+                    entries.append((item["path"], f"{n:03d} {cd_safe_name(os.path.basename(item['path']))}"))
+            iso = os.path.join(workdir, "disc.iso")
+            burn_iso(entries, job["label"], iso)
+            progress(number, total, f"Disc {number} of {total}: burning at {speed}x")
+            burn_run(["wodim", f"dev={device}", f"speed={speed}", "-data", "-eject", iso], cancel)
+        log(f"Disc {number} of {total} burned")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+class Worker(QThread):
+    """Run fn(progress, log, cancel) in a thread."""
+    progress = Signal(int, int, str)
+    log = Signal(str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            res = self.fn(lambda d, t, m: self.progress.emit(d, t, m),
+                          self.log.emit, lambda: self._cancel)
+            self.done.emit(res)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+def fmt_time(sec):
+    sec = int(sec or 0)
+    if sec >= 3600:
+        return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+# ---- theme: palette templates, the stylesheet built from them, and the config ----
+THEME_TEMPLATES = {
+    "dark": {
+        "bg": "#232323", "panel": "#1e1e1e", "panel_alt": "#292929",
+        "header": "#383838", "border": "#3a3a3a", "text": "#dedede",
+        "muted": "#9a9a9a", "accent": "#328fba", "accent_dim": "#21456b",
+        "amber": "#e0a96d", "hover": "#2c2c2c", "hover_alt": "#2a2a2a",
+        "tooltip": "#2f2f2f", "button": "#343434", "button_border": "#484848",
+        "button_hover": "#414141", "accent_hover": "#3ba3d2",
+        "player_button": "#3b3b3b", "player_button_border": "#4d4d4d",
+        "player_button_hover": "#4a4a4a", "scrollbar": "#4a4a4a",
+        "header_text": "#d0d0d0", "groove": "#444444", "handle": "#e8e8e8",
+        "check_border": "#7d7d7d",
+        "pill_bg": "#333333", "pill_text": "#d8d8d8", "pill_border": "#4a4a4a",
+        "stop_after": "#5a5a5a", "cover_bg": "#1b1b1b", "cover_border": "#3f3f3f",
+        "cover_text": "#666666", "separator": "#434343", "on_accent": "#ffffff",
+    },
+    "light": {
+        "bg": "#f6f6f6", "panel": "#ececec", "panel_alt": "#e6e6e6",
+        "header": "#e2e2e2", "border": "#c9c9c9", "text": "#202020",
+        "muted": "#6a6a6a", "accent": "#2a7fb8", "accent_dim": "#a9cfe6",
+        "amber": "#a2661a", "hover": "#e2e2e2", "hover_alt": "#e4e4e4",
+        "tooltip": "#fbfbfb", "button": "#e8e8e8", "button_border": "#c4c4c4",
+        "button_hover": "#dcdcdc", "accent_hover": "#3f96cf",
+        "player_button": "#e4e4e4", "player_button_border": "#c6c6c6",
+        "player_button_hover": "#d8d8d8", "scrollbar": "#b8b8b8",
+        "header_text": "#444444", "groove": "#c8c8c8", "handle": "#6c6c6c",
+        "check_border": "#7f7f7f",
+        "pill_bg": "#e2e2e2", "pill_text": "#333333", "pill_border": "#c6c6c6",
+        "stop_after": "#8a8a8a", "cover_bg": "#e9e9e9", "cover_border": "#c9c9c9",
+        "cover_text": "#9a9a9a", "separator": "#d2d2d2", "on_accent": "#ffffff",
+    },
+    "black": {
+        "bg": "#000000", "panel": "#070707", "panel_alt": "#0d0d0d",
+        "header": "#101010", "border": "#1f1f1f", "text": "#f2f2f2",
+        "muted": "#8a8a8a", "accent": "#4aa3d8", "accent_dim": "#123a52",
+        "amber": "#e0a96d", "hover": "#141414", "hover_alt": "#121212",
+        "tooltip": "#101010", "button": "#1a1a1a", "button_border": "#2a2a2a",
+        "button_hover": "#242424", "accent_hover": "#62b4e4",
+        "player_button": "#121212", "player_button_border": "#262626",
+        "player_button_hover": "#1e1e1e", "scrollbar": "#2e2e2e",
+        "header_text": "#cfcfcf", "groove": "#303030", "handle": "#c8c8c8",
+        "check_border": "#787878",
+        "pill_bg": "#161616", "pill_text": "#d8d8d8", "pill_border": "#2a2a2a",
+        "stop_after": "#5f5f5f", "cover_bg": "#000000", "cover_border": "#262626",
+        "cover_text": "#6a6a6a", "separator": "#232323", "on_accent": "#ffffff",
+    },
+}
+THEME_KEYS = tuple(THEME_TEMPLATES["dark"])
+THEME_LABELS = (("light", "Light"), ("dark", "Dark"), ("black", "Black AMOLED"))
+THEME_EDITABLE = (("bg", "Background"), ("panel", "Panels"), ("text", "Text"),
+                  ("muted", "Muted text"), ("accent", "Accent"))
+
+
+def set_palette(colors):
+    """Make a palette the active one: the painters and the stylesheet read these globals."""
+    merged = dict(THEME_TEMPLATES["dark"])
+    merged.update({k: v for k, v in (colors or {}).items() if k in THEME_KEYS})
+    globals().update({key.upper(): value for key, value in merged.items()})
+    return merged
+
+
+set_palette(THEME_TEMPLATES["dark"])
+
+# The outline around ordinary buttons. apply_theme sets these from the saved theme;
+# build_style reads them, so the width and colour below are only the startup defaults.
+BUTTON_BORDER_DEFAULT_WIDTH = 1
+BTN_BORDER_W = BUTTON_BORDER_DEFAULT_WIDTH
+BTN_BORDER_COLOR = BUTTON_BORDER
+
+
+def build_style():
+    """The application stylesheet for the palette that is active now."""
+    return f"""
+* {{ font-family: "Cantarell", "Noto Sans", "DejaVu Sans", sans-serif; font-size: 10pt; }}
+QMainWindow, QWidget {{ background: {BG}; color: {TEXT}; }}
+QWidget#Panel {{ background: {BG}; }}
+QWidget#Strip {{ background: {PANEL}; border-right: 1px solid {BORDER}; }}
+QToolButton#StripButton {{ background: transparent; border: 0; border-left: 3px solid transparent;
+    padding: 9px 0; font-size: 15pt; color: {MUTED}; }}
+QToolButton#StripButton:hover {{ background: {HOVER}; color: {TEXT}; }}
+QToolButton#StripButton:checked {{ background: {HOVER_ALT}; border-left: 3px solid {ACCENT}; color: {ACCENT}; }}
+QTabWidget::pane {{ border: 0; }}
+QTabBar {{ background: {PANEL}; }}
+QTabBar::tab {{ background: {PANEL}; color: {MUTED}; border: 0; border-bottom: 2px solid transparent;
+    padding: 8px 22px; }}
+QTabBar::tab:selected {{ background: {BG}; color: {TEXT}; border-bottom: 2px solid {ACCENT}; }}
+QTabBar::tab:hover:!selected {{ color: {TEXT}; }}
+QLineEdit, QComboBox, QSpinBox {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 3px;
+    padding: 4px 8px; selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
+QFrame#SearchBox {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 3px; }}
+QFrame#SearchBox QLineEdit#SearchInput {{ background: transparent; border: 0; padding: 5px 2px; }}
+QFrame#SearchBox QToolButton {{ background: transparent; border: 0; color: {MUTED}; padding: 2px 5px; }}
+QFrame#SearchBox QToolButton:hover {{ color: {TEXT}; background: {TOOLTIP}; border-radius: 3px; }}
+QToolButton#RgButton {{ background: transparent; border: {BTN_BORDER_W}px solid {BTN_BORDER_COLOR}; color: {MUTED};
+    border-radius: 3px; padding: 1px 4px; font-size: 8pt; font-weight: bold; }}
+QToolButton#RgButton:checked {{ color: {ACCENT}; border-color: {ACCENT}; }}
+QLineEdit:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
+QComboBox QAbstractItemView {{ background: {PANEL}; border: 1px solid {BORDER}; }}
+QPushButton {{ background: {BUTTON}; border: {BTN_BORDER_W}px solid {BTN_BORDER_COLOR}; border-radius: 3px;
+    padding: 4px 10px; }}
+QPushButton:hover {{ background: {BUTTON_HOVER}; }}
+QPushButton:pressed, QPushButton:checked {{ background: {ACCENT}; color: {ON_ACCENT}; border-color: {ACCENT}; }}
+QPushButton#Primary {{ background: {ACCENT}; border: 0; color: {ON_ACCENT}; font-weight: bold; padding: 6px 14px; }}
+QPushButton#Primary:hover {{ background: {ACCENT_HOVER}; }}
+QPushButton#Ghost {{ background: transparent; border: {BTN_BORDER_W}px solid {BTN_BORDER_COLOR}; }}
+QToolButton {{ border: {BTN_BORDER_W}px solid {BTN_BORDER_COLOR}; border-radius: 3px; }}
+QToolButton:hover {{ background: {HOVER}; }}
+QToolButton:checked {{ background: {HOVER_ALT}; border-color: {ACCENT}; color: {ACCENT}; }}
+QToolButton#AlbumBack {{ background: transparent; border: 0; color: {ACCENT}; padding: 2px 8px;
+    font-weight: bold; }}
+QToolButton#AlbumBack:hover {{ background: {HOVER}; border-radius: 3px; }}
+QWidget#AlbumBar {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 3px; }}
+/* transport: an outlined circle with the glyph drawn inside (see player_icon), in the
+   theme's text colour, so it reads white on Black AMOLED and dark on Light */
+QPushButton#PlayerButton, QPushButton#PlayerBig {{ background: transparent; padding: 0;
+    border: 2px solid {TEXT}; }}
+QPushButton#PlayerButton {{ border-radius: 17px; }}
+QPushButton#PlayerBig {{ border-radius: 22px; }}
+QPushButton#PlayerButton:hover, QPushButton#PlayerBig:hover {{ background: {PLAYER_BUTTON_HOVER}; }}
+QPushButton#PlayerButton:pressed, QPushButton#PlayerBig:pressed {{ background: {PLAYER_BUTTON}; }}
+QPushButton#PlayerToggle {{ background: transparent; border: 0; border-radius: 14px; padding: 0; }}
+QPushButton#PlayerToggle:hover {{ background: {PLAYER_BUTTON_HOVER}; }}
+QPushButton#StopAfter {{ background: transparent; border: 1px solid {STOP_AFTER}; color: {MUTED};
+    border-radius: 3px; padding: 2px 6px; font-size: 9pt; }}
+QPushButton#StopAfter:checked {{ background: transparent; border-color: {AMBER}; color: {AMBER}; }}
+QPushButton#Swatch {{ border: 1px solid {BORDER}; border-radius: 3px; padding: 0; }}
+QTreeWidget, QTableWidget, QListWidget, QPlainTextEdit {{
+    background: {BG}; alternate-background-color: {PANEL_ALT}; border: 0; border-radius: 0;
+    selection-background-color: {ACCENT}; selection-color: {ON_ACCENT}; }}
+QTreeWidget {{ background: {BG}; }}
+QTreeWidget::item {{ padding: 2px 0; height: 21px; }}
+QTreeWidget::item:hover {{ background: {HOVER_ALT}; }}
+QListWidget {{ padding: 2px; }}
+QListWidget::item {{ padding: 5px 4px; border-radius: 3px; }}
+QListWidget::item:hover {{ background: {HOVER}; }}
+QTreeWidget::item:selected, QTableWidget::item:selected, QListWidget::item:selected {{
+    background: {ACCENT}; color: {ON_ACCENT}; }}
+QTableWidget::item:hover {{ background: {HOVER_ALT}; }}
+QHeaderView::section {{ background: {HEADER}; color: {HEADER_TEXT}; border: 0; border-right: 1px solid {BORDER};
+    border-bottom: 1px solid {BORDER}; padding: 4px 6px; font-weight: normal; }}
+QTableWidget {{ gridline-color: {BORDER}; }}
+QLabel#NowTitle {{ font-size: 11pt; font-weight: bold; }}
+QLabel#NowSub {{ color: {MUTED}; font-size: 9pt; }}
+QLabel#Pill {{ background: {PILL_BG}; color: {PILL_TEXT}; border: 1px solid {PILL_BORDER}; border-radius: 3px;
+    padding: 0 4px; font-size: 8.5pt; }}
+QLabel#Heading {{ font-size: 11pt; font-weight: bold; color: {TEXT}; }}
+QLabel#DiscHeading {{ font-size: 15px; font-weight: bold; color: {TEXT}; }}
+QLabel#Muted {{ color: {MUTED}; }}
+QLabel#Amber {{ color: {AMBER}; }}
+QLabel#ThemePreview {{ background: {PANEL}; color: {TEXT}; border-left: 4px solid {ACCENT};
+    border-radius: 3px; padding: 8px 10px; }}
+QWidget#PlayerBar {{ background: {PANEL}; border-top: 1px solid {BORDER}; }}
+QWidget#PlayerBar QWidget {{ background: {PANEL}; }}
+QWidget#SyncActivity {{ background: {PANEL}; }}
+QSlider::groove:horizontal {{ height: 4px; background: {GROOVE}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {HANDLE}; width: 11px; margin: -4px 0; border-radius: 5px; }}
+QProgressBar {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 3px; text-align: center;
+    height: 14px; }}
+QProgressBar::chunk {{ background: {ACCENT}; }}
+/* Check boxes and radios are painted by BranchArrowStyle, not here: Fusion's own box
+   blends into a dark palette and disappears on Black AMOLED. Do not add a stylesheet
+   rule for the indicator sub-control — it would take the drawing away from the style,
+   and the tick inside a filled box would go with it. */
+QCheckBox, QRadioButton {{ spacing: 6px; }}
+QGroupBox {{ border: 1px solid {BORDER}; border-radius: 4px; margin-top: 14px; padding-top: 8px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; color: {MUTED}; }}
+QSplitter::handle {{ background: {BORDER}; width: 1px; }}
+QMenu {{ background: {PANEL}; border: 1px solid {BORDER}; }}
+QMenu::item {{ padding: 5px 22px 5px 18px; }}
+QMenu::item:selected {{ background: {ACCENT}; color: {ON_ACCENT}; }}
+QMenu::separator {{ height: 1px; background: {SEPARATOR}; margin: 4px 12px; }}
+QStatusBar {{ background: {PANEL}; color: {MUTED}; border-top: 1px solid {BORDER}; }}
+QDialog {{ background: {BG}; }}
+QToolTip {{ background: {TOOLTIP}; color: {TEXT}; border: 1px solid {BORDER}; }}
+QScrollBar:vertical {{ background: {BG}; width: 11px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: {SCROLLBAR}; border-radius: 5px; min-height: 24px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+QScrollBar:horizontal {{ background: {BG}; height: 11px; }}
+QScrollBar::handle:horizontal {{ background: {SCROLLBAR}; border-radius: 5px; min-width: 24px; }}
+/* ---- mp3tag-style tag editor ---- */
+QWidget#TagToolbar {{ background: {PANEL}; border-bottom: 1px solid {BORDER}; }}
+QToolButton#TagTool {{ background: transparent; border: 0; border-radius: 3px; padding: 4px; }}
+QToolButton#TagTool:hover {{ background: {BUTTON}; }}
+QToolButton#TagTool:pressed {{ background: {BUTTON_HOVER}; }}
+QFrame#TagToolSep {{ color: {BORDER}; margin: 5px 6px; }}
+QFrame#DeviceDivider {{ background: {BORDER}; border: 0; }}
+QWidget#TagPanel {{ background: {PANEL}; border-right: 1px solid {BORDER}; }}
+QWidget#TagPanel QLabel {{ background: transparent; }}
+QWidget#TagPanel QComboBox {{ background: {BG}; }}
+QLabel#FieldLabel {{ color: {MUTED}; font-size: 8.5pt; }}
+QLabel#TagStatus {{ color: {MUTED}; font-size: 9pt; }}
+QLabel#TagCover {{ border: 1px solid {BORDER}; background: {COVER_BG}; color: {COVER_TEXT};
+    border-radius: 2px; }}
+QLineEdit#FilterInput {{ padding: 3px 6px; }}
+QWidget#TagListFooter {{ background: {PANEL}; border-top: 1px solid {BORDER}; }}
+"""
+
+
+def _blend(color, lighter=None, darker=None):
+    """A slightly lighter or darker version of a colour, as hex."""
+    try:
+        c = QColor(color)
+    except Exception:
+        return color
+    if not c.isValid():
+        return color
+    if lighter:
+        c = c.lighter(lighter)
+    if darker:
+        c = c.darker(darker)
+    return c.name()
+
+
+def button_border_settings(cfg):
+    """The line the app draws around ordinary buttons: width in pixels and colour.
+
+    An empty colour means "whatever the theme's button border is", so a template
+    switch keeps the width the user chose but takes the new template's colour."""
+    raw = (cfg or {}).get("button_border") or {}
+    try:
+        width = int(raw.get("width", BUTTON_BORDER_DEFAULT_WIDTH))
+    except (TypeError, ValueError):
+        width = BUTTON_BORDER_DEFAULT_WIDTH
+    width = max(0, min(width, 8))
+    color = str(raw.get("color") or "")
+    if color and not QColor(color).isValid():
+        color = ""
+    return {"width": width, "color": color}
+
+
+def theme_settings(cfg):
+    """The saved theme: template name, the colours changed by hand, and the palette."""
+    raw = (cfg or {}).get("theme") or {}
+    template = raw.get("template") or "dark"
+    if template not in THEME_TEMPLATES:
+        template = "custom"
+    base = raw.get("base") or (template if template in THEME_TEMPLATES else "dark")
+    palette = dict(THEME_TEMPLATES.get(base) or THEME_TEMPLATES["dark"])
+    overrides = {k: v for k, v in (raw.get("colors") or {}).items() if k in THEME_KEYS}
+    palette.update(overrides)
+    if "accent" in overrides:
+        if "accent_hover" not in overrides:
+            palette["accent_hover"] = _blend(overrides["accent"], lighter=118)
+        if "accent_dim" not in overrides:
+            palette["accent_dim"] = _blend(overrides["accent"], darker=190)
+    border = button_border_settings(raw)
+    if not border["color"]:
+        border["color"] = palette.get("button_border") or palette.get("border")
+    return {"template": template, "base": base, "colors": overrides, "palette": palette,
+            "button_border": border}
+
+
+def apply_theme(app, cfg):
+    """Make the saved theme active and install its stylesheet."""
+    theme = theme_settings(cfg)
+    set_palette(theme["palette"])
+    globals()["BTN_BORDER_W"] = theme["button_border"]["width"]
+    globals()["BTN_BORDER_COLOR"] = theme["button_border"]["color"]
+    if app is not None:
+        app.setStyleSheet(build_style())
+    return theme
+
+
+
+
+def _strip_pixmap(kind, color, size=44):
+    """Vector icons for the vertical Collection / Playlists / Smart strip."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    if kind == "collection":
+        pen = QPen(QColor(color))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QRectF(13, 13, 18, 18))
+        p.drawEllipse(QRectF(19, 19, 6, 6))
+        p.drawArc(QRectF(17, 17, 10, 10), 40 * 16, 120 * 16)
+    elif kind == "playlists":
+        pen = QPen(QColor(color))
+        pen.setWidth(2)
+        p.setPen(pen)
+        for y, width in ((14, 16), (22, 16), (30, 11)):
+            p.drawLine(10, y, 10 + width, y)
+        p.setBrush(QBrush(QColor(color)))
+        p.setPen(Qt.NoPen)
+        for y in (14, 22, 30):
+            p.drawEllipse(QPointF(28 if y != 30 else 25, y), 1.8, 1.8)
+    else:  # smart playlists: lightning bolt
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(color)))
+        p.drawPolygon(QPolygonF([QPointF(25, 8), QPointF(15, 25), QPointF(21, 25),
+                                 QPointF(18, 36), QPointF(30, 19), QPointF(23, 19)]))
+    p.end()
+    return pm
+
+
+def gear_icon(color=None, size=20):
+    """Small drawn gear, used for the library options button."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.translate(size / 2.0, size / 2.0)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(QColor(color or TEXT)))
+    for i in range(8):
+        p.save()
+        p.rotate(i * 45)
+        p.drawRoundedRect(QRectF(-1.8, -size * 0.46, 3.6, size * 0.17), 1, 1)
+        p.restore()
+    p.drawEllipse(QRectF(-size * 0.28, -size * 0.28, size * 0.56, size * 0.56))
+    p.setBrush(QBrush(QColor(PANEL)))
+    p.drawEllipse(QRectF(-size * 0.11, -size * 0.11, size * 0.22, size * 0.22))
+    p.end()
+    return QIcon(pm)
+
+
+def strip_icon(kind):
+    icon = QIcon()
+    icon.addPixmap(_strip_pixmap(kind, MUTED), QIcon.Normal, QIcon.Off)
+    icon.addPixmap(_strip_pixmap(kind, TEXT), QIcon.Active, QIcon.Off)
+    icon.addPixmap(_strip_pixmap(kind, ACCENT), QIcon.Normal, QIcon.On)
+    icon.addPixmap(_strip_pixmap(kind, ACCENT), QIcon.Active, QIcon.On)
+    return icon
+
+
+def player_icon(kind, color, size=22):
+    """One transport or mode glyph, drawn in `color` so every theme can recolour it.
+
+    kind: prev, next, play, pause, stop, shuffle, shuffle_off, repeat, repeat_off or
+    repeat_one. Only the glyph is drawn: the rings around the transport buttons are their
+    own borders, which keeps them crisp at any size and lets the stylesheet colour them.
+    Shuffle is two paths that swap places, repeat is a loop with an arrowhead at the top
+    right and at the bottom left, and repeat_one is that loop with a 1 in it. The two
+    `_off` kinds are the same drawing struck through, so an off mode reads as off and not
+    merely as dim.
+    """
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    s = float(size)
+    fill = QColor(color)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(fill))
+
+    def tri(points):
+        p.drawPolygon(QPolygonF([QPointF(x * s, y * s) for x, y in points]))
+
+    def head(tip_x, tip_y, back_x, half=0.20):
+        # An open arrowhead: two barbs swept back from the tip, the way the icons draw
+        # them. A solid triangle at 18 px reads as a blob rather than a direction.
+        p.drawLine(QPointF(back_x * s, (tip_y - half) * s), QPointF(tip_x * s, tip_y * s))
+        p.drawLine(QPointF(back_x * s, (tip_y + half) * s), QPointF(tip_x * s, tip_y * s))
+
+    def stroke(width=0.095):
+        pen = QPen(fill)
+        pen.setWidthF(max(1.3, s * width))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        return pen
+
+    if kind in ("prev", "next"):
+        bar = 0.15 if kind == "prev" else 0.76
+        p.drawRoundedRect(QRectF(bar * s, 0.22 * s, 0.09 * s, 0.56 * s), 0.02 * s, 0.02 * s)
+        if kind == "prev":
+            tri([(0.55, 0.18), (0.55, 0.82), (0.26, 0.50)])
+            tri([(0.86, 0.18), (0.86, 0.82), (0.57, 0.50)])
+        else:
+            tri([(0.45, 0.18), (0.45, 0.82), (0.74, 0.50)])
+            tri([(0.14, 0.18), (0.14, 0.82), (0.43, 0.50)])
+    elif kind == "play":
+        tri([(0.30, 0.16), (0.30, 0.84), (0.82, 0.50)])
+    elif kind == "pause":
+        p.drawRoundedRect(QRectF(0.28 * s, 0.18 * s, 0.16 * s, 0.64 * s), 0.03 * s, 0.03 * s)
+        p.drawRoundedRect(QRectF(0.56 * s, 0.18 * s, 0.16 * s, 0.64 * s), 0.03 * s, 0.03 * s)
+    elif kind == "stop":
+        p.drawRoundedRect(QRectF(0.26 * s, 0.26 * s, 0.48 * s, 0.48 * s), 0.06 * s, 0.06 * s)
+    else:  # shuffle, shuffle_off, repeat, repeat_off, repeat_one: strokes, not shapes
+        stroke()
+        if kind.startswith("shuffle"):
+            # Two paths that swap places, each running out to an arrow on the right:
+            # they start and finish at the same height and cross in the middle.
+            for y_from, y_to in ((0.26, 0.74), (0.74, 0.26)):
+                path = QPainterPath(QPointF(0.06 * s, y_from * s))
+                path.lineTo(0.26 * s, y_from * s)
+                path.lineTo(0.58 * s, y_to * s)
+                path.lineTo(0.92 * s, y_to * s)
+                p.drawPath(path)
+                head(0.92, y_to, 0.70, 0.18)
+        else:
+            # A loop: a rounded box with an arrowhead at the top right running right and
+            # one at the bottom left running left, the way a player draws repeat. The two
+            # heads sit on the corners, so each points the way the loop travels.
+            # The two opposite corners are the arrowheads, so the loop is drawn with
+            # those corners left open and each head closing it, as the icon does.
+            r = 0.15
+            path = QPainterPath()
+            path.moveTo(0.70 * s, 0.24 * s)
+            path.lineTo((0.08 + r) * s, 0.24 * s)
+            path.quadTo(0.08 * s, 0.24 * s, 0.08 * s, (0.24 + r) * s)
+            path.lineTo(0.08 * s, 0.50 * s)
+            path.moveTo(0.30 * s, 0.76 * s)
+            path.lineTo((0.92 - r) * s, 0.76 * s)
+            path.quadTo(0.92 * s, 0.76 * s, 0.92 * s, (0.76 - r) * s)
+            path.lineTo(0.92 * s, 0.50 * s)
+            p.drawPath(path)
+            p.drawLine(QPointF(0.70 * s, 0.24 * s), QPointF(0.96 * s, 0.24 * s))
+            p.drawLine(QPointF(0.30 * s, 0.76 * s), QPointF(0.04 * s, 0.76 * s))
+            head(0.96, 0.24, 0.70, 0.19)
+            head(0.04, 0.76, 0.30, 0.19)
+            if kind == "repeat_one":
+                # Drawn rather than set in a font: a 1 has to stay a 1 at 18 px.
+                cx, cy = 0.48 * s, 0.49 * s
+                stroke(0.085)
+                flag = QPainterPath(QPointF(cx - 0.07 * s, cy - 0.08 * s))
+                flag.lineTo(cx, cy - 0.13 * s)
+                flag.lineTo(cx, cy + 0.13 * s)
+                p.drawPath(flag)
+        if kind.endswith("_off"):
+            # The same drawing struck through, top left to bottom right.
+            stroke(0.10)
+            p.drawLine(QPointF(0.09 * s, 0.09 * s), QPointF(0.91 * s, 0.91 * s))
+    p.end()
+    return pm
+
+
+def transport_icon(kind, size=22):
+    """A transport glyph in the theme's text colour (the ring is the button's border)."""
+    return QIcon(player_icon(kind, TEXT, size))
+
+
+# the glyph a mode shows while it is off: the same drawing, struck through
+MODE_OFF_KIND = {"shuffle": "shuffle_off", "repeat": "repeat_off", "repeat_one": "repeat_off"}
+
+
+def mode_icon(kind, size=18):
+    """Shuffle / repeat: struck through and muted while off, plain and in the text colour
+    while on (as a player shows it).
+
+    Off and on are filled for every role, because a button that has focus — or the
+    pointer over it — asks Qt for QIcon.Active rather than Normal. Leaving Active+Off
+    out let Qt fall back to the on pixmap, so either button painted white whatever it
+    was set to.
+    """
+    off = player_icon(MODE_OFF_KIND.get(kind, kind), MUTED, size)
+    on = player_icon(kind, TEXT, size)
+    icon = QIcon()
+    for mode in (QIcon.Normal, QIcon.Active):
+        icon.addPixmap(off, mode, QIcon.Off)
+        icon.addPixmap(on, mode, QIcon.On)
+    icon.addPixmap(off, QIcon.Disabled, QIcon.Off)
+    icon.addPixmap(off, QIcon.Disabled, QIcon.On)
+    return icon
+
+
+class PreferencesDialog(QDialog):
+    """Tools > Preferences: library behaviour and playback order in one place."""
+
+    def __init__(self, library_tab, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.setMinimumSize(640, 400)
+        self.library_tab = library_tab
+        cfg = library_tab.config
+        self.widgets = {}
+        # Restoring is applied with the rest of the page: Cancel keeps them hidden.
+        self.removed_devices = dict(cfg.get("removed_devices") or {})
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        self.sidebar = QListWidget()
+        self.sidebar.setFixedWidth(150)
+        self.pages = QStackedWidget()
+        body.addWidget(self.sidebar)
+        body.addWidget(self.pages, 1)
+        lay.addLayout(body, 1)
+        for title, page in (("Theme", self._theme_page(cfg)),
+                            ("Library", self._library_page(cfg)),
+                            ("Audiobooks", self._audiobooks_page(cfg)),
+                            ("Devices", self._devices_page(cfg)),
+                            ("Playback", self._playback_page(cfg)),
+                            ("Syncing", self._sync_page(cfg)),
+                            ("Backup", self._backup_page(cfg)),
+                            ("Audio CD", self._cd_page(cfg)),
+                            ("Identification", self._identify_page(cfg))):
+            self.sidebar.addItem(title)
+            self.pages.addWidget(page)
+        self.sidebar.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.sidebar.setCurrentRow(0)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self._apply)
+        ok = QPushButton("OK")
+        ok.setObjectName("Primary")
+        ok.clicked.connect(self._ok)
+        for button in (cancel, apply_btn, ok):
+            buttons.addWidget(button)
+        lay.addLayout(buttons)
+
+    def _checkbox(self, key, label, cfg, default):
+        box = QCheckBox(label)
+        box.setChecked(bool(cfg.get(key, default)))
+        self.widgets[key] = box
+        return box
+
+    def _combo(self, key, choices, cfg, default):
+        combo = QComboBox()
+        for value, label in choices:
+            combo.addItem(label, value)
+        combo.setCurrentIndex(max(combo.findData(cfg.get(key, default)), 0))
+        self.widgets[key] = combo
+        return combo
+
+    def _line(self, key, cfg, default="", placeholder=""):
+        edit = QLineEdit(str(cfg.get(key, default) or ""))
+        edit.setPlaceholderText(placeholder or default)
+        self.widgets[key] = edit
+        return edit
+
+    def _theme_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        theme = theme_settings(cfg)
+        self.theme_state = {"template": theme["template"], "base": theme["base"],
+                            "colors": dict(theme["colors"]),
+                            "button_border": {"width": theme["button_border"]["width"],
+                                              "color": button_border_settings(cfg)["color"]}}
+        form = QFormLayout()
+        form.setSpacing(8)
+        self.theme_combo = QComboBox()
+        for key, label in THEME_LABELS:
+            self.theme_combo.addItem(label, key)
+        self.theme_combo.addItem("Custom", "custom")
+        self.theme_combo.setCurrentIndex(max(self.theme_combo.findData(self.theme_state["template"]), 0))
+        self.theme_combo.currentIndexChanged.connect(self._theme_template_changed)
+        form.addRow("Template", self.theme_combo)
+        self.swatches = {}
+        for key, label in THEME_EDITABLE:
+            row = QWidget()
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            row_lay.setSpacing(8)
+            button = QPushButton()
+            button.setObjectName("Swatch")
+            button.setFixedSize(52, 20)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(f"Change the {label.lower()} colour")
+            button.clicked.connect(lambda _checked=False, key=key: self._pick_color(key))
+            value = QLabel()
+            value.setObjectName("Muted")
+            row_lay.addWidget(button)
+            row_lay.addWidget(value, 1)
+            form.addRow(label, row)
+            self.swatches[key] = (button, value)
+
+        # the line around buttons: thickness and colour
+        border_row = QWidget()
+        border_lay = QHBoxLayout(border_row)
+        border_lay.setContentsMargins(0, 0, 0, 0)
+        border_lay.setSpacing(8)
+        self.btn_border_width = QSpinBox()
+        self.btn_border_width.setRange(0, 6)
+        self.btn_border_width.setSuffix(" px")
+        self.btn_border_width.setToolTip("How thick the line around buttons is — 0 draws none")
+        self.btn_border_width.setValue(int(theme["button_border"]["width"]))
+        self.btn_border_width.valueChanged.connect(self._button_border_width_changed)
+        self.btn_border_color = QPushButton()
+        self.btn_border_color.setObjectName("Swatch")
+        self.btn_border_color.setFixedSize(52, 20)
+        self.btn_border_color.setCursor(Qt.PointingHandCursor)
+        self.btn_border_color.setToolTip("Change the colour of the line around buttons")
+        self.btn_border_color.clicked.connect(self._pick_button_border_color)
+        border_lay.addWidget(self.btn_border_width)
+        border_lay.addWidget(self.btn_border_color)
+        border_lay.addStretch(1)
+        form.addRow("Button outline", border_row)
+
+        self.border_preview = QPushButton("Sample button")
+        self.border_preview.setFocusPolicy(Qt.NoFocus)
+        self.border_preview.setToolTip("This is the outline those two settings draw")
+        form.addRow("", self.border_preview)
+        lay.addLayout(form)
+        reset = QPushButton("Reset to template")
+        reset.setObjectName("Ghost")
+        reset.clicked.connect(self._theme_reset)
+        lay.addWidget(reset)
+        self.theme_preview = QLabel("Preview: this is how text sits on a panel, with the accent on the left.")
+        self.theme_preview.setObjectName("ThemePreview")
+        self.theme_preview.setWordWrap(True)
+        lay.addWidget(self.theme_preview)
+        lay.addStretch()
+        self._theme_refresh()
+        return page
+
+    def _theme_palette(self):
+        """The colours the page is showing, template plus the changes made here."""
+        return theme_settings({"theme": dict(self.theme_state)})["palette"]
+
+    def _theme_refresh(self):
+        palette = self._theme_palette()
+        for key, (button, value) in self.swatches.items():
+            color = palette.get(key, "#000000")
+            button.setStyleSheet(f"QPushButton#Swatch {{ background: {color};"
+                                 f" border: 1px solid {BORDER}; border-radius: 3px; }}")
+            value.setText(color)
+        self.theme_preview.setStyleSheet(
+            f"QLabel#ThemePreview {{ background: {palette['panel']}; color: {palette['text']};"
+            f" border-left: 4px solid {palette['accent']}; border-radius: 3px; padding: 8px 10px; }}")
+        border = theme_settings({"theme": dict(self.theme_state)})["button_border"]
+        self.btn_border_width.blockSignals(True)
+        self.btn_border_width.setValue(int(border["width"]))
+        self.btn_border_width.blockSignals(False)
+        self.btn_border_color.setStyleSheet(
+            f"QPushButton#Swatch {{ background: {border['color']};"
+            f" border: 1px solid {BORDER}; border-radius: 3px; }}")
+        self.border_preview.setStyleSheet(
+            f"QPushButton {{ background: {palette['button']}; color: {palette['text']};"
+            f" border: {border['width']}px solid {border['color']}; border-radius: 3px;"
+            f" padding: 4px 10px; }}")
+
+    def _button_border_width_changed(self, value):
+        border = dict(self.theme_state.get("button_border") or {})
+        border["width"] = int(value)
+        self.theme_state["button_border"] = border
+        self._theme_refresh()
+
+    def _pick_button_border_color(self):
+        border = dict(self.theme_state.get("button_border") or {})
+        current = border.get("color") or self._theme_palette().get("button_border", "#484848")
+        color = QColorDialog.getColor(QColor(current), self, "Choose the button outline colour")
+        if not color.isValid():
+            return
+        border["color"] = color.name()
+        self.theme_state["button_border"] = border
+        self._theme_refresh()
+
+    def _theme_template_changed(self, _index=0):
+        name = self.theme_combo.currentData()
+        if name in THEME_TEMPLATES:
+            # a new template brings its own colours, but the width is the user's choice
+            width = int((self.theme_state.get("button_border") or {}).get("width",
+                                                                          BUTTON_BORDER_DEFAULT_WIDTH))
+            self.theme_state = {"template": name, "base": name, "colors": {},
+                                "button_border": {"width": width, "color": ""}}
+            self._theme_refresh()
+
+    def _pick_color(self, key):
+        current = self._theme_palette().get(key, "#000000")
+        color = QColorDialog.getColor(QColor(current), self, "Choose a colour")
+        if not color.isValid():
+            return
+        colors = dict(self.theme_state["colors"])
+        colors[key] = color.name()
+        self.theme_state = {"template": "custom", "base": self.theme_state["base"],
+                            "colors": colors,
+                            "button_border": dict(self.theme_state.get("button_border") or {})}
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.setCurrentIndex(max(self.theme_combo.findData("custom"), 0))
+        self.theme_combo.blockSignals(False)
+        self._theme_refresh()
+
+    def _theme_reset(self):
+        base = self.theme_state.get("base", "dark")
+        self.theme_state = {"template": base, "base": base, "colors": {},
+                            "button_border": {"width": BUTTON_BORDER_DEFAULT_WIDTH, "color": ""}}
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.setCurrentIndex(max(self.theme_combo.findData(base), 0))
+        self.theme_combo.blockSignals(False)
+        self._theme_refresh()
+
+    def _library_page(self, cfg):
+        page = QWidget()
+        form = QFormLayout(page)
+        form.setSpacing(8)
+        form.addRow("Double-click a track or album",
+                    self._combo("lib_double_click",
+                                (("queue", "Add to the queue"), ("play", "Play now")),
+                                cfg, "queue"))
+        form.addRow(self._checkbox("lib_show_covers", "Show album covers in the list",
+                                   cfg, True))
+        form.addRow(self._checkbox("lib_show_dividers", "Show A–Z dividers", cfg, True))
+        auto_open = self._checkbox("lib_auto_open", "Auto-open the first level", cfg, False)
+        auto_open.setToolTip("Used until you choose a position with the library's fold "
+                             "button \u2014 after that the folders open the way you left them")
+        form.addRow(auto_open)
+        form.addRow("Devices tab",
+                    self._combo("devices_layout",
+                                (("bar", "Device list across the top"),
+                                 ("side", "Device list down the side")),
+                                cfg, "bar"))
+        return page
+
+    def _audiobooks_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        form = QFormLayout()
+        form.setSpacing(8)
+        folder_row = QWidget()
+        folder_lay = QHBoxLayout(folder_row)
+        folder_lay.setContentsMargins(0, 0, 0, 0)
+        folder_lay.setSpacing(6)
+        self.import_target = self._line("audiobook_import_target", cfg, "",
+                                        "Default audiobook folder")
+        browse = QPushButton("Select folder…")
+        browse.clicked.connect(self._browse_import_folder)
+        folder_lay.addWidget(self.import_target, 1)
+        folder_lay.addWidget(browse)
+        form.addRow("Import folder", folder_row)
+        lay.addLayout(form)
+        note = QLabel("Import and Import folder move audio into this destination and "
+                      "add it to the audiobook folders. Both run in the background; the "
+                      "Audiobooks tab shows their progress.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lay.addStretch()
+        return page
+
+    def _browse_import_folder(self):
+        start = self.import_target.text().strip() or os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(self, "Default audiobook import folder",
+                                                  start, options=DIRECTORY_DIALOG_OPTIONS)
+        if folder:
+            self.import_target.setText(folder)
+
+    def _devices_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        note = QLabel("Removing a device from the Devices tab only hides it there; its "
+                      "music, sync profiles and presets are untouched. A removed device "
+                      "stays out of the tab after a restart or a re-plug until it is "
+                      "restored here.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        self.removed_list = QListWidget()
+        self.removed_list.setAlternatingRowColors(True)
+        self.restore_btn = QPushButton("Restore selected")
+        self.restore_btn.clicked.connect(self._restore_removed)
+        self.removed_list.currentItemChanged.connect(
+            lambda current, _previous: self.restore_btn.setEnabled(
+                current is not None and bool(current.data(Qt.UserRole))))
+        lay.addWidget(self.removed_list, 1)
+        row = QHBoxLayout()
+        self.removed_hint = QLabel()
+        self.removed_hint.setObjectName("Muted")
+        self.removed_hint.setWordWrap(True)
+        row.addWidget(self.removed_hint, 1)
+        row.addWidget(self.restore_btn)
+        lay.addLayout(row)
+        self._fill_removed_list()
+        return page
+
+    def _fill_removed_list(self):
+        self.removed_list.blockSignals(True)
+        self.removed_list.clear()
+        for device_id, name in self.removed_devices.items():
+            item = QListWidgetItem(name or device_id)
+            item.setData(Qt.UserRole, device_id)
+            item.setToolTip(device_id)
+            self.removed_list.addItem(item)
+        if not self.removed_devices:
+            item = QListWidgetItem("No devices have been removed.")
+            item.setFlags(Qt.NoItemFlags)
+            self.removed_list.addItem(item)
+        self.removed_list.blockSignals(False)
+        self.removed_list.setEnabled(bool(self.removed_devices))
+        self.restore_btn.setEnabled(False)
+        self.removed_hint.setText(
+            "Restored devices come back with the same name, presets and profiles."
+            if self.removed_devices else
+            "Right-click a device in the Devices tab to remove it.")
+
+    def _restore_removed(self):
+        item = self.removed_list.currentItem()
+        if item is None:
+            return
+        device_id = item.data(Qt.UserRole)
+        if not device_id:
+            return
+        name = self.removed_devices.pop(device_id, device_id)
+        self._fill_removed_list()
+        self.removed_hint.setText(f"{name} will come back when you press Apply.")
+
+    def _playback_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        form = QFormLayout()
+        form.setSpacing(8)
+        shuffle = self._combo("shuffle_mode", [(k, label) for k, label, _h in SHUFFLE_MODES],
+                              cfg, "off")
+        hint = QLabel()
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+
+        def show_hint(_index=0):
+            key = shuffle.currentData()
+            hint.setText(next(h for k, _label, h in SHUFFLE_MODES if k == key))
+
+        shuffle.currentIndexChanged.connect(show_hint)
+        show_hint()
+        form.addRow("Order for new queues", shuffle)
+        form.addRow(hint)
+        album = self._combo("album_play_order",
+                            [(k, label) for k, label, _h in ALBUM_PLAY_ORDERS],
+                            cfg, "in_order")
+        form.addRow("Album order when playing in order", album)
+        click_seek = self._checkbox("seek_click", "Click the time bar to jump", cfg, True)
+        click_seek.setToolTip("Click anywhere on the time bar to jump to that point. "
+                              "Turn this off to page with a click; dragging the handle "
+                              "still seeks.")
+        form.addRow(click_seek)
+        form.addRow("Buffer playing tracks ahead",
+                    self._combo("file_buffer_mb", file_buffer_choices(), cfg,
+                                FILE_BUFFER_DEFAULT))
+        form.addRow("Buffer device tracks ahead",
+                    self._combo("device_buffer_mb", device_buffer_choices(), cfg,
+                                DEVICE_BUFFER_DEFAULT))
+        lay.addLayout(form)
+        note = QLabel("Play selection as (Music menu) plays once in any mode without "
+                      "changing this setting. Play album in order always keeps disc and "
+                      "track order.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        buffered = QLabel("Buffering reads the tracks coming up into memory before the "
+                          "player needs them, which helps when the library is on a slow disk "
+                          "or a share. Every track coming up has its first 30 seconds read "
+                          "first, so the next one is ready to start, and a bigger size reads "
+                          "further ahead. Nothing is decoded and nothing is copied: the player "
+                          "opens the same file it always did, and Off reads nothing at all.")
+        buffered.setObjectName("Muted")
+        buffered.setWordWrap(True)
+        lay.addWidget(buffered)
+        device_buffered = QLabel("The device buffer copies the tracks coming up from a phone "
+                                 "or player into a local cache. The track playing now is "
+                                 "copied first, then the ones after it while the size lasts, "
+                                 "and playback uses a copy once it is complete. A size is a "
+                                 "budget for whole tracks, so a single large track can be "
+                                 "bigger than the size you pick. Copies are deleted when "
+                                 "that device is disconnected or the app closes.")
+        device_buffered.setObjectName("Muted")
+        device_buffered.setWordWrap(True)
+        lay.addWidget(device_buffered)
+        lay.addStretch()
+        return page
+
+    def _sync_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        form = QFormLayout()
+        form.setSpacing(8)
+        keep = QSpinBox()
+        keep.setRange(1, 100)
+        keep.setSuffix(" runs")
+        keep.setValue(sync_log_keep_entries(cfg.get("sync_log_keep", 10)))
+        keep.setToolTip("How many finished compares, syncs and verifications each profile's "
+                        "log keeps. Older runs are dropped as new ones finish.")
+        self.widgets["sync_log_keep"] = keep
+        form.addRow("Keep in each profile's sync log", keep)
+        lay.addLayout(form)
+        note = QLabel("Each sync profile has its own Choose Target Folders button. It picks "
+                      "the selected device folder and the Music and Audiobooks folders "
+                      "below it, so changing one profile never changes another.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        note = QLabel("Every compare, sync and verification adds one entry to that profile's "
+                      "log: when it ran, what it was, how many files were new, updated, "
+                      "restored or removed, any errors, and the file lines. The clock-and-page "
+                      "button above the change list opens it, newest first. A profile's log "
+                      "is deleted with the profile, and Clear log empties it without "
+                      "forgetting anything on the device.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lay.addStretch()
+        return page
+
+    def _backup_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        heading = QLabel("Backup and transfer")
+        heading.setObjectName("Heading")
+        lay.addWidget(heading)
+        note = QLabel("Export selected settings to one JSON file, or import a file "
+                      "made by Nebula. Preferences are merged; sync profiles, presets "
+                      "and smart playlists replace the selected current ones. Account "
+                      "sign-ins are never exported.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        self.backup_checks = {}
+        for key, label in SETTINGS_BUNDLE_LABELS:
+            box = QCheckBox(label)
+            box.setChecked(True)
+            self.backup_checks[key] = box
+            lay.addWidget(box)
+        row = QHBoxLayout()
+        self.backup_export = QPushButton("Export settings…")
+        self.backup_export.clicked.connect(self._export_settings)
+        self.backup_import = QPushButton("Import settings…")
+        self.backup_import.clicked.connect(self._import_settings)
+        row.addWidget(self.backup_export)
+        row.addWidget(self.backup_import)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.backup_status = QLabel("")
+        self.backup_status.setObjectName("Muted")
+        self.backup_status.setWordWrap(True)
+        lay.addWidget(self.backup_status)
+        lay.addStretch()
+        return page
+
+    def _backup_groups(self):
+        return [key for key, box in self.backup_checks.items() if box.isChecked()]
+
+    def _export_settings(self):
+        groups = self._backup_groups()
+        if not groups:
+            QMessageBox.warning(self, "Export settings",
+                                "Choose at least one kind of setting to export.")
+            return
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Export settings",
+            os.path.join(os.path.expanduser("~"), "nebula-settings.json"),
+            "Nebula settings (*.json)", options=FILE_DIALOG_OPTIONS)
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            write_settings_bundle(path, self.library_tab.config, groups)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Export settings",
+                                f"Could not export the settings:\n{exc}")
+            return
+        self.backup_status.setText(f"Exported {len(groups)} setting group(s) to {path}")
+
+    def _import_settings(self):
+        groups = self._backup_groups()
+        if not groups:
+            QMessageBox.warning(self, "Import settings",
+                                "Choose at least one kind of setting to import.")
+            return
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "Import settings", os.path.expanduser("~"),
+            "Nebula settings (*.json)", options=FILE_DIALOG_OPTIONS)
+        if not path:
+            return
+        try:
+            bundle = read_settings_bundle(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Import settings",
+                                f"Could not read the settings file:\n{exc}")
+            return
+        labels = dict(SETTINGS_BUNDLE_LABELS)
+        chosen = ", ".join(labels.get(key, key) for key in groups)
+        if QMessageBox.question(
+                self, "Import settings",
+                f"Import these settings?\n\n{chosen}\n\nPreferences are merged. "
+                "Selected sync profiles, presets and smart playlists replace the "
+                "current ones. A backup is kept in config.json.bak.") != QMessageBox.Yes:
+            return
+        try:
+            imported = apply_settings_bundle(bundle, self.library_tab.config, groups)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Import settings",
+                                f"Could not import the settings:\n{exc}")
+            return
+        window = self.library_tab.window()
+        if "sync_profiles" in imported or "device_presets" in imported:
+            sync = getattr(window, "sync_tab", None)
+            if sync is not None:
+                if "sync_profiles" in imported:
+                    sync.profiles = imported["sync_profiles"]
+                    sync._reload_list()
+                if "device_presets" in imported:
+                    sync.presets = imported["device_presets"]
+                    sync._fill_presets()
+        if "smart_playlists" in imported:
+            library_tab = getattr(window, "library_tab", self.library_tab)
+            library_tab.smart.items = load_json(SMART_FILE, [])
+            library_tab.reload_smart()
+        if "preferences" in imported:
+            apply_theme(QApplication.instance(), self.library_tab.config)
+            player = getattr(window, "player", None)
+            if player is not None:
+                player.set_click_to_seek(self.library_tab.config.get("seek_click", True))
+                player.refresh_buffers()
+            audiobooks = getattr(window, "audiobooks_tab", None)
+            if audiobooks is not None:
+                audiobooks.refresh(force=True)
+            self.library_tab.preferences_changed()
+            sync = getattr(window, "sync_tab", None)
+            if sync is not None:
+                sync.trim_logs()
+        self.backup_status.setText(f"Imported {len(groups)} setting group(s) from {path}")
+        QMessageBox.information(self, "Import settings",
+                                "The selected settings were imported.")
+        self.accept()
+
+    def _cd_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.addRow("Buffer CD tracks ahead",
+                    self._combo("cd_buffer", ((0, "Off: read each track when it starts"),
+                                              (1, "1 track ahead"), (2, "2 tracks ahead"),
+                                              (3, "3 tracks ahead"), (4, "4 tracks ahead"),
+                                              (-1, "All queued CD tracks")),
+                              cfg, CD_BUFFER_DEFAULT))
+        form.addRow(self._checkbox("cd_buffer_early",
+                                   "Start buffering as soon as a disc is identified", cfg, False))
+        lay.addLayout(form)
+        note = QLabel("Buffered tracks are read in the background into a temporary file, so starting "
+                      "one doesn't wait for the drive to spin up. The track playing now is read "
+                      "first and playback follows that read, then the tracks ahead of it, so the "
+                      "disc is read once in one pass and the drive stops when they are ready. "
+                      "Seeking past what has been read reads the drive, and the read ahead stands "
+                      "back while it does. Buffered files are deleted with the disc, and when "
+                      "the app closes, so nothing read from a disc stays behind.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        early = QLabel("With the start-as-soon-as-identified option on, the tracks the depth "
+                       "covers are read as soon as a disc's table of contents has been read, "
+                       "before anything is queued, so the first track you play already comes "
+                       "from the buffer. With it off, buffering starts when a disc track is "
+                       "queued or played. The depth applies either way.")
+        early.setObjectName("Muted")
+        early.setWordWrap(True)
+        lay.addWidget(early)
+        gone = QLabel("Everything buffered from a disc is deleted the moment that disc leaves "
+                      "the drive - the app's eject, the tray button, the disc being pulled out, "
+                      "the drive being unplugged, or another disc taking its place - so a buffer "
+                      "never outlives the disc it was read from. Each drive keeps its own "
+                      "buffer, and a drive that says it is empty loses it even while another "
+                      "drive still holds a disc. A drive that is only spinning up, or not "
+                      "answering at all, is not taken as its disc having gone; if it cannot be "
+                      "asked for half a minute, the buffer it was read from goes too.")
+        gone.setObjectName("Muted")
+        gone.setWordWrap(True)
+        lay.addWidget(gone)
+        lay.addStretch()
+        return page
+
+    def _identify_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        note = QLabel("When an audio CD goes in, the sources that are on are tried in this order. CDDB "
+                      "and MusicBrainz are matched by disc ID. Discogs has no disc ID lookup, so use "
+                      "Find release on the CD tab to search it.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        body = QHBoxLayout()
+        self.id_list = QListWidget()
+        for key, enabled in id_order_entries(cfg):
+            if key not in ID_SOURCES:
+                continue
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                          | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+            self.id_list.addItem(item)
+        self._id_numbers()
+        body.addWidget(self.id_list, 1)
+        arrows = QVBoxLayout()
+        up = QPushButton("Move up")
+        down = QPushButton("Move down")
+        up.clicked.connect(lambda: self._id_move(-1))
+        down.clicked.connect(lambda: self._id_move(1))
+        arrows.addWidget(up)
+        arrows.addWidget(down)
+        arrows.addStretch()
+        body.addLayout(arrows)
+        lay.addLayout(body, 1)
+        row = QHBoxLayout()
+        self.discogs_status = QLabel()
+        self.discogs_status.setObjectName("Muted")
+        self.discogs_status.setWordWrap(True)
+        self.discogs_btn = QPushButton("Sign in to Discogs…")
+        self.discogs_btn.setEnabled(bool(DISCOGS_CONSUMER_KEY))
+        self.discogs_btn.clicked.connect(self._discogs_connect)
+        row.addWidget(self.discogs_status, 1)
+        row.addWidget(self.discogs_btn)
+        lay.addLayout(row)
+        self._discogs_refresh(cfg)
+        return page
+
+    def _id_numbers(self):
+        for i in range(self.id_list.count()):
+            item = self.id_list.item(i)
+            item.setText(f"{i + 1}. {ID_SOURCES[item.data(Qt.ItemDataRole.UserRole)]}")
+
+    def _id_move(self, step):
+        row = self.id_list.currentRow()
+        target = row + step
+        if row < 0 or not 0 <= target < self.id_list.count():
+            return
+        item = self.id_list.takeItem(row)
+        self.id_list.insertItem(target, item)
+        self.id_list.setCurrentRow(target)
+        self._id_numbers()
+
+    def _id_order_value(self):
+        return [[self.id_list.item(i).data(Qt.ItemDataRole.UserRole),
+                 self.id_list.item(i).checkState() == Qt.CheckState.Checked]
+                for i in range(self.id_list.count())]
+
+    def _discogs_refresh(self, cfg):
+        if not DISCOGS_CONSUMER_KEY:
+            text = "Discogs sign-in is not set up in this build."
+        elif discogs_connected(cfg):
+            text = "Signed in to Discogs."
+        else:
+            text = ("Not signed in to Discogs. Discogs needs a free account. Sign in to search it "
+                    "with Find release.")
+        self.discogs_status.setText(text)
+
+    def _discogs_connect(self):
+        try:
+            token, secret, url = discogs_begin_auth()
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Discogs", f"Could not start Discogs sign-in: {exc}")
+            return
+        QDesktopServices.openUrl(QUrl(url))
+        code, ok = QInputDialog.getText(
+            self, "Discogs sign-in",
+            f"Approve {APP_SHORT} in the browser window that just opened, then paste the code "
+            "Discogs shows you here:")
+        if not ok or not code.strip():
+            return
+        try:
+            token, secret = discogs_finish_auth(token, secret, code.strip())
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Discogs", f"Discogs did not accept the code: {exc}")
+            return
+        cfg = self.library_tab.config
+        cfg["discogs_token"], cfg["discogs_secret"] = token, secret
+        save_config(cfg)
+        self._discogs_refresh(cfg)
+
+    def _collect(self):
+        out = {}
+        for key, widget in self.widgets.items():
+            if isinstance(widget, QCheckBox):
+                out[key] = widget.isChecked()
+            elif isinstance(widget, QSpinBox):
+                out[key] = widget.value()
+            elif isinstance(widget, QLineEdit):
+                out[key] = widget.text().strip()
+            else:
+                out[key] = widget.currentData()
+        out["removed_devices"] = dict(self.removed_devices)
+        border = dict(self.theme_state.get("button_border") or {})
+        out["theme"] = {"template": self.theme_state["template"],
+                        "base": self.theme_state["base"],
+                        "colors": dict(self.theme_state["colors"]),
+                        "button_border": {"width": int(border.get("width",
+                                                                  BUTTON_BORDER_DEFAULT_WIDTH)),
+                                          "color": border.get("color") or ""}}
+        return out
+
+    def _apply(self):
+        cfg = self.library_tab.config
+        devices_changed = (dict(cfg.get("removed_devices") or {}) != self.removed_devices)
+        cfg.update(self._collect())
+        cfg["id_order"] = self._id_order_value()
+        save_config(cfg)
+        window = self.library_tab.window()
+        window.apply_theme()
+        window.sync_disc_buffer()          # the disc in the drive, if the option changed
+        window.player.set_click_to_seek(cfg.get("seek_click", True))
+        window.player.refresh_buffers()
+        window.sync_tab.trim_logs()        # a smaller limit applies to logs already kept
+        if devices_changed:
+            window.devices_tab.refresh_list()   # a restored device comes back right away
+        self.library_tab.preferences_changed()
+
+    def _ok(self):
+        self._apply()
+        self.accept()
+
+
+class CoverViewer(QDialog):
+    """Enlarged album art; close with Esc, a click, or the X."""
+
+    def __init__(self, pixmap, title, subtitle, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cover")
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.pixmap = pixmap
+        self.title = title
+        self.subtitle = subtitle
+        screen = (parent.screen() if parent else QApplication.primaryScreen())
+        avail = screen.availableGeometry() if screen else None
+        if pixmap is not None and not pixmap.isNull():
+            w = min(avail.width() * 0.86 if avail else 900, max(420, pixmap.width()))
+            h = min(avail.height() * 0.86 if avail else 900, max(420, pixmap.height()) + 74)
+        else:
+            w, h = 460, 420
+        self.resize(int(w), int(h))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor("#101010"))
+        top = 16
+        if self.pixmap is not None and not self.pixmap.isNull():
+            target = self.rect().adjusted(22, top, -22, -70)
+            scaled = self.pixmap.scaled(target.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = target.x() + (target.width() - scaled.width()) // 2
+            y = target.y() + (target.height() - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
+        else:
+            p.setPen(QColor(MUTED))
+            f = QFont(self.font())
+            f.setPointSize(13)
+            p.setFont(f)
+            p.drawText(self.rect().adjusted(0, 0, 0, -60), Qt.AlignCenter, "No embedded cover art")
+        p.setPen(QColor("#f0f0f0"))
+        f = QFont(self.font())
+        f.setPointSize(12)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(self.rect().adjusted(22, self.height() - 54, -22, -28), Qt.AlignCenter, self.title)
+        p.setPen(QColor(MUTED))
+        f.setPointSize(10)
+        f.setBold(False)
+        p.setFont(f)
+        p.drawText(self.rect().adjusted(22, self.height() - 30, -22, -8), Qt.AlignCenter, self.subtitle)
+        p.end()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Escape, Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            self.close()
+        else:
+            super().keyPressEvent(e)
+
+    def mousePressEvent(self, _e):
+        self.close()
+
+
+# ---------------------------------------------------------------- spectrum
+SPECTRUM_BANDS = 44
+SPECTRUM_MIN_F = 40.0
+SPECTRUM_MAX_F = 14000.0
+_TABLES = {}
+
+
+def _band_tables(rate, n):
+    key = (rate, n)
+    if key not in _TABLES:
+        tables = []
+        for i in range(SPECTRUM_BANDS):
+            f = SPECTRUM_MIN_F * (SPECTRUM_MAX_F / SPECTRUM_MIN_F) ** (i / (SPECTRUM_BANDS - 1))
+            w = 2 * math.pi * f / rate
+            tables.append([(math.cos(w * k), -math.sin(w * k)) for k in range(n)])
+        _TABLES[key] = tables
+    return _TABLES[key]
+
+
+def _decode_mono(raw, fmt, n):
+    """Last n samples of the first channel, scaled to -1..1."""
+    sf = fmt.sampleFormat()
+    ch = max(1, fmt.channelCount())
+    try:
+        if sf == QAudioFormat.SampleFormat.Int16:
+            need = n * ch * 2
+            raw = raw[-need:]
+            count = len(raw) // (2 * ch)
+            vals = [int.from_bytes(raw[(i * ch) * 2:(i * ch) * 2 + 2], "little", signed=True)
+                    / 32768.0 for i in range(count)]
+        elif sf == QAudioFormat.SampleFormat.Int32:
+            need = n * ch * 4
+            raw = raw[-need:]
+            count = len(raw) // (4 * ch)
+            vals = [int.from_bytes(raw[(i * ch) * 4:(i * ch) * 4 + 4], "little", signed=True)
+                    / 2147483648.0 for i in range(count)]
+        elif sf == QAudioFormat.SampleFormat.Float:
+            import struct
+            need = n * ch * 4
+            raw = raw[-need:]
+            count = len(raw) // (4 * ch)
+            vals = [struct.unpack_from("<f", raw, (i * ch) * 4)[0] for i in range(count)]
+        elif sf == QAudioFormat.SampleFormat.UInt8:
+            need = n * ch
+            raw = raw[-need:]
+            count = len(raw) // ch
+            vals = [(raw[i * ch] - 128) / 128.0 for i in range(count)]
+        else:
+            return []
+    except Exception:
+        return []
+    return vals
+
+
+def spectral_levels(samples, rate, bands=SPECTRUM_BANDS):
+    """32 log-spaced band levels (0..1) for a window of mono samples."""
+    if not samples or not rate or len(samples) < 64:
+        return []
+    samples = samples[-512:]
+    tables = _band_tables(rate, len(samples))
+    levels = []
+    count = len(samples)
+    for table in tables[:bands]:
+        re = im = 0.0
+        for s, (c, sn) in zip(samples, table):
+            re += s * c
+            im += s * sn
+        mag = math.hypot(re, im) / count
+        db = 20 * math.log10(mag + 1e-7)
+        levels.append(max(0.0, min(1.0, (db + 66.0) / 66.0)))
+    return levels
+
+
+class DecodedSpectrum(QObject):
+    """Spectrum for Qt builds without QAudioBufferOutput (i.e. older than 6.8).
+
+    QAudioDecoder decodes the file in the background; we keep one spectral frame
+    per 80 ms in a time-indexed map, then show the frame under the play position.
+    Results are cached in ~/.cache/nebula/spectrum so a replay is instant.
+    """
+
+    STEP_MS = 80
+    MAX_SLOTS = 67500        # 90 minutes of frames
+
+    def __init__(self, player, spectrum, parent=None):
+        super().__init__(parent if parent is not None else spectrum)
+        self.player = player
+        self.spectrum = spectrum
+        self.levels = {}
+        self.path = ""
+        self.enabled = bool(_HAS_AUDIO_DECODER)
+        self.error = ""
+        self._slot = 0
+        self._finished = False
+        self._decoder = None
+        self.cache_dir = os.path.join(TMP_DIR, "spectrum")
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except OSError:
+            self.cache_dir = ""
+        if not self.enabled:
+            return
+        try:
+            self._decoder = QAudioDecoder(self)
+            self._decoder.bufferReady.connect(self._on_buffer)
+            self._decoder.finished.connect(self._on_finished)
+            try:
+                self._decoder.error.connect(self._on_error)
+            except Exception:
+                pass
+        except Exception as exc:
+            self._decoder = None
+            self.enabled = False
+            self.error = str(exc)
+
+    # ---------- cache ----------
+    def _cache_path(self, path):
+        if not self.cache_dir:
+            return ""
+        try:
+            stamp = "%s|%s|%s" % (path, os.path.getmtime(path), os.path.getsize(path))
+        except OSError:
+            stamp = path
+        digest = hashlib.sha1(stamp.encode("utf-8", "replace")).hexdigest()
+        return os.path.join(self.cache_dir, digest + ".json")
+
+    def load(self, path):
+        self.levels = {}
+        self._slot = 0
+        self._finished = False
+        self.error = ""
+        self.path = path or ""
+        if not self.enabled or not path or not os.path.isfile(path):
+            return
+        cache = self._cache_path(path)
+        if cache and os.path.isfile(cache):
+            try:
+                with io.open(cache, encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("version") == 1 and data.get("levels"):
+                    self.levels = {int(k): v for k, v in data["levels"].items()}
+                    self._finished = True
+                    return
+            except (OSError, ValueError, TypeError):
+                self.levels = {}
+        try:
+            self._decoder.stop()
+            self._decoder.setSource(QUrl.fromLocalFile(path))
+            self._decoder.start()
+        except Exception as exc:
+            self.error = str(exc)
+
+    # ---------- decoding ----------
+    def _on_buffer(self):
+        if self._decoder is None or not self.path:
+            return
+        try:
+            buf = self._decoder.read()
+            if not buf.isValid():
+                return
+            start = int(buf.startTime()) // 1000
+            slot = start // self.STEP_MS
+            if slot < self._slot or slot >= self.MAX_SLOTS:
+                return
+            self._slot = slot + 1
+            fmt = buf.format()
+            raw = bytes(buf.data())
+            rate = fmt.sampleRate()
+        except Exception:
+            return
+        if not raw or not rate:
+            return
+        window = 320
+        samples = _decode_mono(raw, fmt, window)
+        levels = spectral_levels(samples, rate)
+        if levels:
+            self.levels[slot] = levels
+
+    def _on_error(self, *_args):
+        try:
+            self.error = self._decoder.errorString() or "decoder error"
+        except Exception:
+            self.error = "decoder error"
+
+    def _on_finished(self):
+        self._finished = True
+        cache = self._cache_path(self.path) if self.path else ""
+        if not cache or not self.levels:
+            return
+        try:
+            tmp = cache + ".tmp"
+            with io.open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "step_ms": self.STEP_MS,
+                           "levels": {str(k): v for k, v in self.levels.items()}}, f)
+            os.replace(tmp, cache)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def levels_at(self, ms):
+        if not self.levels:
+            return None
+        slot = max(0, int(ms)) // self.STEP_MS
+        for probe in (slot, slot - 1, slot - 2):
+            if probe in self.levels:
+                return self.levels[probe]
+        return None
+
+
+class AudioTap(QObject):
+    """Feed the spectrum from real audio.
+
+    Preferred: QMediaPlayer's decoded buffers (Qt 6.8+). Otherwise QAudioDecoder
+    decodes the same file separately and we sync frames to the play position.
+    Only if neither exists does the widget show a labelled placeholder.
+    """
+
+    def __init__(self, player, spectrum):
+        super().__init__(spectrum)
+        self.spectrum = spectrum
+        self.enabled = False
+        self.mode = ""
+        self.decoder = None
+        self._out = None
+        if _HAS_AUDIO_TAP:
+            try:
+                self._out = QAudioBufferOutput()
+                self._out.audioBufferReceived.connect(self._on_buffer)
+                player.setAudioBufferOutput(self._out)
+                self.enabled = True
+                self.mode = "buffer"
+            except Exception:
+                self._out = None
+        if not self.enabled and _HAS_AUDIO_DECODER:
+            self.decoder = DecodedSpectrum(player, spectrum, self)
+            if self.decoder.enabled:
+                self.enabled = True
+                self.mode = "decoder"
+
+    def _on_buffer(self, buf):
+        if not self.spectrum.playing:
+            return
+        try:
+            fmt = buf.format()
+            rate = fmt.sampleRate()
+            raw = bytes(buf.data())
+        except Exception:
+            return
+        if not raw or not rate:
+            return
+        levels = spectral_levels(_decode_mono(raw, fmt, 512), rate)
+        if levels:
+            self.spectrum.push_levels(levels)
+
+    def load(self, path):
+        if self.decoder is not None:
+            self.decoder.load(path)
+
+    def on_position(self, ms):
+        if self.decoder is not None and self.spectrum.playing:
+            levels = self.decoder.levels_at(ms)
+            if levels:
+                self.spectrum.push_levels(levels)
+
+
+class SpectrumWidget(QWidget):
+    """Symmetric bar spectrum. Live when Qt exposes an audio tap."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.bands = [0.0] * SPECTRUM_BANDS
+        self.playing = False
+        self.live = False
+        self.mode = ""
+        self.note = ""
+        self._last_push = 0.0
+        self._phase = [random.random() for _ in range(SPECTRUM_BANDS)]
+        self.setMinimumWidth(140)
+        self.setMinimumHeight(34)
+        self.setMaximumHeight(56)
+        self._timer = QTimer(self, interval=33, timeout=self._tick)
+        self._set_tooltip()
+
+    def _set_tooltip(self):
+        if self.live and self.mode == "decoder":
+            self.setToolTip("Spectrum decoded from the playing file with QAudioDecoder"
+                            + ((" — " + self.note) if self.note else ""))
+        elif self.live:
+            self.setToolTip("Live spectrum of the playing audio")
+        elif self.note:
+            self.setToolTip("Spectrum: " + self.note)
+        else:
+            self.setToolTip("Animated spectrum placeholder — no audio decoder is available "
+                            "in this Qt build; bars are not derived from the audio")
+
+    def set_live(self, live, mode=""):
+        self.live = bool(live)
+        self.mode = mode or self.mode
+        self._set_tooltip()
+
+    def set_playing(self, playing):
+        self.playing = playing
+        if playing:
+            self._last_push = time.monotonic()
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            self.reset()
+
+    def reset(self):
+        """Silence the analyser: Stop clears the bars instead of freezing them."""
+        self._timer.stop()
+        self.playing = False
+        self._last_push = 0.0
+        self.bands = [0.0] * len(self.bands)
+        self.update()
+
+    def push_levels(self, levels):
+        self._last_push = time.monotonic()
+        for i, v in enumerate(levels[:len(self.bands)]):
+            self.bands[i] = max(v, self.bands[i] * 0.55)
+
+    def _tick(self):
+        # if the tap is enabled but no buffers arrive (unsupported stream), keep the
+        # placeholder moving instead of showing a dead line
+        starved = self.live and (time.monotonic() - self._last_push) > 1.5
+        if self.playing and (not self.live or starved):
+            # placeholder animation: smooth wandering bars, clearly not audio data
+            for i in range(SPECTRUM_BANDS):
+                self._phase[i] += random.uniform(-0.18, 0.18)
+                drift = 0.5 + 0.5 * math.sin(self._phase[i])
+                falloff = 0.35 + 0.65 * (1.0 - i / SPECTRUM_BANDS)
+                self.bands[i] = 0.08 + 0.55 * drift * falloff
+        else:
+            self.bands = [b * 0.72 for b in self.bands]
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(self.rect(), QColor(PANEL))
+        n = len(self.bands)
+        gap = 1.5
+        bw = max(1.5, (w - gap * (n - 1)) / n)
+        grad = QLinearGradient(0, h, 0, 0)
+        grad.setColorAt(0.0, QColor(ACCENT_DIM))
+        grad.setColorAt(0.55, QColor(ACCENT))
+        grad.setColorAt(1.0, QColor("#7cc4e8"))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(grad))
+        mid = h / 2.0
+        for i, level in enumerate(self.bands):
+            bh = max(2.0, level * (h - 6))
+            x = i * (bw + gap)
+            p.drawRect(QRectF(x, mid - bh / 2, bw, bh))
+        p.setPen(QPen(QColor("#3a3a3a"), 1))
+        p.drawLine(0, int(mid), w, int(mid))
+        p.end()
+
+
+class SeekSlider(QSlider):
+    """Horizontal time bar: click the groove to jump, drag from anywhere to seek."""
+
+    clicked = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self.click_to_seek = True
+        self._dragging = False
+
+    def _value_at(self, x):
+        """The value under a click at x, measured from the handle's centre."""
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        handle = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+        span = max(1, self.width() - handle.width())
+        pos = max(0, min(span, int(x) - handle.width() // 2))
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), pos, span, opt.upsideDown)
+
+    def mousePressEvent(self, event):
+        if (self.click_to_seek and event.button() == Qt.LeftButton
+                and self.maximum() > self.minimum()):
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle = self.style().subControlRect(
+                QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+            if not handle.contains(event.position().toPoint()):
+                value = self._value_at(event.position().x())
+                self.setSliderDown(True)
+                self.setValue(value)
+                self.clicked.emit(value)
+                self._dragging = True
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and event.buttons() & Qt.LeftButton:
+            value = self._value_at(event.position().x())
+            self.setValue(value)
+            self.clicked.emit(value)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging:
+            self._dragging = False
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+# ---------------------------------------------------------------- player
+class PlayerBar(QWidget):
+    """Strawberry-style bottom bar: cover, transport, format pills, spectrum, seek, volume."""
+
+    track_changed = Signal(str)
+    queue_changed = Signal()
+    index_changed = Signal(int)
+    error = Signal(str)
+    buffer_status = Signal(str)     # what the buffers are reading, for the status bar
+
+    def __init__(self, config, on_play=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PlayerBar")
+        self.config = config
+        self.on_play = on_play
+        self.on_skip = None
+        self.queue, self.index = [], -1
+        self.shuffle = bool(config.get("shuffle", False))
+        self.repeat = config.get("repeat", "off")
+        self._shuffle_order = []      # queue indices in the order shuffle plays them
+        self._shuffle_pos = -1        # where the playing track sits in that order
+        self.stop_after = bool(config.get("stop_after", False))
+        self._covers = {}
+        self._current = ""
+        self._stopped = False
+        self._buffer_text = ""
+        self._buffer_timer = QTimer(self, interval=2000, timeout=self._report_buffers)
+        self._buffer_timer.start()
+
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+        self.audio.setVolume(config.get("volume", 70) / 100)
+
+        # cover (click -> enlarged view)
+        self.cover = QLabel()
+        self.cover.setFixedSize(64, 64)
+        self.cover.setCursor(Qt.PointingHandCursor)
+        self.cover.setToolTip("Click to enlarge the cover")
+        self.cover.setStyleSheet(f"border: 1px solid {COVER_BORDER}; background: {COVER_BG};")
+        self.cover.mousePressEvent = lambda _e: self.show_cover()
+
+        def std(sp):
+            return self.style().standardIcon(sp)
+
+        # Transport: an outlined circle with the glyph drawn inside, like a portable
+        # player. The rings are the buttons' borders (stylesheet), the glyphs are painted
+        # in the theme's text colour, so they read white on Black AMOLED and dark on Light.
+        self.prev_btn = QPushButton()
+        self.play_btn = QPushButton()
+        self.stop_btn = QPushButton()
+        self.next_btn = QPushButton()
+        self.shuffle_btn = QPushButton()
+        self.repeat_btn = QPushButton()
+        self._playing = False
+        for b, tip in ((self.prev_btn, "Previous track"), (self.play_btn, "Play"),
+                       (self.stop_btn, "Stop"), (self.next_btn, "Next track")):
+            b.setObjectName("PlayerButton")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tip)
+        for b in (self.prev_btn, self.stop_btn, self.next_btn):
+            b.setFixedSize(34, 34)
+            b.setIconSize(QSize(22, 22))
+        # the play button is the bigger circle, so its ring gets its own radius
+        self.play_btn.setObjectName("PlayerBig")
+        self.play_btn.setFixedSize(44, 44)
+        self.play_btn.setIconSize(QSize(26, 26))
+        # Shuffle and repeat sit outside the circles and say their state with colour:
+        # muted grey while off, the text colour while on, and repeat-one carries a 1.
+        self.shuffle_btn.setCheckable(True)
+        self.shuffle_btn.setChecked(self.shuffle)
+        for b in (self.shuffle_btn, self.repeat_btn):
+            b.setObjectName("PlayerToggle")
+            b.setFixedSize(30, 30)
+            b.setIconSize(QSize(20, 20))
+            b.setCursor(Qt.PointingHandCursor)
+        self.shuffle_btn.setToolTip("Shuffle")
+        self._update_repeat_ui()
+        self._refresh_transport_icons()
+
+        self.now_title = QLabel("Nothing playing")
+        self.now_title.setObjectName("NowTitle")
+        self.now_sub = QLabel("")
+        self.now_sub.setObjectName("NowSub")
+        self.pills = QWidget()
+        self.pills_layout = QHBoxLayout(self.pills)
+        self.pills_layout.setContentsMargins(0, 0, 0, 0)
+        self.pills_layout.setSpacing(4)
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        info.setContentsMargins(8, 0, 8, 0)
+        info.addWidget(self.now_title)
+        info.addWidget(self.now_sub)
+        info.addWidget(self.pills)
+
+        self.spectrum = SpectrumWidget()
+        self.tap = AudioTap(self.player, self.spectrum)
+        self.spectrum.set_live(self.tap.enabled, self.tap.mode)
+        if self.tap.decoder is not None and self.tap.decoder.error:
+            self.spectrum.note = "decoder unavailable: " + self.tap.decoder.error
+            self.spectrum._set_tooltip()
+
+        # ReplayGain
+        self.rg_mode = config.get("rg_mode", "off")
+        self.rg_preamp = float(config.get("rg_preamp") or 0.0)
+        self.rg_prevent_clip = bool(config.get("rg_prevent_clip", True))
+        self._rg_values = {k: None for k in RG_FIELDS}
+        self._rg_worker = None
+        self.rg_btn = QToolButton()
+        self.rg_btn.setText("RG")
+        self.rg_btn.setObjectName("RgButton")
+        self.rg_btn.setCheckable(True)
+        self.rg_btn.setChecked(self.rg_mode != "off")
+        self.rg_btn.setToolTip("ReplayGain: off")
+        self.rg_btn.setPopupMode(QToolButton.InstantPopup)
+        self.rg_btn.setMenu(self._build_rg_menu())
+        self.stop_after_btn = QPushButton("stop after track")
+        self.stop_after_btn.setObjectName("StopAfter")
+        self.stop_after_btn.setCheckable(True)
+        self.stop_after_btn.setChecked(self.stop_after)
+        self.stop_after_btn.setToolTip("Stop playback when the current track ends")
+        self.stop_after_btn.toggled.connect(self._set_stop_after)
+
+        self.seek = SeekSlider(self)
+        self.seek.click_to_seek = bool(config.get("seek_click", True))
+        self.seek.setToolTip("Click to jump; drag the handle to seek")
+        self.pos_label = QLabel("0:00 / 0:00")
+        self.pos_label.setObjectName("Muted")
+        self.vol = QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(int(config.get("volume", 70)))
+        self.vol.setFixedWidth(96)
+        self.vol_icon = QToolButton()
+        self.vol_icon.setIcon(std(QStyle.SP_MediaVolume))
+        self.vol_icon.setIconSize(QSize(16, 16))
+        self.vol_icon.setAutoRaise(True)
+        self.vol_icon.setToolTip("Volume")
+
+        # The order a portable player uses: the two modes sit outside the transport,
+        # shuffle on the left of previous and repeat on the right of next.
+        transport = QHBoxLayout()
+        transport.setSpacing(4)
+        for b in (self.shuffle_btn, self.prev_btn, self.play_btn, self.stop_btn,
+                  self.next_btn, self.repeat_btn):
+            transport.addWidget(b, 0, Qt.AlignVCenter)
+
+        seek_row = QHBoxLayout()
+        seek_row.setSpacing(6)
+        seek_row.addWidget(self.seek, 1)
+        seek_row.addWidget(self.pos_label)
+        center = QVBoxLayout()
+        center.setSpacing(2)
+        center.addLayout(transport)
+        center.addLayout(seek_row)
+
+        right = QVBoxLayout()
+        right.setSpacing(2)
+        right.addWidget(self.stop_after_btn, 0, Qt.AlignRight)
+        vol_row = QHBoxLayout()
+        vol_row.setSpacing(4)
+        vol_row.addWidget(self.rg_btn)
+        vol_row.addWidget(self.vol_icon)
+        vol_row.addWidget(self.vol)
+        right.addLayout(vol_row)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 8, 12, 8)
+        lay.setSpacing(10)
+        lay.addWidget(self.cover)
+        lay.addLayout(info, 0)
+        lay.addLayout(center, 3)
+        lay.addWidget(self.spectrum, 2)
+        lay.addLayout(right, 0)
+
+        self.play_btn.clicked.connect(self.toggle)
+        self.stop_btn.clicked.connect(self.stop)
+        self.next_btn.clicked.connect(lambda: self.next())
+        self.prev_btn.clicked.connect(self.prev)
+        self.shuffle_btn.toggled.connect(self._set_shuffle)
+        self.repeat_btn.clicked.connect(self._cycle_repeat)
+        self.vol.valueChanged.connect(self._set_volume)
+        self.seek.sliderMoved.connect(self.player.setPosition)
+        self.seek.clicked.connect(self.player.setPosition)
+        self.player.durationChanged.connect(lambda d: self.seek.setRange(0, d))
+        self.player.positionChanged.connect(self._on_pos)
+        self.player.positionChanged.connect(self.tap.on_position)
+        self.player.playbackStateChanged.connect(self._on_state)
+        self.player.mediaStatusChanged.connect(self._on_status)
+        try:
+            self.player.errorOccurred.connect(
+                lambda *_: self.error.emit(self.player.errorString() or "Playback failed"))
+        except Exception:
+            pass
+        self._paint_cover(None)
+        self._apply_volume()
+        self._buffer_disc_entries = []   # a disc kept ready before anything is queued
+        self.queue_changed.connect(self.refresh_buffers)
+        self.queue_changed.connect(self._invalidate_shuffle)
+        self.index_changed.connect(lambda _index: self.refresh_buffers())
+
+    # ---------- ReplayGain ----------
+    def _build_rg_menu(self):
+        menu = QMenu(self)
+        group = QActionGroup(self)
+        for value, label in (("off", "ReplayGain off"), ("track", "Track gain"),
+                             ("album", "Album gain")):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self.rg_mode == value)
+            action.setData(value)
+            group.addAction(action)
+        group.triggered.connect(lambda a: self.set_rg_mode(a.data()))
+        menu.addSeparator()
+        clip = menu.addAction("Prevent clipping")
+        clip.setCheckable(True)
+        clip.setChecked(self.rg_prevent_clip)
+        clip.toggled.connect(self._set_rg_clip)
+        menu.addAction("Pre-amp…", self._edit_preamp)
+        menu.addAction("Analyse current track", self.analyse_current)
+        return menu
+
+    def set_rg_mode(self, mode):
+        self.rg_mode = mode if mode in ("off", "track", "album") else "off"
+        self.config["rg_mode"] = self.rg_mode
+        self.rg_btn.setChecked(self.rg_mode != "off")
+        save_config(self.config)
+        self._apply_volume()
+
+    def _set_rg_clip(self, on):
+        self.rg_prevent_clip = bool(on)
+        self.config["rg_prevent_clip"] = self.rg_prevent_clip
+        save_config(self.config)
+        self._apply_volume()
+
+    def _edit_preamp(self):
+        value, ok = QInputDialog.getDouble(self, "ReplayGain pre-amp",
+                                           "Pre-amp (dB):", self.rg_preamp,
+                                           -12.0, 12.0, 1)
+        if not ok:
+            return
+        self.rg_preamp = float(value)
+        self.config["rg_preamp"] = self.rg_preamp
+        save_config(self.config)
+        self._apply_volume()
+
+    def _rg_row(self):
+        return {"rg_track_gain": self._rg_values.get("track_gain"),
+                "rg_track_peak": self._rg_values.get("track_peak"),
+                "rg_album_gain": self._rg_values.get("album_gain"),
+                "rg_album_peak": self._rg_values.get("album_peak")}
+
+    def _apply_volume(self):
+        row = self._rg_row()
+        factor = replaygain_factor(replaygain_db(row, self.rg_mode), self.rg_preamp,
+                                   replaygain_peak(row, self.rg_mode),
+                                   self.rg_prevent_clip)
+        level = max(0.0, min(1.0, (self.vol.value() / 100.0) * factor))
+        self.audio.setVolume(level)
+        db = replaygain_db(row, self.rg_mode)
+        if self.rg_mode == "off" or db is None:
+            self.rg_btn.setToolTip("ReplayGain: off" if self.rg_mode == "off"
+                                   else "ReplayGain: no %s gain tag" % self.rg_mode)
+        else:
+            self.rg_btn.setToolTip("ReplayGain: %s %+.1f dB" % (self.rg_mode, db))
+        self.rg_btn.setText("RG" if self.rg_mode == "off" else "RG %+.1f" % (db or 0.0))
+
+    def analyse_current(self):
+        path = self.current_path()
+        if not path:
+            self.window().notify("Nothing to analyse")
+            return
+        if self._rg_worker is not None and self._rg_worker.isRunning():
+            self.window().notify("ReplayGain analysis is already running")
+            return
+
+        def job(_progress, _log, cancel):
+            results = analyze_replaygain([path], cancel=cancel)
+            item = results[0] if results else None
+            ok = bool(item and write_replaygain(path, item["gain"], item["peak"]))
+            return {"path": path, "item": item, "written": ok}
+
+        worker = Worker(job, self)
+        self._rg_worker = worker
+        worker.done.connect(self._rg_current_done)
+        worker.failed.connect(self._rg_current_failed)
+        worker.finished.connect(lambda w=worker: self._rg_current_finished(w))
+        self.window().statusBar().showMessage("Measuring loudness with ffmpeg…", 6000)
+        worker.start()
+
+    def _rg_current_done(self, result):
+        result = result or {}
+        if not result.get("written") or not result.get("item"):
+            QMessageBox.information(
+                self, "ReplayGain",
+                "ffmpeg was not found (or could not decode this file).\n\n"
+                "Install ffmpeg to measure loudness; tracks that already carry "
+                "REPLAYGAIN_* tags work without it.")
+            return
+        path = result["path"]
+        item = result["item"]
+        if path == self.current_path():
+            self._rg_values = read_replaygain(path)
+            self._apply_volume()
+        self.window().notify("ReplayGain: %+.1f dB written to the file" % item["gain"])
+
+    def _rg_current_failed(self, error):
+        self.window().notify("ReplayGain measurement failed")
+        QMessageBox.warning(self, "ReplayGain", error)
+
+    def _rg_current_finished(self, worker=None):
+        if worker is not None and worker is not self._rg_worker:
+            return
+        self._rg_worker = None
+
+    # ---------- queue API ----------
+    def current_path(self):
+        if self._stopped:
+            return ""
+        if 0 <= self.index < len(self.queue):
+            return self.queue[self.index]
+        return ""
+
+    def refresh_buffers(self):
+        """Keep what is coming up ready: the disc, the PC read-ahead and the device buffer."""
+        self.refresh_cd_buffer()
+        self.refresh_file_buffer()
+        self.refresh_device_buffer()
+
+    def set_buffer_disc(self, disc):
+        """Keep this disc's tracks ready before they are queued, or None for none.
+
+        Used by Preferences > Audio CD "start buffering as soon as a disc is identified":
+        the disc's own tracks are read ahead while the drive is idle, so pressing play on
+        it starts from the buffer instead of the drive.
+        """
+        entries = [] if disc is None else [cd_entry(disc, t.number) for t in disc.audio_tracks]
+        self._buffer_disc_entries = entries
+        self.refresh_cd_buffer()
+
+    def refresh_cd_buffer(self):
+        """Keep the CD tracks coming up on disk, so starting one doesn't wait for the drive.
+
+        The track playing now is read first, then the tracks ahead of it, in one pass of
+        the drive: playback follows that read as it arrives (see GrowingTrackReader), so a
+        disc plays from the buffer instead of reading the drive again for every track. The
+        drive is handed over whenever playback needs it itself - a seek into what has not
+        been read yet - and the read carries on from where it stopped afterwards.
+
+        The depth is tracks: 0 reads nothing, N keeps the track playing plus N ahead, and
+        -1 ("All queued CD tracks") keeps every CD entry queued after the current one.
+        """
+        try:
+            limit = int(self.config.get("cd_buffer", CD_BUFFER_DEFAULT))
+        except (TypeError, ValueError):
+            limit = CD_BUFFER_DEFAULT
+        CD_BUFFER.teeing = limit != 0     # with the buffer off, nothing is written either
+        current = self.current_path()
+        keep = []
+        if limit != 0:
+            if is_cd_entry(current):
+                keep.append(current)
+            ahead = [p for p in self.queue[max(self.index, 0):]
+                     if is_cd_entry(p) and p != current]
+            keep.extend(ahead if limit < 0 else ahead[:limit])
+            # A disc kept ready before it is queued (Preferences > Audio CD): the tracks the
+            # depth covers are read as soon as the disc is identified, so the first track
+            # played already comes from the buffer. What is queued still comes first.
+            for entry in (self._buffer_disc_entries if limit < 0
+                          else self._buffer_disc_entries[:limit]):
+                if entry not in keep:
+                    keep.append(entry)
+        CD_BUFFER.plan(keep, allow_fetch=bool(keep))
+
+    def refresh_file_buffer(self):
+        """Read the tracks queued after this one into memory, if the setting is on.
+
+        The track playing now is left to the player's own read; every track after it has its
+        first 30 seconds read before the budget is spent going deeper (see FileBuffer).
+        """
+        try:
+            mb = int(self.config.get("file_buffer_mb", FILE_BUFFER_DEFAULT))
+        except (TypeError, ValueError):
+            mb = FILE_BUFFER_DEFAULT
+        budget = max(mb, 0) * 1024 ** 2
+        paths = []
+        if budget:
+            entries = [p for p in self.queue[max(self.index, 0):]
+                       if not is_cd_entry(p) and not is_device_entry(p)]
+            if 0 <= self.index < len(self.queue) and entries \
+                    and entries[0] == self.queue[self.index]:
+                entries = entries[1:]       # the file playing now is being read already
+            paths = [p for p in entries if os.path.isfile(p)]
+        FILE_BUFFER.plan(paths, budget)
+
+    def refresh_device_buffer(self):
+        """Copy the device tracks coming up into the local cache, current track first.
+
+        The queue holds the file on the device, so playback can read it directly while the
+        copy is being made; once the copy exists, the player uses it. The size is a budget
+        for whole files, not a promise that a particular track is ready when it starts.
+        """
+        try:
+            mb = int(self.config.get("device_buffer_mb", DEVICE_BUFFER_DEFAULT))
+        except (TypeError, ValueError):
+            mb = DEVICE_BUFFER_DEFAULT
+        budget = max(mb, 0) * 1024 ** 2
+        entries = []
+        if budget and self.queue:
+            entries = [p for p in self.queue[max(self.index, 0):] if is_device_entry(p)]
+        DEVICE_BUFFER.plan(entries, budget)
+
+    def _report_buffers(self):
+        """Say in the status bar what the buffers are reading, so the drive noise is explained."""
+        try:
+            text = (CD_BUFFER.status() or DEVICE_BUFFER.status()
+                    or FILE_BUFFER.status())
+        except Exception:
+            text = ""
+        if text != self._buffer_text:
+            self._buffer_text = text
+            self.buffer_status.emit(text)
+
+    def set_queue(self, paths, start=None, play=False):
+        self.queue = [p for p in paths]
+        if start is None or int(start) < 0 or not self.queue:
+            self.index = -1
+        else:
+            self.index = max(0, min(int(start), len(self.queue) - 1))
+        self._prune_device_entries()
+        self.queue_changed.emit()
+        if play and self.queue:
+            self.play_index(max(self.index, 0))
+        elif not self.queue:
+            self.player.stop()
+            self._stopped = True
+            self._clear_now_playing()
+
+    def add_paths(self, paths, play_if_idle=True):
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        self.queue.extend(paths)
+        self.queue_changed.emit()
+        if self.index < 0 and play_if_idle:
+            self.play_index(0)
+
+    def play_next(self, paths):
+        """Insert paths right after the current track."""
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        at = self.index + 1 if 0 <= self.index < len(self.queue) else len(self.queue)
+        for path in reversed(paths):
+            self.queue.insert(at, path)
+        self.queue_changed.emit()
+
+    def _note_skip(self):
+        """Count a track left before it finished (Strawberry's skip counter)."""
+        path = self.current_path()
+        if not path or is_cd_entry(path) or not callable(getattr(self, "on_skip", None)):
+            return
+        duration = self.player.duration()
+        position = self.player.position()
+        if duration > 0 and 0 < position < duration - 3000:
+            self.on_skip(path)
+
+    def remove_indices(self, indices):
+        keep = [p for i, p in enumerate(self.queue) if i not in set(indices)]
+        current = self.current_path()
+        self.queue = keep
+        if current in keep:
+            self.index = keep.index(current)
+        else:
+            self.index = min(self.index, len(keep) - 1) if keep else -1
+        self._prune_device_entries()
+        self.queue_changed.emit()
+        self.index_changed.emit(self.index)
+
+    def _prune_device_entries(self):
+        """Forget the device tracks that are no longer in the queue."""
+        for path in list(DEVICE_QUEUE):
+            if path not in self.queue:
+                DEVICE_QUEUE.pop(path, None)
+
+    def drop_device_entries(self, device_id=None):
+        """Drop queued tracks that came from a device that is gone, and their buffer.
+
+        device_id=None drops every device entry. Playback stops when the track playing now
+        lost its device. PC files and CD entries are left exactly as they were.
+        """
+        def stale(path):
+            info = device_entry_info(path)
+            return bool(info) and (device_id is None or info.get("device_id") == device_id)
+
+        kept, removed = [], []
+        new_index, kept_before, current_lost = -1, 0, False
+        for i, path in enumerate(self.queue):
+            if stale(path):
+                removed.append(path)
+                if i == self.index:
+                    current_lost = True
+                continue
+            if i == self.index:
+                new_index = len(kept)
+            if i < self.index:
+                kept_before += 1
+            kept.append(path)
+        if not removed:
+            DEVICE_BUFFER.forget(device_id)
+            return 0
+        self.queue = kept
+        DEVICE_BUFFER.forget(device_id)
+        unregister_device_entries(removed)
+        if current_lost:
+            self.index = min(kept_before, len(kept) - 1) if kept else -1
+            self.stop()
+            self._current = ""
+        elif new_index >= 0:
+            self.index = new_index
+        else:
+            self.index = min(self.index, len(kept) - 1) if kept else -1
+        self._prune_device_entries()
+        self.queue_changed.emit()
+        self.index_changed.emit(self.index)
+        self.refresh_buffers()
+        return len(removed)
+
+    def drop_cd_entries(self, device=None, disc_id=""):
+        """Drop queued CD tracks whose disc has left the drive, so they can't linger unplayable.
+
+        device=None means no drive holds a disc, so every cd:// entry goes. A disc that is
+        still in its drive (disc_id given) keeps its tracks. Playback stops when the track
+        that was playing lost its disc. Returns how many entries were removed.
+        """
+        def stale(path):
+            if not is_cd_entry(path):
+                return False
+            meta = cd_entry_meta(path)
+            if device is None:
+                return True
+            if os.path.realpath(meta.get("device", "")) != os.path.realpath(device):
+                return False
+            return not disc_id or meta.get("disc_id", "") != disc_id
+
+        kept, removed = [], []
+        new_index, kept_before, current_lost = -1, 0, False
+        for i, path in enumerate(self.queue):
+            if stale(path):
+                removed.append(path)
+                if i == self.index:
+                    current_lost = True
+                continue
+            if i == self.index:
+                new_index = len(kept)
+            if i < self.index:
+                kept_before += 1
+            kept.append(path)
+        if not removed:
+            return 0
+        self.queue = kept
+        for entry in set(removed):
+            CD_ENTRIES.pop(entry, None)
+        if current_lost:
+            self.index = min(kept_before, len(kept) - 1) if kept else -1
+            self.stop()
+            self._current = ""
+        elif new_index >= 0:
+            self.index = new_index
+        else:
+            self.index = min(self.index, len(kept) - 1) if kept else -1
+        self.queue_changed.emit()
+        self.index_changed.emit(self.index)
+        self.refresh_cd_buffer()
+        return len(removed)
+
+    def clear_queue(self):
+        self.queue = []
+        self.index = -1
+        self.player.stop()
+        self._stopped = True
+        self._clear_now_playing()
+        self._prune_device_entries()
+        self.queue_changed.emit()
+        self.index_changed.emit(-1)
+
+    def play_list(self, paths, start=0):
+        """Replace the queue and start playing (used by Devices tab)."""
+        self.set_queue(paths, start, play=True)
+
+    def play_index(self, i):
+        if not (0 <= i < len(self.queue)):
+            return
+        self._stopped = False
+        self.index = i
+        # A row picked by hand joins the shuffled order at that point, so next and
+        # previous carry on from the track that is actually playing.
+        if self._shuffle_active():
+            if len(self._shuffle_order) == len(self.queue) and i in self._shuffle_order:
+                self._shuffle_pos = self._shuffle_order.index(i)
+            else:
+                self._shuffle_playlist(first=i)
+        path = self.queue[i]
+        local = path
+        if is_cd_entry(path):
+            self.refresh_cd_buffer()      # the plan names this track before it is streamed
+            self.player.setSource(QUrl(cd_stream_url(path)))
+        else:
+            if is_device_entry(path):
+                # use the buffered copy once it is complete; until then read the device
+                local = DEVICE_BUFFER.cached(path) or path
+            self.player.setSource(QUrl.fromLocalFile(local))
+        self.player.play()
+        self._load_info(path, local)
+        if self.on_play and not is_cd_entry(path) and not is_device_entry(path):
+            try:
+                self.on_play(path)
+            except Exception:
+                pass
+        self.track_changed.emit(path)
+        self.index_changed.emit(i)
+
+    def _load_info(self, path, local=None):
+        self._stopped = False
+        self._current = path
+        if is_cd_entry(path):
+            self._load_cd_info(path)
+            return
+        if is_device_entry(path):
+            self._load_device_info(path, local or DEVICE_BUFFER.cached(path) or path)
+            return
+        tags = read_tags(path)
+        specs = read_specs(path)
+        title = tags["title"] or os.path.basename(path)
+        bits = []
+        if tags["artist"]:
+            bits.append(tags["artist"])
+        if tags["album"]:
+            bits.append(tags["album"])
+        self.now_title.setText(title)
+        self.now_sub.setText(" — ".join(bits) if bits else " ")
+        self._set_pills(spec_parts(specs))
+        self._paint_cover(path)
+        self._rg_values = read_replaygain(path)
+        self._apply_volume()
+        self.tap.load(path)
+
+    def _load_device_info(self, path, local):
+        """The now-playing bar for a track that lives on a device, without reading it."""
+        info = device_entry_info(path) or {}
+        row = info.get("meta") or {}
+        title = row.get("title") or os.path.basename(path)
+        bits = [x for x in (row.get("artist"), row.get("album")) if x]
+        self.now_title.setText(title)
+        self.now_sub.setText(" — ".join(bits) if bits else " ")
+        specs = {k: row.get(k) for k in ("sample_rate", "bits_per_sample", "bitrate",
+                                         "filetype")}
+        self._set_pills(spec_parts(specs))
+        self._paint_cover(row.get("cover_path") or "")
+        self._rg_values = {}
+        self._apply_volume()
+        self.tap.load(local)
+
+    def _load_cd_info(self, path):
+        """The now-playing bar for a track playing straight off the disc."""
+        meta = cd_entry_meta(path)
+        self.now_title.setText(meta["title"])
+        sub = " \u2014 ".join(x for x in (meta["artist"], meta["album"]) if x)
+        self.now_sub.setText(sub or " ")
+        # Say where the audio is coming from: a buffered track never touches the drive, and
+        # a track the buffer is still reading is served from what it has written so far.
+        cache = cd_entry_cache_file(path)
+        buffered = CD_BUFFER.ready(path) or (CD_BUFFER.buffering(path)
+                                             and _buffered_bytes(cache) > CD_WAV_HEADER)
+        source = "from buffer" if buffered else "from disc"
+        self._set_pills(["Audio CD", "44.1 kHz", "16 Bit", "1411 kbps", source])
+        self.cover.setPixmap(QPixmap())
+        self.cover.setText("\u266a")
+        self.cover.setAlignment(Qt.AlignCenter)
+        self.cover.setStyleSheet("border: 1px solid %s; background: %s; color: %s; font-size: 22pt;"
+                                 % (COVER_BORDER, COVER_BG, COVER_TEXT))
+        self._rg_values = {}
+        self._apply_volume()
+
+    def _set_pills(self, parts):
+        while self.pills_layout.count():
+            item = self.pills_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for part in [p for p in parts if p]:
+            label = QLabel(part)
+            label.setObjectName("Pill")
+            self.pills_layout.addWidget(label)
+        self.pills_layout.addStretch()
+
+    def _cover_bytes(self, path):
+        folder = os.path.dirname(path or "")
+        if folder not in self._covers:
+            data = read_cover(path) if path else None
+            pm = QPixmap()
+            if not data or not pm.loadFromData(data):
+                pm = None
+            self._covers[folder] = pm
+            if len(self._covers) > 120:
+                self._covers.pop(next(iter(self._covers)))
+        return self._covers[folder]
+
+    def _paint_cover(self, path):
+        pm = self._cover_bytes(path)
+        if pm is None or pm.isNull():
+            self.cover.setPixmap(QPixmap())
+            self.cover.setText("♪")
+            self.cover.setAlignment(Qt.AlignCenter)
+            self.cover.setStyleSheet(f"border: 1px solid {COVER_BORDER}; background: {COVER_BG};"
+                                     f"color: {COVER_TEXT}; font-size: 22pt;")
+        else:
+            self.cover.setText("")
+            self.cover.setPixmap(pm.scaled(64, 64, Qt.KeepAspectRatioByExpanding,
+                                           Qt.SmoothTransformation)
+                                 .copy(0, 0, 64, 64))
+            self.cover.setStyleSheet(f"border: 1px solid {COVER_BORDER}; background: {COVER_BG};")
+
+    def refresh_theme(self):
+        """Repaint the bits styled by hand, after the theme changed."""
+        self._refresh_transport_icons()
+        self._paint_cover(self.current_path())
+
+    def show_cover(self):
+        path = self.current_path()
+        if not path or is_cd_entry(path):
+            return
+        if is_device_entry(path):
+            row = device_entry_row(path) or {}
+            cover = row.get("cover_path") or ""
+            pm = self._cover_bytes(cover) if cover else None
+            viewer = CoverViewer(pm, row.get("title") or os.path.basename(path),
+                                 " — ".join(x for x in (row.get("artist"), row.get("album"))
+                                            if x) or " ",
+                                 self)
+            viewer.exec()
+            return
+        tags = read_tags(path)
+        pm = self._cover_bytes(path)
+        viewer = CoverViewer(pm, tags["title"] or os.path.basename(path),
+                             " — ".join(x for x in (tags["artist"], tags["album"]) if x) or " ",
+                             self.window())
+        viewer.exec()
+
+    # ---------- transport ----------
+    def toggle(self):
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+        elif not self.queue:
+            return
+        elif self.player.source().isEmpty() or not self.current_path():
+            self.play_index(max(self.index, 0))
+        else:
+            self.player.play()
+
+    def set_click_to_seek(self, on):
+        self.seek.click_to_seek = bool(on)
+
+    def stop(self):
+        self._stopped = True
+        self.player.stop()
+        self.spectrum.reset()
+        self._clear_now_playing()
+        # The queue stays, and Play starts the stopped track again; only its
+        # current-row highlight has to go.
+        self.index_changed.emit(self.index)
+
+    def _clear_now_playing(self):
+        """Put the bar back to its pre-playback state, keeping the queue and index."""
+        self._current = ""
+        self.now_title.setText("Nothing playing")
+        self.now_sub.setText("")
+        self._set_pills([])
+        self._paint_cover(None)
+        self._rg_values = {}
+        self._apply_volume()
+        self.seek.setRange(0, 0)
+        self.seek.setValue(0)
+        self.pos_label.setText("0:00 / 0:00")
+
+    def next(self, auto=False):
+        if not self.queue:
+            return
+        if not auto:
+            self._note_skip()
+        if auto and self.repeat == "one":
+            self.player.setPosition(0)
+            self.player.play()
+            return
+        if self._shuffle_active():
+            self._next_shuffled()
+            return
+        i = self.index + 1
+        if i >= len(self.queue):
+            if self.repeat == "all":
+                i = 0
+            elif auto and self.stop_after:
+                self.stop()
+                self.stop_after_btn.setChecked(False)
+                return
+            else:
+                self.stop()
+                self.seek.setValue(0)
+                return
+        self.play_index(i)
+
+    def prev(self):
+        if self.player.position() > 3000:
+            self.player.setPosition(0)
+            return
+        # Back through the order that was drawn, not the queue's own order, so previous
+        # undoes next while shuffle is on.
+        if self._shuffle_active() and self._shuffle_pos > 0:
+            self._shuffle_pos -= 1
+            self.play_index(self._shuffle_order[self._shuffle_pos])
+            return
+        if self.index > 0:
+            self._note_skip()
+            self.play_index(self.index - 1)
+        elif self.queue:
+            self.play_index(0)
+
+    def _set_volume(self, v):
+        self.config["volume"] = int(v)
+        self._apply_volume()
+
+    def _set_shuffle(self, on):
+        self.shuffle = bool(on)
+        self.config["shuffle"] = self.shuffle
+        self._invalidate_shuffle()
+        self._sync_mode_buttons()
+
+    def _set_stop_after(self, on):
+        self.stop_after = bool(on)
+        self.config["stop_after"] = self.stop_after
+
+    def _cycle_repeat(self):
+        order = ["off", "all", "one"]
+        self.repeat = order[(order.index(self.repeat) + 1) % len(order)] if self.repeat in order else "off"
+        self.config["repeat"] = self.repeat
+        self._invalidate_shuffle()
+        self._update_repeat_ui()
+
+    # ---------- shuffle order ----------
+    def _shuffle_active(self):
+        """Shuffling playback, which repeat one switches off while it plays one track."""
+        return bool(self.shuffle) and self.repeat != "one"
+
+    def _invalidate_shuffle(self):
+        """The queue changed, or the mode did: the order drawn for it no longer fits."""
+        self._shuffle_order = []
+        self._shuffle_pos = -1
+
+    def _shuffle_playlist(self, first=None):
+        """Draw a fresh random order for the queue, optionally opening with one track."""
+        order = [i for i in range(len(self.queue)) if i != first]
+        random.shuffle(order)
+        if first is not None and 0 <= first < len(self.queue):
+            order.insert(0, first)
+            self._shuffle_pos = 0
+        else:
+            self._shuffle_pos = -1
+        self._shuffle_order = order
+
+    def _next_shuffled(self):
+        """Play the next track of the shuffled order; a repeat-all pass is redrawn."""
+        if len(self._shuffle_order) != len(self.queue) or not self._shuffle_order:
+            # nothing drawn yet, or the queue changed under it: keep the track playing
+            # where it is and shuffle everything after it
+            self._shuffle_playlist(first=self.index if self.index >= 0 else None)
+        pos = self._shuffle_pos + 1
+        if pos >= len(self._shuffle_order):
+            if self.repeat != "all":
+                # the shuffled queue is finished, and nothing asked for another pass
+                self.stop()
+                self.seek.setValue(0)
+                return
+            # Repeat all: the queue starts again in a new order, so it does not open
+            # with the track that has just finished
+            self._shuffle_playlist()
+            pos = 0
+        self._shuffle_pos = pos
+        self.play_index(self._shuffle_order[pos])
+
+    def _refresh_transport_icons(self):
+        """Redraw every transport and mode glyph in the palette that is active now."""
+        self.prev_btn.setIcon(transport_icon("prev", 22))
+        self.stop_btn.setIcon(transport_icon("stop", 22))
+        self.next_btn.setIcon(transport_icon("next", 22))
+        self.play_btn.setIcon(transport_icon("pause" if self._playing else "play", 26))
+        self._sync_mode_buttons()
+
+    def _update_repeat_ui(self):
+        self.repeat_btn.setCheckable(True)
+        self.repeat_btn.setText("")
+        self._sync_mode_buttons()
+
+    def _sync_mode_buttons(self):
+        """Show what the two toggles are set to: grey while off, text colour while on.
+
+        Repeat one plays the same track, so shuffle has nothing to reorder: the shuffle
+        button goes off and stays insensitive while it is on. The setting itself is not
+        thrown away — it comes back as soon as repeat leaves repeat one.
+        """
+        one = self.repeat == "one"
+        for b in (self.shuffle_btn, self.repeat_btn):
+            b.blockSignals(True)
+        self.shuffle_btn.setChecked(self.shuffle and not one)
+        self.shuffle_btn.setEnabled(not one)
+        self.repeat_btn.setChecked(self.repeat != "off")
+        for b in (self.shuffle_btn, self.repeat_btn):
+            b.blockSignals(False)
+        self.shuffle_btn.setIcon(mode_icon("shuffle", 20))
+        self.repeat_btn.setIcon(mode_icon("repeat_one" if one else "repeat", 20))
+        self.shuffle_btn.setToolTip(
+            "Shuffle is off while Repeat one plays the same track" if one
+            else ("Shuffle: on" if self.shuffle else "Shuffle: off"))
+        self.repeat_btn.setToolTip({"off": "Repeat off", "all": "Repeat all",
+                                    "one": "Repeat one"}.get(self.repeat, "Repeat"))
+
+    def _on_pos(self, p):
+        if self._stopped:
+            return
+        if not self.seek.isSliderDown():
+            self.seek.setValue(p)
+        self.pos_label.setText(f"{fmt_time(p / 1000)} / {fmt_time(self.player.duration() / 1000)}")
+
+    def _on_state(self, s):
+        playing = s == QMediaPlayer.PlayingState
+        self._playing = playing
+        self.play_btn.setIcon(transport_icon("pause" if playing else "play", 26))
+        self.spectrum.set_playing(playing)
+
+    def _on_status(self, s):
+        if s == QMediaPlayer.EndOfMedia:
+            if self.stop_after:
+                self.stop()
+                self.stop_after_btn.setChecked(False)
+            else:
+                self.next(auto=True)
+# ======================================================================
+# ui/library_tab.py - icon strip, collection tree, playlists, queue
+# ======================================================================
+PATH_ROLE = Qt.UserRole
+KIND_ROLE = Qt.UserRole + 1
+SMART_ROLE = Qt.UserRole + 2
+DEV_FOLD_MODES = ("all", "letters", "none")
+# the three positions the fold menu offers, and the config value that remembers one
+FOLD_MODES = ("all", "letters", "none")
+
+QUEUE_COLS = ["Track", "Title", "Artist", "Album", "Length", "Sample Rate",
+              "Bit Depth", "Bitrate", "Source", "File Type"]
+QUEUE_WIDTHS = [44, 210, 130, 130, 58, 96, 72, 86, 96, 78]
+
+GROUPINGS = [
+    ("artist_album", "Artist / Album"),
+    ("albumartist_album", "Album artist / Album"),
+    ("album", "Album"),
+    ("genre", "Genre"),
+    ("year", "Year"),
+    ("folder", "Folder"),
+    ("albumartist_album_disc", "Album artist / Album / Disc"),
+    ("year_album", "Year / Album"),
+    ("genre_artist_album", "Genre / Artist / Album"),
+    ("composer", "Composer / Album"),
+    ("format", "File type / Album"),
+    ("samplerate", "Sample rate / Album"),
+    ("bitdepth", "Bit depth / Album"),
+    ("bitrate", "Bitrate / Album"),
+    ("none", "No grouping (flat list)"),
+]
+
+
+def _num(value):
+    try:
+        return int(str(value).split("/")[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+# 0.52 advanced shuffle: (key, menu label, what it does)
+SHUFFLE_MODES = (
+    ("off", "Play in order", "Tracks in disc and track order; albums follow the album order setting"),
+    ("shuffle", "Shuffle all tracks", "Every selected track in random order"),
+    ("albums", "Shuffle albums", "Albums in random order, each album's tracks in order"),
+    ("artists", "Shuffle artists", "Artists in random order, their albums in order"),
+    ("inside", "Shuffle inside albums", "Albums in order, tracks shuffled within each album"),
+    ("loved", "Loved first, then shuffle", "Loved tracks shuffled at the front, the rest after"),
+    ("spread", "Spread artists", "Shuffled, but never two tracks by one artist back to back"),
+    ("least_played", "Least played first", "Lowest play count first, ties shuffled"),
+    ("most_played", "Most played first", "Highest play count first, ties shuffled"),
+    ("top_rated", "Top rated first", "Highest star rating first, ties shuffled"),
+)
+SHUFFLE_LABELS = {key: label for key, label, _hint in SHUFFLE_MODES}
+ALBUM_PLAY_ORDERS = (
+    ("in_order", "In order", "Albums play one after another, tracks in disc and track order"),
+    ("shuffle_albums", "Shuffle album order", "Albums in random order, tracks stay in order"),
+)
+
+
+def _artist_of(row):
+    return (row.get("albumartist") or row.get("artist") or "").lower()
+
+
+def _album_of(row):
+    return (row.get("album") or "").lower()
+
+
+def _disc_track_key(row):
+    return (_num(row.get("discnumber")), _num(row.get("tracknumber")),
+            (row.get("title") or "").lower(), row.get("path") or "")
+
+
+def album_track_key(row):
+    """Library order: artist, then album, then disc and track."""
+    return (_artist_of(row), _album_of(row)) + _disc_track_key(row)
+
+
+def order_queue(rows, mode="off", album_order="in_order", rng=random):
+    """Return the rows reordered for queueing. Pure: no Qt, no I/O.
+
+    rows: dicts as stored in the library cache (missing keys are fine).
+    mode: one of SHUFFLE_MODES. Any mode other than "off" replaces the
+          album order rule. With "off", album_order decides whether whole
+          albums are shuffled while their tracks stay in disc/track order.
+    rng: a random.Random-like object so tests can pass a seeded generator.
+    """
+    rows = list(rows)
+
+    def by_track(group):
+        return sorted(group, key=_disc_track_key)
+
+    def group_rows(key):
+        groups = {}
+        for row in rows:
+            groups.setdefault(key(row), []).append(row)
+        return list(groups.values())
+
+    def shuffled_groups(groups):
+        rng.shuffle(groups)
+        return [r for group in groups for r in group]
+
+    def album_groups():
+        return [by_track(g) for g in group_rows(lambda r: (_artist_of(r), _album_of(r)))]
+
+    if mode == "shuffle":
+        out = list(rows)
+        rng.shuffle(out)
+        return out
+    if mode == "albums":
+        return shuffled_groups(album_groups())
+    if mode == "artists":
+        return shuffled_groups([sorted(g, key=lambda r: (_album_of(r),) + _disc_track_key(r))
+                                for g in group_rows(_artist_of)])
+    if mode == "inside":
+        out = []
+        for group in sorted(group_rows(lambda r: (_artist_of(r), _album_of(r))),
+                            key=lambda g: album_track_key(g[0])):
+            rng.shuffle(group)
+            out.extend(group)
+        return out
+    if mode == "loved":
+        loved = [r for r in rows if r.get("loved")]
+        rest = [r for r in rows if not r.get("loved")]
+        rng.shuffle(loved)
+        rng.shuffle(rest)
+        return loved + rest
+    if mode == "spread":
+        pool = list(rows)
+        rng.shuffle(pool)
+        out = []
+        while pool:
+            previous = _artist_of(out[-1]) if out else None
+            index = next((i for i, r in enumerate(pool) if _artist_of(r) != previous), 0)
+            out.append(pool.pop(index))
+        return out
+    if mode == "least_played":
+        return sorted(rows, key=lambda r: (int(r.get("play_count") or 0), rng.random()))
+    if mode == "most_played":
+        return sorted(rows, key=lambda r: (-int(r.get("play_count") or 0), rng.random()))
+    if mode == "top_rated":
+        return sorted(rows, key=lambda r: (-int(r.get("rating") or 0), rng.random()))
+    if album_order == "shuffle_albums":
+        return shuffled_groups(album_groups())
+    return rows
+
+
+class QueueTable(QTableWidget):
+    """Queue view: internal drag-reorder plus file drops from the file manager."""
+
+    row_moved = Signal(int, int)
+    files_dropped = Signal(list)
+
+    def __init__(self, rows, cols, parent=None):
+        super().__init__(rows, cols, parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+
+    def dropEvent(self, event):
+        if event.source() is self:
+            rows = sorted({i.row() for i in self.selectedIndexes()})
+            if rows:
+                pos = event.position().toPoint()
+                target = self.rowAt(pos.y())
+                if target < 0:
+                    target = self.rowCount() - 1
+                self.row_moved.emit(rows[0], target)
+            event.acceptProposedAction()
+            return
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+
+class DividerDelegate(QStyledItemDelegate):
+    """Paint the A-Z section headers flush to the left edge, with an expander."""
+
+    def paint(self, painter, option, index):
+        if index.data(KIND_ROLE) != "divider":
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        rect = option.rect
+        painter.fillRect(rect, QColor(PANEL))
+        painter.setPen(QColor(BORDER))
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+        painter.setPen(QColor(ACCENT))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSizeF(font.pointSizeF() + 0.5)
+        painter.setFont(font)
+        text = str(index.data() or "")
+        left = option.rect.left()
+        # leave room for the tree's expander arrow at the left edge
+        indent = option.widget.indentation() if hasattr(option.widget, "indentation") else 18
+        painter.drawText(rect.adjusted(6 + indent - left, 0, -14, 0),
+                         Qt.AlignVCenter | Qt.AlignLeft, text)
+        painter.restore()
+
+
+class BranchArrowStyle(QProxyStyle):
+    """Fusion proxy that paints the small indicators Fusion gets wrong here.
+
+    Qt's Fusion branch indicator is a tiny dark triangle on a dark background, and
+    its check box is a dark outline on a dark background that vanishes completely on
+    the Black AMOLED palette. Both are drawn here instead, from the active palette, so
+    the shapes stay crisp and visible in every theme.
+    """
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element == QStyle.PrimitiveElement.PE_IndicatorBranch:
+            state = option.state
+            if state & QStyle.StateFlag.State_Children:
+                self._arrow(painter, option,
+                            bool(state & QStyle.StateFlag.State_Open))
+                return
+        elif element in (QStyle.PrimitiveElement.PE_IndicatorCheckBox,
+                         QStyle.PrimitiveElement.PE_IndicatorRadioButton,
+                         QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck):
+            # the check boxes in the disc track list and the tag tree use the item-view
+            # primitive; they had the same invisible-box problem on Black AMOLED
+            self._check_indicator(painter, option,
+                                  radio=(element == QStyle.PrimitiveElement.PE_IndicatorRadioButton))
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+    @staticmethod
+    def _check_indicator(painter, option, radio=False):
+        """A check box or radio dot in the palette's colours.
+
+        Unchecked is a panel-coloured box with a visible outline, hovered and checked
+        take the accent, and the tick keeps the on-accent colour, so the state reads at
+        a glance on light, dark and AMOLED alike.
+        """
+        rect = option.rect
+        if rect.width() < 4 or rect.height() < 4:
+            return
+        state = option.state
+        on = bool(state & QStyle.StateFlag.State_On)
+        partial = bool(state & QStyle.StateFlag.State_NoChange)
+        enabled = bool(state & QStyle.StateFlag.State_Enabled)
+        hover = bool(state & QStyle.StateFlag.State_MouseOver)
+        if on or partial:
+            fill = ACCENT if enabled else ACCENT_DIM
+            border = fill
+            glyph = ON_ACCENT if enabled else MUTED
+        else:
+            fill = PANEL if enabled else BG
+            border = (ACCENT if hover else CHECK_BORDER) if enabled else BORDER
+            glyph = MUTED
+        side = float(min(rect.width(), rect.height())) - 1.0
+        box = QRectF(rect.center().x() - side / 2.0 + 0.5, rect.center().y() - side / 2.0 + 0.5,
+                     side, side)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(QColor(border), 1.0))
+        painter.setBrush(QBrush(QColor(fill)))
+        if radio:
+            painter.drawEllipse(box)
+        else:
+            painter.drawRoundedRect(box, 3.0, 3.0)
+        if on or partial:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(glyph)))
+            if radio:  # a radio reads as a centred dot, not a tick
+                dot = side * 0.26
+                painter.drawEllipse(QRectF(box.center().x() - dot, box.center().y() - dot,
+                                           dot * 2.0, dot * 2.0))
+            elif partial:  # a tristate's mixed state is a dash, not a tick
+                pen = QPen(QColor(glyph), max(1.6, side * 0.14))
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.drawLine(QPointF(box.left() + side * 0.25, box.center().y()),
+                                 QPointF(box.right() - side * 0.25, box.center().y()))
+            else:
+                pen = QPen(QColor(glyph), max(1.6, side * 0.14))
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPolyline(QPolygonF([
+                    QPointF(box.left() + side * 0.24, box.top() + side * 0.52),
+                    QPointF(box.left() + side * 0.42, box.top() + side * 0.72),
+                    QPointF(box.left() + side * 0.78, box.top() + side * 0.28)]))
+        painter.restore()
+
+    @staticmethod
+    def _arrow(painter, option, expanded):
+        rect = option.rect
+        if rect.width() < 4 or rect.height() < 4:
+            return
+        state = option.state
+        if state & QStyle.StateFlag.State_Selected:
+            color = QColor("#ffffff")
+        elif state & QStyle.StateFlag.State_MouseOver:
+            color = QColor(ACCENT)
+        else:
+            color = QColor("#bdbdbd")
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        cx = rect.center().x() + 0.5
+        cy = rect.center().y() + 0.5
+        half = max(2.0, min(3.4, min(rect.width(), rect.height()) * 0.20))
+        if expanded:
+            points = [QPointF(cx - half, cy - half * 0.55),
+                      QPointF(cx + half, cy - half * 0.55),
+                      QPointF(cx, cy + half * 0.85)]
+        else:
+            points = [QPointF(cx - half * 0.55, cy - half),
+                      QPointF(cx - half * 0.55, cy + half),
+                      QPointF(cx + half * 0.85, cy)]
+        painter.drawPolygon(QPolygonF(points))
+        painter.restore()
+
+
+def install_app_style(app):
+    """Fusion with our branch arrows, then the stylesheet on top of it."""
+    try:
+        app.setStyle("Fusion")
+        app.setStyle(BranchArrowStyle())
+    except Exception:
+        try:
+            app.setStyle("Fusion")
+        except Exception:
+            pass
+    apply_theme(app, load_config())
+
+
+class LibraryTree(QTreeWidget):
+    """Tree view that reports middle clicks (Strawberry enqueues on middle click)."""
+
+    middle_clicked = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Double-click queues the group; opening it is the arrow's job, so the
+        # tree cannot fold up while several artists or albums are being queued.
+        self.setExpandsOnDoubleClick(False)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            item = self.itemAt(event.position().toPoint())
+            if item is not None:
+                self.middle_clicked.emit(item)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
+class SmartPlaylistDialog(QDialog):
+    """Small rule builder: field / operator / value rows, match all/any, limit."""
+
+    def __init__(self, parent=None, item=None):
+        super().__init__(parent)
+        self.setWindowTitle("Smart playlist")
+        self.resize(560, 460)
+        self.item = dict(item or {})
+        self.rules = [dict(r) for r in self.item.get("rules", [])] or \
+                     [{"field": "genre", "op": "contains", "value": ""}]
+
+        self.name = QLineEdit(self.item.get("name", "My smart playlist"))
+        self.match = QComboBox()
+        self.match.addItem("Match all rules", "all")
+        self.match.addItem("Match any rule", "any")
+        self.match.setCurrentIndex(max(self.match.findData(self.item.get("match", "all")), 0))
+        self.limit = QSpinBox()
+        self.limit.setRange(0, 100000)
+        self.limit.setSpecialValueText("No limit")
+        self.limit.setValue(int(self.item.get("limit") or 0))
+        self.order = QComboBox()
+        for label, value in (("Artist, album", "artist, album, discnumber, tracknumber"),
+                             ("Newest first", "added DESC"),
+                             ("Most played first", "play_count DESC"),
+                             ("Title A-Z", "title"),
+                             ("Random", "RANDOM()")):
+            self.order.addItem(label, value)
+        idx = self.order.findData(self.item.get("order") or "artist, album, discnumber, tracknumber")
+        self.order.setCurrentIndex(max(idx, 0))
+
+        self.rows_box = QVBoxLayout()
+        self.rows_box.setSpacing(4)
+        self.rows_widgets = []
+        add_btn = QPushButton("＋ Add rule")
+        add_btn.clicked.connect(lambda: self._add_row({"field": "artist", "op": "contains", "value": ""}))
+        for rule in self.rules:
+            self._add_row(rule)
+
+        top = QFormLayout()
+        top.addRow("Name", self.name)
+        top.addRow("", self.match)
+        top.addRow("Limit", self.limit)
+        top.addRow("Order by", self.order)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(add_btn)
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Save")
+        ok.setObjectName("Primary")
+        ok.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(QLabel("Rules"))
+        lay.addLayout(self.rows_box)
+        lay.addStretch()
+        lay.addLayout(buttons)
+
+    def _add_row(self, rule):
+        holder = self._rule_row(dict(rule))
+        self.rows_box.addWidget(holder)
+        self.rows_widgets.append(holder)
+
+    def _rule_row(self, rule):
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        field = QComboBox()
+        for key, label in SMART_FIELDS.items():
+            field.addItem(label, key)
+        field.setCurrentIndex(max(field.findData(rule.get("field", "artist")), 0))
+        op = QComboBox()
+        op.addItems(SMART_OPS)
+        op.setCurrentIndex(max(op.findText(rule.get("op", "contains")), 0))
+        value = QLineEdit(str(rule.get("value", "")))
+        value.setPlaceholderText("value")
+        remove = QPushButton("✕")
+        remove.setFixedWidth(30)
+        row.addWidget(field, 2)
+        row.addWidget(op, 2)
+        row.addWidget(value, 3)
+        row.addWidget(remove)
+        rule["_widgets"] = (field, op, value)
+        remove.clicked.connect(lambda: self._remove_rule(holder))
+        holder._rule = rule
+        return holder
+
+    def _remove_rule(self, holder):
+        if holder in self.rows_widgets:
+            self.rows_widgets.remove(holder)
+        holder.setParent(None)
+        holder.deleteLater()
+
+    def _collect(self):
+        out = []
+        for holder in self.rows_widgets:
+            rule = getattr(holder, "_rule", None)
+            if not rule:
+                continue
+            field, op, value = rule["_widgets"]
+            if not value.text().strip():
+                continue
+            out.append({"field": field.currentData(), "op": op.currentText(),
+                        "value": value.text().strip()})
+        return out
+
+    def result_item(self):
+        rules = self._collect()
+        return {
+            "name": self.name.text().strip() or "Smart playlist",
+            "match": self.match.currentData(),
+            "limit": self.limit.value(),
+            "order": self.order.currentData(),
+            "rules": rules,
+        }
+
+
+# ======================================================================
+# ui/collection_model.py - grouping fields and details columns
+# ======================================================================
+GROUP_FIELDS = [
+    ("artist", "Artist"),
+    ("albumartist", "Album artist"),
+    ("album", "Album"),
+    ("albumdisc", "Album / Disc"),
+    ("disc", "Disc"),
+    ("year", "Year"),
+    ("decade", "Decade"),
+    ("genre", "Genre"),
+    ("composer", "Composer"),
+    ("performer", "Performer"),
+    ("grouping", "Grouping"),
+    ("filetype", "File type"),
+    ("samplerate", "Sample rate"),
+    ("bitdepth", "Bit depth"),
+    ("bitrate", "Bitrate"),
+    ("folder", "Folder"),
+]
+LIB_GROUP_LABEL = dict(GROUP_FIELDS)
+LIB_GROUP_LABEL["none"] = "None"
+
+GROUPING_LEVELS = {
+    "artist_album": ["artist", "album"],
+    "albumartist_album": ["albumartist", "album"],
+    "album": ["album"],
+    "genre": ["genre", "artist", "album"],
+    "year": ["decade", "album"],
+    "folder": ["folder"],
+    "albumartist_album_disc": ["albumartist", "album", "disc"],
+    "year_album": ["year", "album"],
+    "genre_artist_album": ["genre", "artist", "album"],
+    "composer": ["composer", "album"],
+    "format": ["filetype", "albumartist", "album"],
+    "samplerate": ["samplerate", "albumartist", "album"],
+    "bitdepth": ["bitdepth", "albumartist", "album"],
+    "bitrate": ["bitrate", "albumartist", "album"],
+    "none": ["none"],
+}
+
+# The Strawberry-style details columns, in the order they are shown.
+LIB_COLUMNS = [
+    ("track", "Track", 44),
+    ("title", "Title", 200),
+    ("artist", "Artist", 140),
+    ("album", "Album", 150),
+    ("length", "Length", 56),
+    ("year", "Year", 50),
+    ("genre", "Genre", 100),
+    ("rating", "Rating", 74),
+    ("plays", "Play count", 62),
+    ("format", "Type", 56),
+]
+LIB_COLUMN_LABELS = {key: label for key, label, _w in LIB_COLUMNS}
+DETAIL_KEYS = [key for key, _l, _w in LIB_COLUMNS]
+
+
+def stars(rating):
+    rating = max(0, min(5, int(rating or 0)))
+    return ("★" * rating + "☆" * (5 - rating)) if rating else ""
+
+
+def format_path_pattern(tags, pattern):
+    """%albumartist%/%album%/%tracknumber% - %title% -> a relative path."""
+    def sub_one(m):
+        key = m.group(1).lower()
+        val = str(tags.get(key, "") or "")
+        if key in ("tracknumber", "discnumber"):
+            val = val.split("/")[0]
+            if val.isdigit():
+                val = val.zfill(2)
+        return _BAD_CHARS.sub("_", val).strip()
+
+    parts = []
+    for segment in str(pattern).replace("\\", "/").split("/"):
+        segment = _PLACEHOLDER.sub(sub_one, segment).strip().strip(".")
+        if segment:
+            parts.append(segment)
+    return os.path.join(*parts) if parts else ""
+
+
+def organize_paths(paths, pattern, root, move=True):
+    """Move (or copy) files into root/pattern. Returns [(old, new, error)]."""
+    results = []
+    for path in paths:
+        try:
+            tags = read_tags(path)
+        except Exception as e:  # unreadable file: report it, keep going
+            results.append((path, "", str(e)))
+            continue
+        rel = format_path_pattern(tags, pattern)
+        ext = os.path.splitext(path)[1]
+        if not rel:
+            results.append((path, "", "the pattern produced an empty path"))
+            continue
+        stem = os.path.join(root, rel)
+        target, n = stem + ext, 2
+        while os.path.exists(target) and os.path.abspath(target) != os.path.abspath(path):
+            target = f"{stem} ({n}){ext}"
+            n += 1
+        if os.path.abspath(target) == os.path.abspath(path):
+            results.append((path, path, ""))
+            continue
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if move:
+                shutil.move(path, target)
+            else:
+                shutil.copy2(path, target)
+        except OSError as e:
+            results.append((path, "", str(e)))
+            continue
+        results.append((path, target, ""))
+    return results
+
+
+class GroupByDialog(QDialog):
+    """Strawberry's group-by dialog: three levels plus saved groupings."""
+
+    def __init__(self, parent=None, levels=None, saved=None):
+        super().__init__(parent)
+        self.setWindowTitle("Group library by")
+        self.setMinimumWidth(400)
+        self.saved = [dict(s) for s in (saved or []) if isinstance(s, dict) and s.get("name")]
+        levels = list(levels or ["artist", "album"])
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        info = QLabel("Group the collection by up to three levels.\n"
+                      "Songs are listed under the last level.")
+        info.setObjectName("Muted")
+        lay.addWidget(info)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+        self.combos = []
+        for i in range(3):
+            combo = QComboBox()
+            if i:
+                combo.addItem("None", "none")
+            for key, label in GROUP_FIELDS:
+                combo.addItem(label, key)
+            wanted = levels[i] if i < len(levels) else "none"
+            combo.setCurrentIndex(max(combo.findData(wanted), 0))
+            self.combos.append(combo)
+            form.addRow("Level %d" % (i + 1), combo)
+        lay.addLayout(form)
+
+        saved_head = QLabel("Saved groupings")
+        saved_head.setObjectName("Heading")
+        lay.addWidget(saved_head)
+        self.saved_list = QListWidget()
+        self.saved_list.setFixedHeight(96)
+        self.saved_list.itemDoubleClicked.connect(lambda _i: self.load_selected())
+        lay.addWidget(self.saved_list)
+        saved_row = QHBoxLayout()
+        for text, fn in (("Use", self.load_selected),
+                         ("Save current…", self.save_current),
+                         ("Delete", self.delete_selected)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            saved_row.addWidget(b)
+        saved_row.addStretch()
+        lay.addLayout(saved_row)
+        self._refresh_saved()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Group")
+        ok.setObjectName("Primary")
+        ok.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+        lay.addLayout(buttons)
+
+    def _refresh_saved(self):
+        self.saved_list.clear()
+        for grouping in self.saved:
+            levels = " / ".join(LIB_GROUP_LABEL.get(k, k) for k in grouping.get("levels", []))
+            item = QListWidgetItem(f"{grouping['name']}   ({levels})")
+            item.setData(Qt.UserRole, grouping["name"])
+            self.saved_list.addItem(item)
+
+    def pick(self):
+        out = [c.currentData() for c in self.combos if c.currentData() != "none"]
+        return out or ["none"]
+
+    def load_selected(self):
+        item = self.saved_list.currentItem()
+        if not item:
+            return
+        name = item.data(Qt.UserRole)
+        grouping = next((s for s in self.saved if s["name"] == name), None)
+        if not grouping:
+            return
+        levels = list(grouping.get("levels") or ["artist", "album"])
+        for i, combo in enumerate(self.combos):
+            wanted = levels[i] if i < len(levels) else "none"
+            combo.setCurrentIndex(max(combo.findData(wanted), 0))
+
+    def save_current(self):
+        name, ok = QInputDialog.getText(self, "Save grouping", "Name:")
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        self.saved = [s for s in self.saved if s["name"] != name]
+        self.saved.append({"name": name, "levels": self.pick()})
+        self._refresh_saved()
+
+    def delete_selected(self):
+        item = self.saved_list.currentItem()
+        if not item:
+            return
+        name = item.data(Qt.UserRole)
+        self.saved = [s for s in self.saved if s["name"] != name]
+        self._refresh_saved()
+
+
+class DuplicateDialog(QDialog):
+    """Group rows that share the same album artist / album / title."""
+
+    def __init__(self, library, parent=None):
+        super().__init__(parent)
+        self.library = library
+        self.removed = []
+        self.setWindowTitle("Find duplicates")
+        self.resize(760, 500)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(6)
+        head = QLabel("Tracks matching on all three fields are listed together.")
+        head.setObjectName("Muted")
+        lay.addWidget(head)
+
+        self.combos = []
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Match"))
+        choices = [("albumartist", "Album artist"), ("artist", "Artist"), ("album", "Album"),
+                   ("title", "Title"), ("tracknumber", "Track number"), ("date", "Year"),
+                   ("filetype", "File type")]
+        for default in ("albumartist", "album", "title"):
+            combo = QComboBox()
+            for key, label in choices:
+                combo.addItem(label, key)
+            combo.setCurrentIndex(max(combo.findData(default), 0))
+            combo.currentIndexChanged.connect(lambda _i: self.find())
+            self.combos.append(combo)
+            row.addWidget(combo)
+        find_btn = QPushButton("Find duplicates")
+        find_btn.clicked.connect(self.find)
+        row.addWidget(find_btn)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Track", "File"])
+        self.tree.setColumnWidth(0, 340)
+        self.tree.setAlternatingRowColors(True)
+        lay.addWidget(self.tree, 1)
+
+        self.status = QLabel("")
+        self.status.setObjectName("Muted")
+        lay.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        keep = QPushButton("Select all but the first")
+        keep.clicked.connect(self.select_duplicates)
+        remove = QPushButton("Remove selected from library")
+        remove.clicked.connect(self.remove_selected)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(keep)
+        buttons.addWidget(remove)
+        buttons.addStretch()
+        buttons.addWidget(close)
+        lay.addLayout(buttons)
+        self.find()
+
+    def fields(self):
+        return [c.currentData() for c in self.combos]
+
+    def find(self):
+        self.tree.clear()
+        groups = self.library.duplicate_groups(self.fields())
+        total = 0
+        for group in groups:
+            first = group[0]
+            label = f"{first.get('artist') or 'Unknown artist'} — {first.get('title') or '?'}"
+            header = QTreeWidgetItem(self.tree, [f"{label}  ({len(group)} copies)", ""])
+            f = header.font(0)
+            f.setBold(True)
+            header.setFont(0, f)
+            for row in group:
+                child = QTreeWidgetItem(header, [os.path.basename(row["path"]), row["path"]])
+                child.setData(0, PATH_ROLE, row["path"])
+                child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.Checked)
+                total += 1
+            header.setExpanded(True)
+        self.status.setText(f"{len(groups)} duplicate group(s), {total} track(s)")
+        self.select_duplicates()
+
+    def select_duplicates(self):
+        for i in range(self.tree.topLevelItemCount()):
+            header = self.tree.topLevelItem(i)
+            for j in range(header.childCount()):
+                header.child(j).setCheckState(0, Qt.Unchecked if j == 0 else Qt.Checked)
+
+    def checked_paths(self):
+        paths = []
+        for i in range(self.tree.topLevelItemCount()):
+            header = self.tree.topLevelItem(i)
+            for j in range(header.childCount()):
+                child = header.child(j)
+                if child.checkState(0) == Qt.Checked:
+                    paths.append(child.data(0, PATH_ROLE))
+        return paths
+
+    def remove_selected(self):
+        paths = self.checked_paths()
+        if not paths:
+            return
+        self.library.remove_paths(paths)
+        self.removed.extend(paths)
+        self.find()
+
+
+class OrganizeDialog(QDialog):
+    """Strawberry's 'Organize files': rewrite paths from tags."""
+
+    def __init__(self, paths, library, default_root, parent=None):
+        super().__init__(parent)
+        self.paths = list(paths)
+        self.library = library
+        self.organized = []
+        self.setWindowTitle("Organize files")
+        self.setMinimumWidth(560)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        info = QLabel(f"{len(self.paths)} file(s). Placeholders: %artist% %albumartist% %album% "
+                      "%tracknumber% %discnumber% %date% %genre% %title% %composer%")
+        info.setObjectName("Muted")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        form = QFormLayout()
+        self.pattern = QLineEdit("%albumartist%/%album%/%tracknumber% - %title%")
+        self.pattern.textChanged.connect(self._preview)
+        form.addRow("Pattern", self.pattern)
+        root_row = QHBoxLayout()
+        self.root = QLineEdit(default_root)
+        self.root.textChanged.connect(self._preview)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        root_row.addWidget(self.root, 1)
+        root_row.addWidget(browse)
+        form.addRow("Destination", root_row)
+        lay.addLayout(form)
+
+        self.move_files = QCheckBox("Move files (otherwise copy them)")
+        self.move_files.setChecked(True)
+        lay.addWidget(self.move_files)
+        self.preview = QLabel("")
+        self.preview.setObjectName("Amber")
+        self.preview.setWordWrap(True)
+        lay.addWidget(self.preview)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Organize")
+        ok.setObjectName("Primary")
+        ok.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+        lay.addLayout(buttons)
+        self._preview()
+
+    def _browse(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Destination", self.root.text() or os.path.expanduser("~/Music"),
+            options=DIRECTORY_DIALOG_OPTIONS)
+        if folder:
+            self.root.setText(folder)
+
+    def _preview(self, *_args):
+        if not self.paths:
+            self.preview.setText("")
+            return
+        shown = []
+        for path in self.paths[:2]:
+            tags = read_tags(path)
+            rel = format_path_pattern(tags, self.pattern.text())
+            shown.append(os.path.join(self.root.text(), rel + os.path.splitext(path)[1]))
+        more = "" if len(self.paths) < 3 else f"\n…and {len(self.paths) - 2} more"
+        self.preview.setText("\n".join(shown) + more)
+
+    def accept(self):
+        root = self.root.text().strip()
+        if not root or not os.path.isdir(root):
+            QMessageBox.warning(self, "Organize files", "Pick an existing destination folder.")
+            return
+        results = organize_paths(self.paths, self.pattern.text(), root,
+                                 self.move_files.isChecked())
+        failures = [r for r in results if r[2]]
+        for old, new, error in results:
+            if error or old == new:
+                continue
+            self.library.forget(old)
+            self.library.update_track(new)
+            self.organized.append((old, new))
+        if failures:
+            QMessageBox.warning(self, "Organize files",
+                                f"{len(failures)} file(s) could not be moved:\n" +
+                                "\n".join(f"{os.path.basename(p)}: {e}" for p, _n, e in failures[:5]))
+        super().accept()
+
+
+def _album_folders(rows):
+    seen = []
+    for row in rows:
+        folder = os.path.dirname(row.get("path") or "")
+        if folder and folder not in seen:
+            seen.append(folder)
+    return seen
+
+
+def _genre_title(value):
+    return " ".join(word.capitalize() if word.islower() else word
+                    for word in str(value or "").replace("_", " ").split())
+
+
+class OnlineLookupDialog(QDialog):
+    """MusicBrainz search + Cover Art Archive artwork for an album selection."""
+
+    def __init__(self, rows, library, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Online metadata & cover lookup")
+        self.resize(760, 540)
+        self.rows = [dict(r) for r in rows if r.get("path")]
+        self.library = library
+        self.results = []
+        self.applied = False
+        self._worker = None
+        self._cover_worker = None
+        self._preview_id = ""
+        self._live = False
+        self._cover_error = ""
+        tags = read_tags(self.rows[0]["path"]) if self.rows else {}
+        artist = (tags.get("albumartist") or tags.get("artist") or "")
+        album = tags.get("album") or ""
+
+        self.artist_edit = QLineEdit(artist)
+        self.album_edit = QLineEdit(album)
+        self.search_btn = QPushButton("Search MusicBrainz")
+        self.search_btn.setObjectName("Primary")
+        self.search_btn.clicked.connect(self.search)
+        self.artist_edit.returnPressed.connect(self.search)
+        self.album_edit.returnPressed.connect(self.search)
+
+        form = QHBoxLayout()
+        form.setSpacing(6)
+        form.addWidget(QLabel("Artist"))
+        form.addWidget(self.artist_edit, 2)
+        form.addWidget(QLabel("Album"))
+        form.addWidget(self.album_edit, 3)
+        form.addWidget(self.search_btn)
+
+        self.results_list = QListWidget()
+        self.results_list.currentRowChanged.connect(self._selection_changed)
+
+        self.preview = QLabel("no preview")
+        self.preview.setObjectName("Muted")
+        self.preview.setFixedSize(150, 150)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet("border: 1px solid #3a3a3a; background: #1b1b1b;")
+
+        self.details = QLabel("Search MusicBrainz by artist and album.")
+        self.details.setWordWrap(True)
+        self.details.setObjectName("Muted")
+
+        side = QVBoxLayout()
+        side.addWidget(self.preview, 0, Qt.AlignHCenter)
+        side.addWidget(self.details, 1)
+
+        body = QHBoxLayout()
+        body.addWidget(self.results_list, 3)
+        body.addLayout(side, 2)
+
+        self.status = QLabel("%d track(s) selected" % len(self.rows))
+        self.status.setObjectName("Muted")
+        self.status.setWordWrap(True)
+
+        self.cover_btn = QPushButton("Save front cover")
+        self.cover_btn.setEnabled(False)
+        self.cover_btn.clicked.connect(self.save_cover)
+        self.apply_btn = QPushButton("Apply album tags")
+        self.apply_btn.setEnabled(False)
+        self.apply_btn.clicked.connect(self.apply_tags)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.status, 1)
+        buttons.addWidget(self.cover_btn)
+        buttons.addWidget(self.apply_btn)
+        buttons.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addLayout(body, 1)
+        lay.addLayout(buttons)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._live = True
+        if self.selected() is not None:
+            self._selection_changed(self.results_list.currentRow())
+
+    # ---------- background helper ----------
+    def _run(self, fn, done, failed):
+        worker = Worker(fn, self)
+        worker.done.connect(done)
+        worker.failed.connect(failed)
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+        return worker
+
+    def _fail(self, text):
+        self.status.setText("Lookup failed: " + mb_error_text(text))
+        self.search_btn.setEnabled(True)
+
+    # ---------- search ----------
+    def search(self):
+        artist = self.artist_edit.text().strip()
+        album = self.album_edit.text().strip()
+        if not artist and not album:
+            self.status.setText("Enter an artist or an album name first.")
+            return
+        self.search_btn.setEnabled(False)
+        self.status.setText("Searching MusicBrainz…")
+        self.results_list.clear()
+        self.results = []
+        self._run(lambda progress, log, cancel: mb_search_releases(artist, album),
+                  self._show_results, self._fail)
+
+    def _show_results(self, results):
+        self.search_btn.setEnabled(True)
+        self.results = list(results or [])
+        self.results_list.clear()
+        if not self.results:
+            self.status.setText("No release found. Try a shorter artist or album name.")
+            return
+        for rel in self.results:
+            extra = " · ".join(x for x in (rel.get("type"), rel.get("date")[:4],
+                                           rel.get("country")) if x)
+            self.results_list.addItem(
+                "%s — %s  (%s, %d tracks)" % (rel["artist"] or "?", rel["title"],
+                                              extra or "release", rel["tracks"]))
+        self.status.setText("%d release(s) found on MusicBrainz." % len(self.results))
+        self.results_list.setCurrentRow(0)
+
+    def selected(self):
+        index = self.results_list.currentRow()
+        if 0 <= index < len(self.results):
+            return self.results[index]
+        return None
+
+    def _selection_changed(self, _row):
+        rel = self.selected()
+        if rel is None:
+            self.cover_btn.setEnabled(False)
+            self.apply_btn.setEnabled(False)
+            return
+        self.cover_btn.setEnabled(True)
+        self.apply_btn.setEnabled(True)
+        labels = ", ".join(rel.get("labels") or [])
+        self.details.setText(
+            "<b>%s</b><br>%s<br>%s<br>%d track(s)%s"
+            % (rel["title"] or "?", rel["artist"] or "?",
+               rel.get("date") or "no date", rel["tracks"],
+               ("<br>Label: " + labels) if labels else ""))
+        self._preview_id = rel["id"]
+        if not self._live:
+            return
+        self.preview.setText("loading cover…")
+        self.preview.setPixmap(QPixmap())
+        self._cover_worker = self._run(
+            lambda progress, log, cancel: mb_cover_bytes(rel["id"], 250),
+            lambda data, mbid=rel["id"]: self._show_preview(mbid, data),
+            self._cover_failed)
+
+    def _cover_failed(self, traceback_text):
+        self._cover_error = str(traceback_text).strip().splitlines()[-1]
+        self.preview.setText("no cover art")
+
+    def _show_preview(self, mbid, data):
+        if mbid != self._preview_id:
+            return
+        pm = QPixmap()
+        if not data or not pm.loadFromData(data):
+            self.preview.setText("no cover art")
+            return
+        self.preview.setText("")
+        self.preview.setPixmap(pm.scaled(150, 150, Qt.KeepAspectRatio,
+                                         Qt.SmoothTransformation))
+
+    # ---------- saving artwork ----------
+    def save_cover(self):
+        rel = self.selected()
+        if rel is None:
+            return
+        self.status.setText("Downloading the front cover…")
+        self._run(lambda progress, log, cancel: mb_cover_bytes(rel["id"], 1000),
+                  lambda data: self._write_cover(rel, data),
+                  lambda tb: self.status.setText("Cover download failed: "
+                                                 + str(tb).strip().splitlines()[-1]))
+
+    def _write_cover(self, rel, data):
+        if not data:
+            self.status.setText("Cover Art Archive has no front image for this release.")
+            return
+        ext = ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else ".jpg"
+        saved = []
+        for folder in _album_folders(self.rows):
+            if not os.path.isdir(folder):
+                continue
+            target = os.path.join(folder, "cover" + ext)
+            try:
+                with open(target, "wb") as f:
+                    f.write(data)
+                saved.append(target)
+            except OSError:
+                continue
+        if saved:
+            self.status.setText("Saved %d cover file(s) — e.g. %s"
+                                % (len(saved), os.path.basename(saved[0])))
+        else:
+            self.status.setText("Could not write a cover next to the selected files.")
+
+    # ---------- applying tags ----------
+    def apply_tags(self):
+        rel = self.selected()
+        if rel is None:
+            return
+        self.apply_btn.setEnabled(False)
+        self.status.setText("Fetching the track list for the release…")
+        self._run(lambda progress, log, cancel: mb_release(rel["id"]),
+                  self._apply_release,
+                  lambda tb: (self.apply_btn.setEnabled(True),
+                              self._fail(tb)))
+
+    def _apply_release(self, release):
+        order = sorted(self.rows, key=lambda r: (_num(r.get("discnumber")),
+                                                 _num(r.get("tracknumber")),
+                                                 r.get("path") or ""))
+        tracks = release.get("tracks") or []
+        tag_titles = len(tracks) == len(order)
+        genre = _genre_title((release.get("genres") or [""])[0])
+        changed, failed = 0, 0
+        for index, row in enumerate(order):
+            values = {}
+            if release.get("title"):
+                values["album"] = release["title"]
+            if release.get("artist"):
+                values["albumartist"] = release["artist"]
+            if release.get("date"):
+                values["date"] = release["date"][:4]
+            if genre:
+                values["genre"] = genre
+            if tag_titles:
+                track = tracks[index]
+                if track.get("title"):
+                    values["title"] = track["title"]
+                if track.get("position"):
+                    values["tracknumber"] = str(track["position"]).split("/")[0]
+                if track.get("disc"):
+                    values["discnumber"] = str(track["disc"])
+            try:
+                write_tags(row["path"], values)
+                if self.library is not None:
+                    self.library.update_track(row["path"])
+                changed += 1
+            except (OSError, ValueError):
+                failed += 1
+        self.applied = changed > 0
+        note = "Updated %d file(s)" % changed
+        if not tag_titles:
+            note += " (track titles skipped: %d files vs %d tracks)" % (len(order),
+                                                                        len(tracks))
+        if failed:
+            note += ", %d failed" % failed
+        self.status.setText(note)
+        self.apply_btn.setEnabled(True)
+        if changed:
+            self.accept()
+
+
+def disc_icon(size=16):
+    """A small CD glyph for the tab."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#c9d3dc"))
+    p.drawEllipse(QRectF(1, 1, size - 2, size - 2))
+    p.setBrush(QColor(ACCENT))
+    p.drawEllipse(QRectF(size * 0.34, size * 0.34, size * 0.32, size * 0.32))
+    p.setBrush(QColor(BG))
+    p.drawEllipse(QRectF(size * 0.44, size * 0.44, size * 0.12, size * 0.12))
+    p.end()
+    return QIcon(pm)
+
+
+class CdJobDialog(QDialog):
+    """A small window that shows a CD rip while it runs, and the error if it fails."""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        self.status = QLabel("Starting\u2026")
+        self.status.setWordWrap(True)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)  # busy until the first track reports progress
+        self.cancel_btn = QPushButton("Cancel")
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setVisible(False)
+        self.close_btn.clicked.connect(self.accept)
+        lay.addWidget(self.status)
+        lay.addWidget(self.bar)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.cancel_btn)
+        buttons.addWidget(self.close_btn)
+        lay.addLayout(buttons)
+
+    def report(self, done, total, message):
+        self.status.setText(message)
+        if total > 0:
+            self.bar.setRange(0, total)
+            self.bar.setValue(done)
+
+    def failed(self, message):
+        self.bar.setRange(0, 1)
+        self.bar.setValue(0)
+        self.status.setText(message)
+        self.cancel_btn.setVisible(False)
+        self.close_btn.setVisible(True)
+
+
+class FindReleaseDialog(QDialog):
+    """Search the enabled identification sources by text, and pick the release for a CD."""
+
+    def __init__(self, cfg, disc, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Find release")
+        self.setMinimumSize(600, 420)
+        self.cfg = cfg
+        self.chosen = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        row = QHBoxLayout()
+        self.query = QLineEdit(" ".join(x for x in (disc.artist, disc.album) if x))
+        self.query.setPlaceholderText("Artist and album")
+        self.query.returnPressed.connect(self.run_search)
+        search = QPushButton("Search")
+        search.clicked.connect(self.run_search)
+        row.addWidget(self.query, 1)
+        row.addWidget(search)
+        lay.addLayout(row)
+        self.results = QListWidget()
+        self.results.itemDoubleClicked.connect(lambda _item: self.accept_choice())
+        lay.addWidget(self.results, 1)
+        self.status = QLabel("Sources are searched in the order set in Preferences > Identification.")
+        self.status.setObjectName("Muted")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        use = QPushButton("Use this release")
+        use.clicked.connect(self.accept_choice)
+        buttons.addWidget(cancel)
+        buttons.addWidget(use)
+        lay.addLayout(buttons)
+
+    def run_search(self):
+        text = self.query.text().strip()
+        if not text:
+            return
+        self.results.clear()
+        hits, problems = [], []
+        for key in id_order(self.cfg):
+            try:
+                if key == "cddb":
+                    continue                     # CDDB has no text search, only disc ID lookups
+                if key == "discogs":
+                    if not discogs_connected(self.cfg):
+                        problems.append("Discogs: not signed in")
+                        continue
+                    hits += discogs_search(text, self.cfg["discogs_token"], self.cfg["discogs_secret"])
+                else:
+                    hits += mb_text_search(text)
+            except (OSError, ValueError, KeyError) as exc:
+                problems.append(f"{ID_SOURCES[key]}: {exc}")
+        for hit in hits:
+            label = f"[{ID_SOURCES[hit['source']]}] {hit['title']}"
+            if hit["year"]:
+                label += f" ({hit['year']})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, hit)
+            self.results.addItem(item)
+        if hits:
+            self.results.setCurrentRow(0)
+        self.status.setText(" · ".join(problems) or f"{len(hits)} result(s)")
+
+    def accept_choice(self):
+        item = self.results.currentItem()
+        if item is not None:
+            self.chosen = item.data(Qt.ItemDataRole.UserRole)
+            self.accept()
+
+
+class DiscTab(QWidget):
+    """The CD tab: the audio tracks on the disc in the drive, with queue and rip actions."""
+
+    def __init__(self, main, disc, parent=None):
+        super().__init__(parent)
+        self.main = main
+        self.disc = disc
+        self._worker = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        self.heading = QLabel("Audio CD")
+        self.heading.setObjectName("DiscHeading")
+        self.status = QLabel(f"{len(disc.audio_tracks)} audio tracks")
+        self.status.setObjectName("Muted")
+        lay.addWidget(self.heading)
+        lay.addWidget(self.status)
+
+        # The release details, so the tab says what the queue entries say.
+        self.fields = {}
+        details = QWidget()
+        grid = QGridLayout(details)
+        grid.setContentsMargins(0, 8, 0, 8)
+        grid.setHorizontalSpacing(22)
+        grid.setVerticalSpacing(1)
+        for col, (key, label) in enumerate((("album", "Album"), ("artist", "Artist"),
+                                            ("year", "Year"), ("genre", "Genre"),
+                                            ("tracks", "Tracks"), ("length", "Length"))):
+            caption = QLabel(label)
+            caption.setObjectName("Muted")
+            value = QLabel("\u2014")
+            value.setObjectName("DiscValue")
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            row, column = divmod(col, 3)
+            grid.addWidget(caption, row * 2, column)
+            grid.addWidget(value, row * 2 + 1, column)
+            grid.setColumnStretch(column, 1)
+            self.fields[key] = value
+        lay.addWidget(details)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["", "#", "Title", "Length"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._context_menu)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.itemDoubleClicked.connect(self._double_clicked)
+        for track in disc.audio_tracks:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            check.setCheckState(Qt.CheckState.Checked)
+            check.setData(Qt.ItemDataRole.UserRole, track.number)
+            self.table.setItem(row, 0, check)
+            self.table.setItem(row, 1, QTableWidgetItem(f"{track.number}"))
+            self.table.setItem(row, 2, QTableWidgetItem(track.title or f"Track {track.number:02d}"))
+            self.table.setItem(row, 3, QTableWidgetItem(fmt_time(track.frames / CD_FRAMES_PER_SECOND)))
+        lay.addWidget(self.table, 1)
+
+        queue_row = QHBoxLayout()
+        self.btn_all = QPushButton("Select all")
+        self.btn_none = QPushButton("Select none")
+        self.btn_queue = QPushButton("Add ticked to queue")
+        self.btn_queue_all = QPushButton("Add CD to queue")
+        self.btn_shuffle = QPushButton("Shuffle CD into queue")
+        self.btn_queue.setToolTip("Add the ticked tracks to the end of the queue; nothing starts playing")
+        self.btn_queue_all.setToolTip("Add every track on the disc to the end of the queue")
+        self.btn_shuffle.setToolTip("Add every track on the disc to the queue in random order")
+        self.btn_all.clicked.connect(lambda: self._check_all(True))
+        self.btn_none.clicked.connect(lambda: self._check_all(False))
+        self.btn_queue.clicked.connect(self.queue_checked)
+        self.btn_queue_all.clicked.connect(self.queue_whole_disc)
+        self.btn_shuffle.clicked.connect(self.queue_shuffled)
+        for b in (self.btn_all, self.btn_none, self.btn_queue, self.btn_queue_all, self.btn_shuffle):
+            queue_row.addWidget(b)
+        queue_row.addStretch(1)
+        lay.addLayout(queue_row)
+
+        row_btns = QHBoxLayout()
+        self.btn_rip = QPushButton("Rip\u2026")
+        self.btn_find = QPushButton("Find release…")
+        self.btn_eject = QPushButton("Eject")
+        self.btn_find.clicked.connect(self.find_release)
+        self.btn_rip.clicked.connect(self.rip_checked)
+        self.btn_eject.clicked.connect(self.main.eject_disc)
+        for b in (self.btn_find, self.btn_rip, self.btn_eject):
+            row_btns.addWidget(b)
+        row_btns.addStretch(1)
+        lay.addLayout(row_btns)
+        self._refresh_details()
+
+    def _refresh_details(self):
+        """Fill the release fields from the disc (blank fields show an em dash)."""
+        tracks = self.disc.audio_tracks
+        self.fields["album"].setText(self.disc.album or "\u2014")
+        self.fields["artist"].setText(self.disc.artist or "\u2014")
+        self.fields["year"].setText(self.disc.date or "\u2014")
+        self.fields["genre"].setText(self.disc.genre or "\u2014")
+        self.fields["tracks"].setText(str(len(tracks)))
+        self.fields["length"].setText(fmt_time(sum(t.frames for t in tracks) / CD_FRAMES_PER_SECOND))
+        self.heading.setText(self.disc.album or "Audio CD")
+
+    def lookup_finished(self, found, error="", source="", tried="", answered=True):
+        """Show the identification result: the release and track titles, or why there is none."""
+        count = len(self.disc.audio_tracks)
+        self.status.setToolTip(error)
+        self._refresh_details()
+        if found:
+            for row, track in enumerate(self.disc.audio_tracks):
+                self.table.item(row, 2).setText(track.title or f"Track {track.number:02d}")
+            detail = " \u00b7 ".join(x for x in (f"{count} tracks", self.disc.date, source) if x)
+            self.status.setText(detail)
+        elif error and not answered:
+            # Nothing gave a real answer: this is a failure, not a disc no service knows.
+            self.status.setText(f"{count} tracks \u00b7 lookup failed: {error}")
+        else:
+            text = f"{count} tracks \u00b7 not found" + (f" on {tried}" if tried else "")
+            if error:
+                text += f" \u00b7 {error}"
+            self.status.setText(text)
+
+    def find_release(self):
+        """Search the enabled sources for this disc and fill it in from the release the user picks."""
+        cfg = self.main.config
+        dlg = FindReleaseDialog(cfg, self.disc, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.chosen is None:
+            return
+        hit = dlg.chosen
+        self._start(lambda p, l, c: apply_release_hit(self.disc, hit, cfg),
+                    lambda _result: self.lookup_finished(True, "", ID_SOURCES[hit["source"]]),
+                    "Loading release")
+
+    def checked_numbers(self):
+        numbers = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item.checkState() == Qt.CheckState.Checked:
+                numbers.append(item.data(Qt.ItemDataRole.UserRole))
+        return numbers
+
+    def _check_all(self, state):
+        for row in range(self.table.rowCount()):
+            self.table.item(row, 0).setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
+
+    def _double_clicked(self, item):
+        self._queue([self.table.item(item.row(), 0).data(Qt.ItemDataRole.UserRole)])
+
+    def _selected_rows(self):
+        """The rows that are selected, in disc order."""
+        return sorted({index.row() for index in self.table.selectedIndexes()})
+
+    def _row_number(self, row):
+        return self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+
+    def _context_menu(self, pos):
+        item = self.table.itemAt(pos)
+        if item is None:
+            return
+        if item.row() not in self._selected_rows():
+            self.table.selectRow(item.row())
+        rows = self._selected_rows()
+        numbers = [self._row_number(row) for row in rows]
+        menu = QMenu(self)
+        menu.addAction("Add ticked to queue", lambda: self._queue(numbers))
+        menu.addAction("Add whole CD to queue", self.queue_whole_disc)
+        menu.addAction("Shuffle CD into queue", self.queue_shuffled)
+        menu.addAction("Rip\u2026", lambda: self._rip(numbers))
+        menu.addSeparator()
+        menu.addAction("Tick selected", lambda: self._set_rows_checked(rows, True))
+        menu.addAction("Untick selected", lambda: self._set_rows_checked(rows, False))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _set_rows_checked(self, rows, state):
+        for row in rows:
+            self.table.item(row, 0).setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
+
+    def queue_checked(self):
+        numbers = self.checked_numbers()
+        if not numbers:
+            self.main.notify("Tick the tracks you want to add first")
+            return
+        self._queue(numbers)
+
+    def queue_whole_disc(self):
+        """Add every audio track on the disc to the queue, without starting playback."""
+        tracks = self.disc.audio_tracks
+        self._queue([t.number for t in tracks],
+                    f"Added the whole CD ({len(tracks)} tracks) to the queue")
+
+    def queue_shuffled(self):
+        """Add every track in random order, so the disc plays in a different order."""
+        numbers = [t.number for t in self.disc.audio_tracks]
+        random.shuffle(numbers)
+        self._queue(numbers, f"Shuffled {len(numbers)} CD tracks into the queue")
+
+    def _queue(self, numbers, message=""):
+        """Add disc tracks to the end of the queue. Playback is the user's decision:
+
+        nothing starts here, even when the queue was idle.
+        """
+        entries = [cd_entry(self.disc, n) for n in numbers]
+        if not entries:
+            return
+        self.main.player.add_paths(entries, play_if_idle=False)
+        self.main.notify(message or f"Added {len(entries)} track(s) from the CD to the queue")
+
+    def rip_checked(self):
+        numbers = self.checked_numbers()
+        if not numbers:
+            self.main.notify("Tick the tracks you want to rip first")
+            return
+        self._rip(numbers)
+
+    def _rip(self, numbers):
+        missing = [tool for tool in ("cdparanoia", "ffmpeg") if not shutil.which(tool)]
+        if missing:
+            QMessageBox.warning(self, "Rip audio CD", "Install these tools first: " + ", ".join(missing))
+            return
+        dlg = RipDialog(self.main.rip_folder(), self.main.config.get("rip") or {}, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        s = dlg.settings()
+        if not s["folder"]:
+            QMessageBox.warning(self, "Rip audio CD", "Choose a folder to rip to.")
+            return
+        self.main.config["rip"] = s
+        save_config(self.main.config)
+        base = os.path.join(s["folder"], cd_safe_name(self.disc.artist or "Unknown artist"),
+                            cd_safe_name(self.disc.album or "Unknown album"))
+        ext = RIP_CODECS[s["codec"]][1]
+        jobs = []
+        for n in numbers:
+            title = self.disc.track(n).title or f"Track {n:02d}"
+            out = os.path.join(base, f"{n:02d} - {cd_safe_name(title)}{ext}")
+            jobs.append((n, out, s["codec"], s["mode"], s["quality"]))
+        self._start(lambda p, l, c: rip_cd_tracks(self.disc, jobs, p, c),
+                    lambda paths: self._ripped(paths, base), "Ripping audio CD")
+
+    def _ripped(self, paths, folder):
+        self.status.setText(f"Ripped {len(paths)} track(s) to {folder}")
+        self.main.notify(f"Ripped {len(paths)} track(s) to {folder}")
+
+    def _start(self, fn, done, title):
+        """Run fn in a worker, with a progress window. done gets the result when the job succeeds."""
+        if self._worker is not None and self._worker.isRunning():
+            self.main.notify("A CD job is already running")
+            return
+        dialog = CdJobDialog(title, self.main)
+        worker = Worker(fn, self)
+        worker.progress.connect(dialog.report)
+        dialog.cancel_btn.clicked.connect(worker.cancel)
+        dialog.cancel_btn.clicked.connect(lambda: dialog.status.setText("Cancelling after the current track\u2026"))
+
+        def finished(result):
+            dialog.accept()
+            done(result)
+
+        def failed(msg):
+            last = (msg.strip().splitlines() or ["failed"])[-1]
+            dialog.failed(f"{title} failed: {last}")
+            self.main.notify("CD: " + last)
+
+        worker.done.connect(finished)
+        worker.failed.connect(failed)
+        self._worker = worker
+        self._job_dialog = dialog
+        dialog.show()
+        worker.start()
+
+
+class RipDialog(QDialog):
+    """Pick the codec, mode, quality and folder for ripping CD tracks."""
+
+    def __init__(self, folder, saved, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Rip audio CD")
+        self.setMinimumWidth(540)
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.codec = QComboBox()
+        for key, (label, _ext) in RIP_CODECS.items():
+            self.codec.addItem(label, key)
+        self.mode = QComboBox()
+        self.mode.addItem("Variable bitrate (VBR): smaller files for the same quality", "vbr")
+        self.mode.addItem("Constant bitrate (CBR): the same bitrate for every second", "cbr")
+        self.mode.addItem("Not used by lossless codecs", "")
+        self.quality = QDoubleSpinBox()
+        self.quality_label = QLabel()
+        self.reset = QPushButton("Set to perceptually lossless")
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setObjectName("Muted")
+        self.folder = QLineEdit(folder)
+        browse = QPushButton("Browse\u2026")
+        browse.clicked.connect(self._browse)
+        frow = QHBoxLayout()
+        frow.addWidget(self.folder, 1)
+        frow.addWidget(browse)
+        qrow = QHBoxLayout()
+        qrow.addWidget(self.quality, 1)
+        qrow.addWidget(self.reset)
+        form.addRow("Codec", self.codec)
+        self.mode_label = QLabel("Bitrate mode")
+        form.addRow(self.mode_label, self.mode)
+        form.addRow(self.quality_label, qrow)
+        form.addRow("", self.hint)
+        form.addRow("Save to", frow)
+        lay.addLayout(form)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        ok = QPushButton("Rip")
+        cancel = QPushButton("Cancel")
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+        lay.addLayout(buttons)
+
+        codec = saved.get("codec", "flac")
+        self.codec.setCurrentIndex(max(0, self.codec.findData(codec)))
+        self._lossy_mode = "cbr" if saved.get("mode") == "cbr" else "vbr"  # remembered across lossless codecs
+        self._refresh(saved.get("quality") if saved.get("codec") == codec else None)
+        self.codec.currentIndexChanged.connect(lambda _i: self._refresh())
+        self.mode.currentIndexChanged.connect(lambda _i: self._mode_changed())
+        self.reset.clicked.connect(self._perceptual)
+
+    def _key(self):
+        codec = self.codec.currentData()
+        if codec in RIP_LOSSLESS:
+            return codec, ""
+        return codec, (self.mode.currentData() or self._lossy_mode)
+
+    def _mode_changed(self):
+        if self.mode.currentData():
+            self._lossy_mode = self.mode.currentData()
+        self._refresh()
+
+    def _refresh(self, value=None):
+        codec, mode = self._key()
+        lossless = codec in RIP_LOSSLESS
+        # Lossless codecs have no bitrate mode, so the row is hidden rather than shown as a dead control.
+        self.mode_label.setVisible(not lossless)
+        self.mode.setVisible(not lossless)
+        self.mode.blockSignals(True)
+        self.mode.setCurrentIndex(2 if lossless else self.mode.findData(mode))
+        self.mode.blockSignals(False)
+        spec = RIP_QUALITY.get((codec, mode))
+        self.quality.setEnabled(spec is not None)
+        self.reset.setEnabled((codec, mode) in RIP_PERCEPTUAL)
+        if spec is None:
+            self.quality_label.setText("Quality")
+            self.quality.setRange(0, 0)
+            self.quality.setValue(0)
+        else:
+            lo, hi, default, label, decimals = spec
+            self.quality.setDecimals(decimals)
+            self.quality.setRange(lo, hi)
+            self.quality.setSingleStep(0.1 if decimals else 1)
+            self.quality.setValue(default if value is None else value)
+            self.quality_label.setText(label)
+        if codec in RIP_LOSSLESS:
+            self.hint.setText(RIP_LOSSLESS_NOTE[codec])
+        else:
+            self.hint.setText(RIP_PERCEPTUAL[(codec, mode)][1])
+
+    def _perceptual(self):
+        codec, mode = self._key()
+        if (codec, mode) in RIP_PERCEPTUAL:
+            self.quality.setValue(RIP_PERCEPTUAL[(codec, mode)][0])
+
+    def _browse(self):
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Rip to folder", self.folder.text() or os.path.expanduser("~"),
+            options=DIRECTORY_DIALOG_OPTIONS)
+        if chosen:
+            self.folder.setText(chosen)
+
+    def settings(self):
+        codec, mode = self._key()
+        spec = RIP_QUALITY.get((codec, mode))
+        quality = None
+        if spec is not None:
+            quality = int(round(self.quality.value())) if spec[4] == 0 else round(self.quality.value(), spec[4])
+        return {"codec": codec, "mode": mode, "quality": quality, "folder": self.folder.text().strip()}
+
+
+class BurnDialog(QDialog):
+    """Burn to disc: the kind of disc, the drive, the write speed and the disc length."""
+
+    def __init__(self, drives, total_seconds, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Burn to disc")
+        self.setMinimumWidth(540)
+        self.total_seconds = total_seconds
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.kind = QComboBox()
+        self.kind.addItem("Audio CD (plays in any CD player)", "audio")
+        self.kind.addItem("Data disc (MP3, FLAC, Opus or the original files)", "data")
+        self.drive = QComboBox()
+        for node in drives:
+            self.drive.addItem(node, node)
+        self.speed = QComboBox()
+        self.length = QComboBox()
+        self.length.addItem("80 minutes", 80)
+        self.length.addItem("74 minutes", 74)
+        self.cdtext = QCheckBox("Write album and track names to the disc (CD-TEXT)")
+        self.cdtext.setChecked(True)
+        self.convert = QComboBox()
+        self.convert.addItem("Keep the files as they are", "")
+        self.convert.addItem("Convert to MP3 (about 200 kbps, V2)", "mp3")
+        self.convert.addItem("Convert to Opus (128 kbps)", "opus")
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setObjectName("Muted")
+        form.addRow("Disc", self.kind)
+        form.addRow("Drive", self.drive)
+        form.addRow("Write speed", self.speed)
+        form.addRow("Disc length", self.length)
+        form.addRow("", self.cdtext)
+        form.addRow("Files", self.convert)
+        form.addRow("", self.hint)
+        lay.addLayout(form)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        ok = QPushButton("Burn")
+        cancel = QPushButton("Cancel")
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok)
+        lay.addLayout(buttons)
+        self.drive.currentIndexChanged.connect(lambda _i: self._fill_speeds())
+        self.kind.currentIndexChanged.connect(lambda _i: self._refresh())
+        self.convert.currentIndexChanged.connect(lambda _i: self._refresh())
+        self._fill_speeds()
+        self._refresh()
+
+    def _fill_speeds(self):
+        previous = self.speed.currentData()
+        self.speed.clear()
+        for s in burn_speed_choices(burn_max_speed(self.drive.currentData())):
+            self.speed.addItem(f"{s}x", s)
+        if previous is not None and self.speed.findData(previous) >= 0:
+            self.speed.setCurrentIndex(self.speed.findData(previous))
+        else:
+            # default to the fastest speed up to 16x, which suits most blanks
+            fast = [i for i in range(self.speed.count()) if self.speed.itemData(i) <= 16]
+            self.speed.setCurrentIndex(fast[-1] if fast else 0)
+
+    def _refresh(self):
+        audio = self.kind.currentData() == "audio"
+        self.cdtext.setEnabled(audio)
+        self.convert.setEnabled(not audio)
+        if audio:
+            self.hint.setText(f"{fmt_time(self.total_seconds)} of music. Tracks are converted to CD audio "
+                               "(44.1 kHz, 16-bit, stereo) and split across discs at album breaks.")
+        else:
+            self.hint.setText("Files are written to a data disc (ISO 9660 with Joliet and Rock Ridge names). "
+                               "Most computers read these; many home and car CD players do not.")
+
+    def settings(self):
+        audio = self.kind.currentData() == "audio"
+        return {"kind": self.kind.currentData(), "device": self.drive.currentData(),
+                "speed": self.speed.currentData(), "minutes": self.length.currentData(),
+                "cdtext": audio and self.cdtext.isChecked(),
+                "convert": None if audio else (self.convert.currentData() or None)}
+
+
+class EditTagsDialog(QDialog):
+    """Track-by-track tag editor in the style of 'Edit track information'. The track list
+    is on the left; edits are kept per track and written only when Save is pressed."""
+
+    LABELS = [("title", "Title"), ("artist", "Artist"), ("album", "Album"),
+              ("albumartist", "Album artist"), ("composer", "Composer"),
+              ("genre", "Genre"), ("date", "Year"), ("tracknumber", "Track"),
+              ("discnumber", "Disc")]
+
+    def __init__(self, paths, library, parent=None):
+        super().__init__(parent)
+        self.paths = list(paths)
+        self.library = library
+        self.saved = []
+        self.originals = {p: read_tags(p) for p in self.paths}
+        self.edits = {p: {} for p in self.paths}
+        self.current = 0
+        self.setWindowTitle("Edit track information")
+        self.setMinimumWidth(720)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        body = QHBoxLayout()
+        self.track_list = QListWidget()
+        self.track_list.setMinimumWidth(240)
+        for p in self.paths:
+            self.track_list.addItem(os.path.basename(p))
+        self.track_list.currentRowChanged.connect(self._switch)
+        body.addWidget(self.track_list)
+
+        right = QVBoxLayout()
+        form = QFormLayout()
+        self.inputs = {}
+        for key, label in self.LABELS:
+            edit = QLineEdit()
+            edit.textEdited.connect(lambda text, k=key: self._record(k, text))
+            self.inputs[key] = edit
+            form.addRow(label, edit)
+        right.addLayout(form)
+        self.status = QLabel("")
+        self.status.setObjectName("Muted")
+        self.status.setWordWrap(True)
+        right.addWidget(self.status)
+        right.addStretch()
+        body.addLayout(right, 1)
+        lay.addLayout(body)
+
+        buttons = QHBoxLayout()
+        self.prev_btn = QPushButton("Previous")
+        self.prev_btn.clicked.connect(lambda: self.track_list.setCurrentRow(self.current - 1))
+        self.next_btn = QPushButton("Next")
+        self.next_btn.clicked.connect(lambda: self.track_list.setCurrentRow(self.current + 1))
+        buttons.addWidget(self.prev_btn)
+        buttons.addWidget(self.next_btn)
+        buttons.addStretch()
+        close = QPushButton("Close without saving")
+        close.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.setObjectName("Primary")
+        save.clicked.connect(self._save)
+        buttons.addWidget(close)
+        buttons.addWidget(save)
+        lay.addLayout(buttons)
+        self.track_list.setCurrentRow(0)
+
+    def _record(self, key, text):
+        self.edits[self.paths[self.current]][key] = text
+
+    def _switch(self, row):
+        if row < 0:
+            return
+        self.current = row
+        path = self.paths[row]
+        multi = len(self.paths) > 1
+        for key, _label in self.LABELS:
+            edit = self.inputs[key]
+            edit.blockSignals(True)
+            edit.setText(self.edits[path].get(key, self.originals[path].get(key, "")))
+            differ = multi and len({self.originals[p].get(key, "") for p in self.paths}) > 1
+            edit.setPlaceholderText("(different across songs)" if differ and key not in self.edits[path] else "")
+            edit.blockSignals(False)
+        self.prev_btn.setEnabled(row > 0)
+        self.next_btn.setEnabled(row < len(self.paths) - 1)
+        self.status.setText(f"Track {row + 1} of {len(self.paths)}: {os.path.basename(path)}")
+
+    def _save(self):
+        changed, failed = 0, 0
+        for path in self.paths:
+            values = self.edits[path]
+            if not values:
+                continue
+            try:
+                write_tags(path, values)
+                if self.library is not None:
+                    self.library.update_track(path)
+                changed += 1
+                self.saved.append(path)
+            except (OSError, ValueError):
+                failed += 1
+        note = f"Saved {changed} file(s)"
+        if failed:
+            note += f", {failed} failed"
+        if not changed and not failed:
+            self.status.setText("No changes to save")
+            self.accept()
+            return
+        self.status.setText(note)
+        if not failed:
+            self.accept()
+
+
+# ======================================================================
+# cover art: one right-click menu, used by the tag panel and the tags window
+# ======================================================================
+
+# a cut or copied cover, kept while the app runs so either window can paste it
+COVER_CLIPBOARD = {"data": None, "type": FRONT_COVER, "desc": DEFAULT_COVER_DESC}
+# "Correct aspect ratio": an adjusted cover keeps the picture's shape
+COVER_ASPECT = {"keep": True}
+
+
+def cover_pending(data=None, kind=FRONT_COVER, desc=DEFAULT_COVER_DESC):
+    """One cover edit held in memory until Save: bytes (None removes it), type, text."""
+    return {"data": data, "type": int(kind if kind is not None else FRONT_COVER),
+            "desc": DEFAULT_COVER_DESC if desc is None else desc}
+
+
+class AdjustCoverDialog(QDialog):
+    """mp3tag's "Adjust cover": re-encode, resize and re-shape one picture."""
+
+    FORMATS = ("Original", "JPEG", "PNG")
+    SIZE_MODES = ("max. size", "min. size")
+    SCALES = ("Scale proportionally", "Scale to square", "Crop to square")
+
+    def __init__(self, data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Adjust cover")
+        self._image = QImage()
+        self._image.loadFromData(data or b"")
+        self._mime = _image_mime(data or b"")
+        self._data = data
+
+        grid = QGridLayout(self)
+        grid.setContentsMargins(14, 12, 14, 12)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(9)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
+
+        grid.addWidget(QLabel("Format"), 0, 0)
+        grid.addWidget(QLabel("Quality"), 0, 1)
+        self.format = QComboBox()
+        self.format.addItems(self.FORMATS)
+        self.format.setCurrentText("PNG" if self._mime == "image/png" else
+                                   ("JPEG" if self._mime == "image/jpeg" else "Original"))
+        self.format.currentTextChanged.connect(self._format_changed)
+        grid.addWidget(self.format, 1, 0)
+        self.quality = QSlider(Qt.Horizontal)
+        self.quality.setRange(10, 100)
+        self.quality.setValue(90)
+        self.quality.valueChanged.connect(self._quality_label)
+        grid.addWidget(self.quality, 1, 1)
+        self.quality_text = QLabel("")
+        self.quality_text.setObjectName("Muted")
+        self.quality_text.setAlignment(Qt.AlignHCenter)
+        grid.addWidget(self.quality_text, 2, 1)
+
+        self.size_on = QCheckBox("Size")
+        self.size_on.setChecked(not self._image.isNull())
+        grid.addWidget(self.size_on, 2, 0)
+        size_row = QHBoxLayout()
+        size_row.setSpacing(6)
+        self.size_value = QSpinBox()
+        self.size_value.setRange(16, 4000)
+        self.size_value.setValue(max(16, min(4000, max(self._image.width(),
+                                                      self._image.height()) or 500)))
+        self.size_mode = QComboBox()
+        self.size_mode.addItems(self.SIZE_MODES)
+        size_row.addWidget(self.size_value, 1)
+        size_row.addWidget(self.size_mode, 1)
+        grid.addLayout(size_row, 3, 0, 1, 2)
+
+        self.scale_mode = QComboBox()
+        self.scale_mode.addItems(self.SCALES)
+        grid.addWidget(self.scale_mode, 4, 0, 1, 2)
+        if COVER_ASPECT["keep"]:
+            # the option in the cover menu asks for the shape to be kept
+            self.scale_mode.setCurrentText("Scale proportionally")
+            self.scale_mode.model().item(1).setEnabled(False)
+        self.size_on.toggled.connect(self.size_value.setEnabled)
+        self.size_value.setEnabled(self.size_on.isChecked())
+        self._format_changed()
+        self._quality_label()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        ok = QPushButton("OK")
+        ok.setObjectName("Primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        grid.addLayout(buttons, 5, 0, 1, 2)
+
+    def _format_changed(self, *_args):
+        # quality only means something for a lossy format
+        jpeg = self._target_format() == "JPEG"
+        self.quality.setEnabled(jpeg)
+        self._quality_label()
+
+    def _quality_label(self, *_args):
+        value = self.quality.value()
+        word = "High" if value >= 80 else ("Medium" if value >= 50 else "Low")
+        self.quality_text.setText(f"{word} \u00b7 {value}%" if self.quality.isEnabled() else "lossless")
+
+    def _target_format(self):
+        choice = self.format.currentText()
+        if choice == "Original":
+            return {"image/jpeg": "JPEG", "image/png": "PNG"}.get(self._mime, "PNG")
+        return choice
+
+    def _resized(self, img, size):
+        mode = self.scale_mode.currentText()
+        if mode == "Crop to square":
+            side = min(img.width(), img.height())
+            img = img.copy((img.width() - side) // 2, (img.height() - side) // 2, side, side)
+            return img.scaled(size, size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        if mode == "Scale to square":
+            return img.scaled(size, size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        # scale proportionally: the number is the short or the long side, whichever
+        w, h = img.width(), img.height()
+        if not w or not h:
+            return img
+        if self.size_mode.currentText().startswith("min"):
+            factor = max(size / min(w, h), 1.0)
+        else:
+            factor = size / max(w, h)
+        return img.scaled(max(1, round(w * factor)), max(1, round(h * factor)),
+                          Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+    def adjusted(self):
+        """The cover as the dialog describes it, or None when it cannot be written."""
+        img = QImage(self._image)
+        if img.isNull():
+            return None
+        if self.size_on.isChecked():
+            img = self._resized(img, max(16, self.size_value.value()))
+        fmt = self._target_format()
+        buf = QBuffer()
+        buf.open(QBuffer.WriteOnly)
+        quality = self.quality.value() if fmt == "JPEG" else -1
+        if not img.save(buf, fmt, quality):
+            return None
+        return bytes(buf.data())
+
+
+class CoverManagerDialog(QDialog):
+    """mp3tag's "Manage covers": the picture a file carries, and what to do with it."""
+
+    def __init__(self, menu, parent=None):
+        super().__init__(parent)
+        self.menu = menu
+        self.setWindowTitle("Manage covers")
+        self.setMinimumWidth(520)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Type", "Description", "Format", "Size"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setMinimumHeight(120)
+        lay.addWidget(self.table)
+        self.note = QLabel("")
+        self.note.setObjectName("Muted")
+        lay.addWidget(self.note)
+        buttons = QHBoxLayout()
+        for text, slot in (("Add\u2026", menu.add),
+                           ("Replace\u2026", menu.replace),
+                           ("Remove", menu.remove),
+                           ("Extract\u2026", menu.extract),
+                           ("Adjust\u2026", menu.adjust)):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(close)
+        lay.addLayout(buttons)
+        self.refresh()
+
+    def refresh(self):
+        if not self.menu.host_ready():
+            self.table.setRowCount(0)
+            self.note.setText("No file is selected.")
+            return
+        _path, data, kind, desc = self.menu.current()
+        self.table.setRowCount(1)
+        if data:
+            image = QImage()
+            image.loadFromData(data)
+            cells = [cover_type_name(kind), desc or "",
+                     _image_mime(data).split("/")[-1].upper(),
+                     f"{fmt_human_size(len(data))} \u00b7 {image.width()}\u00d7{image.height()}"]
+        else:
+            cells = ["", "No cover", "", ""]
+        for col, text in enumerate(cells):
+            item = QTableWidgetItem(text)
+            if not data:
+                item.setForeground(QBrush(QColor(MUTED)))
+            self.table.setItem(0, col, item)
+        self.note.setText("This build stores one cover per file, so adding replaces the one here."
+                          if data else "No cover is stored; add one above.")
+
+
+class CoverMenu:
+    """The cover right-click menu, the same in the tag panel and the tags window.
+
+    The window using it answers two questions: `cover_host()` for the picture it is
+    showing and `cover_store()` to keep an edit until Save. Neither window has to
+    know how the other holds its files.
+    """
+
+    def __init__(self, owner, host):
+        self.owner = owner
+        self.host = host
+        self.manager = None
+        self.actions = {}
+        self.types = {}
+        self._group = QActionGroup(owner)
+        self._group.setExclusive(True)
+        self._build()
+
+    # ---------- what the host is showing ----------
+    def host_ready(self):
+        return bool(self.host.cover_host()[0])
+
+    def current(self):
+        return self.host.cover_host()
+
+    def _store(self, data, kind, desc):
+        if not self.host_ready():
+            return
+        self.host.cover_store(cover_pending(data, kind, desc))
+        if self.manager is not None and self.manager.isVisible():
+            self.manager.refresh()
+
+    # ---------- menu ----------
+    def _action(self, key, text, slot, shortcut="", tip=""):
+        act = QAction(text, self.owner)
+        if shortcut:
+            act.setShortcut(QKeySequence(shortcut))
+            act.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+            self.owner.addAction(act)
+        if tip:
+            act.setToolTip(tip)
+        act.triggered.connect(lambda _checked=False, fn=slot: fn())
+        self.actions[key] = act
+        return act
+
+    def _build(self):
+        self._action("add", "Add cover\u2026", self.add, "Ctrl+Alt+A",
+                     "One cover per file: adding replaces the one already there")
+        self._action("remove", "Remove cover", self.remove)
+        self._action("replace", "Replace cover\u2026", self.replace)
+        self._action("extract", "Extract cover\u2026", self.extract)
+        self._action("adjust", "Adjust cover\u2026", self.adjust)
+        self._action("manage", "Manage covers\u2026", self.manage, "Ctrl+Alt+M")
+        self._action("desc", "Set cover description\u2026", self.set_description)
+        self._action("cut", "Cut cover", self.cut)
+        self._action("copy", "Copy cover", self.copy)
+        self._action("paste", "Paste cover", self.paste)
+        self.actions["aspect"] = self._action("aspect", "Correct aspect ratio", self.toggle_aspect,
+                                             tip="Keep the picture's shape when adjusting")
+        self.actions["aspect"].setCheckable(True)
+        self.actions["aspect"].setChecked(COVER_ASPECT["keep"])
+        for name, num in COVER_PICTURE_TYPES:
+            act = QAction(name, self.owner)
+            act.setCheckable(True)
+            act.triggered.connect(lambda _checked=False, n=num: self.set_type(n))
+            self._group.addAction(act)
+            self.types[num] = act
+
+    def menu(self):
+        self._sync()
+        menu = QMenu(self.owner)
+        menu.addAction(self.actions["add"])
+        menu.addAction(self.actions["remove"])
+        menu.addAction(self.actions["replace"])
+        menu.addAction(self.actions["extract"])
+        menu.addAction(self.actions["adjust"])
+        menu.addSeparator()
+        menu.addAction(self.actions["manage"])
+        menu.addSeparator()
+        sub = QMenu("Set cover type", menu)
+        for name, num in COVER_PICTURE_TYPES:
+            sub.addAction(self.types[num])
+        menu.addMenu(sub)
+        menu.addAction(self.actions["desc"])
+        menu.addSeparator()
+        menu.addAction(self.actions["cut"])
+        menu.addAction(self.actions["copy"])
+        menu.addAction(self.actions["paste"])
+        menu.addSeparator()
+        menu.addAction(self.actions["aspect"])
+        return menu
+
+    def popup(self, widget, pos):
+        self.menu().exec(widget.mapToGlobal(pos))
+
+    def _sync(self):
+        path, data, kind, _desc = self.current()
+        has = bool(data)
+        for key in ("remove", "replace", "extract", "adjust", "cut", "copy"):
+            self.actions[key].setEnabled(has)
+        for key in ("add", "manage", "paste"):
+            self.actions[key].setEnabled(bool(path) if key != "paste"
+                                         else bool(path and COVER_CLIPBOARD["data"]))
+        self.actions["desc"].setEnabled(has)
+        for num, act in self.types.items():
+            act.setEnabled(has)
+            act.setChecked(has and int(kind or 0) == num)
+        self.actions["aspect"].setChecked(COVER_ASPECT["keep"])
+
+    # ---------- actions ----------
+    def _pick_image(self):
+        path = self.current()[0]
+        name, _ = QFileDialog.getOpenFileName(
+            self.owner, "Add cover", os.path.dirname(path) or "",
+            "Images (*.jpg *.jpeg *.png *.gif *.bmp *.webp)",
+            options=FILE_DIALOG_OPTIONS)
+        if not name:
+            return None
+        try:
+            with open(name, "rb") as f:
+                return f.read()
+        except OSError as e:
+            QMessageBox.warning(self.owner, "Cover", str(e))
+            return None
+
+    def add(self):
+        _path, data, kind, desc = self.current()
+        if not _path:
+            return
+        picked = self._pick_image()
+        if picked is None:
+            return
+        if not QImage().loadFromData(picked):
+            QMessageBox.warning(self.owner, "Cover", "That file is not a readable image.")
+            return
+        # a first picture is a front cover; one that replaces another keeps its role
+        if data:
+            self._store(picked, kind, desc)
+        else:
+            self._store(picked, FRONT_COVER, DEFAULT_COVER_DESC)
+
+    def replace(self):
+        _path, _data, kind, desc = self.current()
+        picked = self._pick_image()
+        if picked is None:
+            return
+        if not QImage().loadFromData(picked):
+            QMessageBox.warning(self.owner, "Cover", "That file is not a readable image.")
+            return
+        self._store(picked, kind, desc)
+
+    def remove(self):
+        _path, _data, kind, desc = self.current()
+        self._store(None, kind, desc)
+
+    def extract(self):
+        path, data, kind, desc = self.current()
+        if not data:
+            return
+        ext = ".png" if _image_mime(data) == "image/png" else ".jpg"
+        stem = (desc or cover_type_name(kind) or "cover").strip().replace("/", "-")
+        target, _ = QFileDialog.getSaveFileName(
+            self.owner, "Extract cover",
+            os.path.join(os.path.dirname(path) or "", stem + ext),
+            "Images (*.jpg *.jpeg *.png)", options=FILE_DIALOG_OPTIONS)
+        if not target:
+            return
+        try:
+            with open(target, "wb") as f:
+                f.write(data)
+        except OSError as e:
+            QMessageBox.warning(self.owner, "Extract cover", str(e))
+
+    def adjust(self):
+        _path, data, kind, desc = self.current()
+        if not data:
+            return
+        dialog = AdjustCoverDialog(data, self.owner)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        adjusted = dialog.adjusted()
+        if not adjusted:
+            QMessageBox.warning(self.owner, "Adjust cover", "The picture could not be written.")
+            return
+        self._store(adjusted, kind, desc)
+
+    def manage(self):
+        if not self.host_ready():
+            return
+        if self.manager is None:
+            self.manager = CoverManagerDialog(self, self.owner)
+        self.manager.refresh()
+        self.manager.exec()
+
+    def set_type(self, kind):
+        _path, data, _kind, desc = self.current()
+        self._store(data, kind, desc)
+
+    def set_description(self):
+        _path, data, kind, desc = self.current()
+        if not data:
+            return
+        text, ok = QInputDialog.getText(self.owner, "Set cover description",
+                                        "Description:", text=desc or "")
+        if ok:
+            self._store(data, kind, text)
+
+    def copy(self):
+        _path, data, kind, desc = self.current()
+        if not data:
+            return
+        COVER_CLIPBOARD.update({"data": data, "type": kind, "desc": desc})
+
+    def cut(self):
+        self.copy()
+        if COVER_CLIPBOARD["data"]:
+            _path, _data, kind, desc = self.current()
+            self._store(None, kind, desc)
+
+    def paste(self):
+        if not COVER_CLIPBOARD["data"]:
+            return
+        _path, _data, _kind, _desc = self.current()
+        self._store(COVER_CLIPBOARD["data"], COVER_CLIPBOARD["type"], COVER_CLIPBOARD["desc"])
+
+    def toggle_aspect(self):
+        COVER_ASPECT["keep"] = self.actions["aspect"].isChecked()
+
+
+class ExtendedTagsDialog(QDialog):
+    """Every tag on a file in one list, the way mp3tag's extended-tags window shows it.
+
+    The nine core fields and the format's free-form keys sit in the same table, so a
+    tag stored outside the core set can be read, changed, added or removed in one
+    place. Edits stay in the `entries` this dialog was handed; the caller applies
+    them (the Tags tab keeps them in memory until Save, as it does for every edit).
+    """
+
+    CORE = ["title", "artist", "album", "albumartist", "composer", "genre",
+            "date", "tracknumber", "discnumber", "comment"]
+
+    def __init__(self, entries, start=0, parent=None):
+        super().__init__(parent)
+        self.entries = entries
+        self.current = min(max(int(start), 0), len(entries) - 1) if entries else 0
+        self._added = {i: set() for i in range(len(entries))}
+        self.setMinimumSize(780, 480)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+
+        head = QHBoxLayout()
+        heading = QLabel("Metadata")
+        heading.setObjectName("Heading")
+        self.position = QLabel("")
+        self.position.setObjectName("Muted")
+        head.addWidget(heading)
+        head.addStretch(1)
+        head.addWidget(self.position)
+        lay.addLayout(head)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Tag", "Value"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(23)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked
+                                   | QAbstractItemView.EditKeyPressed)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 170)
+        self.table.itemChanged.connect(self._edited)
+        self.table.itemDoubleClicked.connect(lambda _it: self._edit())
+        body.addWidget(self.table, 1)
+
+        keys = QVBoxLayout()
+        keys.setSpacing(4)
+        self.add_btn = QPushButton("\uff0b")
+        self.add_btn.setToolTip("Add a tag")
+        self.add_btn.setFixedWidth(38)
+        self.add_btn.clicked.connect(self._add)
+        self.edit_btn = QPushButton("\u270e")
+        self.edit_btn.setToolTip("Edit the selected value")
+        self.edit_btn.setFixedWidth(38)
+        self.edit_btn.clicked.connect(self._edit)
+        self.del_btn = QPushButton("\u2715")
+        self.del_btn.setToolTip("Remove the selected tag")
+        self.del_btn.setFixedWidth(38)
+        self.del_btn.clicked.connect(self._remove)
+        for b in (self.add_btn, self.edit_btn, self.del_btn):
+            keys.addWidget(b)
+        keys.addStretch(1)
+        body.addLayout(keys)
+
+        cover_box = QVBoxLayout()
+        cover_box.setSpacing(6)
+        cover_head = QLabel("Cover")
+        cover_head.setObjectName("FieldLabel")
+        self.cover = QLabel("\u266a")
+        self.cover.setObjectName("TagCover")
+        self.cover.setFixedSize(220, 220)
+        self.cover.setAlignment(Qt.AlignCenter)
+        self.cover.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.cover_menu = CoverMenu(self, self)
+        self.cover.customContextMenuRequested.connect(
+            lambda pos: self.cover_menu.popup(self.cover, pos))
+        self.cover.setToolTip("Right-click for cover actions")
+        self._covers = {}
+        self.cover_info = QLabel("")
+        self.cover_info.setObjectName("Muted")
+        self.cover_info.setAlignment(Qt.AlignHCenter)
+        cover_box.addWidget(cover_head)
+        cover_box.addWidget(self.cover, 0, Qt.AlignHCenter)
+        cover_box.addWidget(self.cover_info)
+        cover_box.addStretch(1)
+        body.addLayout(cover_box)
+        lay.addLayout(body, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.ok_btn = QPushButton("OK")
+        self.ok_btn.setObjectName("Primary")
+        self.ok_btn.setDefault(True)
+        self.ok_btn.clicked.connect(self.accept)
+        self.prev_btn = QPushButton("\u2039\u2039")
+        self.prev_btn.setToolTip("Previous file")
+        self.prev_btn.clicked.connect(lambda: self._switch(-1))
+        self.next_btn = QPushButton("\u203a\u203a")
+        self.next_btn.setToolTip("Next file")
+        self.next_btn.clicked.connect(lambda: self._switch(1))
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        for b in (self.ok_btn, self.prev_btn, self.next_btn, cancel):
+            buttons.addWidget(b)
+        lay.addLayout(buttons)
+        self._refresh()
+
+    # ---------- state ----------
+    def tags(self):
+        return self.entries[self.current]["tags"] if self.entries else {}
+
+    def keys(self, tags=None):
+        """Rows to show: core fields first, then the format's own keys."""
+        tags = self.tags() if tags is None else tags
+        core = [k for k in self.CORE if str(tags.get(k, "") or "").strip()]
+        lowered = {k.lower() for k in self.CORE}
+        extra = [k for k in tags
+                 if k.lower() not in lowered and str(tags.get(k, "") or "").strip()]
+        extra.sort(key=str.lower)
+        for key in sorted(self._added.get(self.current, ()), key=str.lower):
+            if key not in extra and key.lower() not in lowered:
+                extra.append(key)
+        return core + extra
+
+    def set_tag(self, key, value):
+        """Set one tag on the current file (core name or free-form key)."""
+        key = (key or "").strip()
+        if not key or not self.entries:
+            return
+        canonical = key.lower() if key.lower() in self.CORE else key
+        self.tags()[canonical] = value
+        self._added[self.current].add(canonical)
+        self._refresh()
+
+    def remove_keys(self, keys):
+        if not self.entries:
+            return
+        tags = self.tags()
+        for key in keys:
+            if key is None:
+                continue
+            tags[key] = ""
+            self._added[self.current].discard(key)
+        self._refresh()
+
+    # ---------- ui ----------
+    def _refresh(self):
+        entry = self.entries[self.current] if self.entries else {}
+        path = entry.get("path", "")
+        total = len(self.entries)
+        if entry.get("multi"):
+            count = len(entry.get("paths") or [])
+            self.setWindowTitle(f"Tags \u2014 {count} files")
+            self.position.setText(f"{count} files selected")
+        else:
+            self.setWindowTitle("Tags" + (f" \u2014 {tag_label(path)}" if path else ""))
+            self.position.setText(
+                f"{os.path.basename(path)}   \u00b7   file {self.current + 1} of {total}"
+                if path else "No file")
+        tags = self.tags()
+        keys = self.keys(tags)
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(keys))
+        for row, key in enumerate(keys):
+            key_item = QTableWidgetItem(key.upper() if key.lower() in self.CORE else key)
+            key_item.setData(Qt.UserRole, key)
+            key_item.setFlags(key_item.flags() & ~Qt.ItemIsEditable)
+            value_item = QTableWidgetItem(str(tags.get(key, "") or ""))
+            self.table.setItem(row, 0, key_item)
+            self.table.setItem(row, 1, value_item)
+        self.table.blockSignals(False)
+        self.prev_btn.setEnabled(self.current > 0)
+        self.next_btn.setEnabled(self.current < total - 1)
+        self._fill_cover(path)
+
+    def _fill_cover(self, path):
+        entry = self.entries[self.current] if self.entries else {}
+        if entry.get("cover_variants"):
+            self.cover.setPixmap(QPixmap())
+            self.cover.setText("\u266b")
+            self.cover_info.setText("Cover varies")
+            return
+        data, kind, desc = self.cover_host()[1:]
+        pm = QPixmap()
+        if data and pm.loadFromData(data):
+            self.cover.setPixmap(pm.scaled(220, 220, Qt.KeepAspectRatio,
+                                           Qt.SmoothTransformation))
+            role = cover_type_name(kind)
+            if desc and desc != role:
+                role += f"  \u00b7  {desc}"
+            self.cover_info.setText(f"{_image_mime(data)}  \u00b7  {pm.width()}\u00d7{pm.height()}\n"
+                                    f"{fmt_human_size(len(data))}  \u00b7  {role}")
+        elif data:
+            self.cover.setPixmap(QPixmap())
+            self.cover.setText("\u266a")
+            self.cover_info.setText("A cover is embedded but could not be read")
+        else:
+            self.cover.setPixmap(QPixmap())
+            self.cover.setText("\u266a")
+            self.cover_info.setText("No cover")
+
+    def _current_cover(self, path):
+        rec = self._covers.get(path)
+        if rec is not None:
+            return rec.get("data")
+        return read_cover(path) if path else None
+
+    # ---------- cover menu host ----------
+    def cover_host(self):
+        """(path, bytes, picture type, description) of the file on screen."""
+        entry = self.entries[self.current] if self.entries else {}
+        path = entry.get("path", "")
+        rec = self._covers.get(path)
+        if rec is not None:
+            return path, rec.get("data"), rec.get("type", FRONT_COVER), rec.get("desc", DEFAULT_COVER_DESC)
+        if entry.get("multi") and "cover" in entry:
+            return path, entry.get("cover"), FRONT_COVER, DEFAULT_COVER_DESC
+        if not path:
+            return "", None, FRONT_COVER, DEFAULT_COVER_DESC
+        data, kind, desc = read_cover_details(path)
+        return path, data, kind, desc
+
+    def cover_store(self, record):
+        """Keep a cover edit until Save, like every other edit this dialog makes."""
+        if not self.entries:
+            return
+        entry = self.entries[self.current]
+        paths = entry.get("paths") or [entry.get("path", "")]
+        for path in paths:
+            if path:
+                self._covers[path] = record
+        if entry.get("multi"):
+            entry["cover"] = record.get("data")
+            entry["cover_variants"] = False
+        self._fill_cover(paths[0] if paths else "")
+
+    def pending_covers(self):
+        """Cover edits made in this dialog: path -> {data, type, desc}."""
+        return dict(self._covers)
+
+    def _select_key(self, key):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None and item.data(Qt.UserRole) == key:
+                self.table.clearSelection()
+                self.table.selectRow(row)
+                self.table.scrollToItem(item)
+                return
+
+    def _switch(self, delta):
+        target = self.current + delta
+        if 0 <= target < len(self.entries):
+            self.current = target
+            self._refresh()
+
+    # ---------- actions ----------
+    def _edited(self, item):
+        if item is None or item.column() != 1:
+            return
+        key_item = self.table.item(item.row(), 0)
+        if key_item is None or not self.entries:
+            return
+        self.tags()[key_item.data(Qt.UserRole)] = item.text()
+
+    def _edit(self):
+        if not self.entries or not self.table.rowCount():
+            return
+        row = self.table.currentRow()
+        if row < 0:
+            row = 0
+        self.table.setCurrentCell(row, 1)
+        item = self.table.item(row, 1)
+        if item is not None:
+            self.table.editItem(item)
+
+    def _add(self):
+        if not self.entries:
+            return
+        tags = self.tags()
+        names = [k.upper() for k in self.CORE]
+        names += sorted({str(k) for k in tags if k.lower() not in self.CORE}, key=str.lower)
+        name, ok = QInputDialog.getItem(self, "Add tag", "Tag name:", names, 0, True)
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        canonical = name.lower() if name.lower() in self.CORE else name
+        value, ok = QInputDialog.getText(self, "Add tag", f"Value for {name}:",
+                                         text=str(tags.get(canonical, "") or ""))
+        if not ok:
+            return
+        self.set_tag(canonical, value)
+        self._select_key(canonical)
+
+    def _remove(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        keys = [self.table.item(r, 0).data(Qt.UserRole) for r in rows
+                if self.table.item(r, 0) is not None]
+        if keys:
+            self.remove_keys(keys)
+
+
+class LibraryTab(QWidget):
+    # the set of music folders (or the scan result behind them) changed
+    folders_changed = Signal()
+
+    def __init__(self, library, config, player, playlists, smart_store, parent=None):
+        super().__init__(parent)
+        self.library = library
+        self.config = config
+        self.player = player
+        self.playlists = playlists
+        self.smart = smart_store
+        self.cover_cache = {}
+        self.cover_pix_cache = {}
+        self.columns = []
+        self.details = True
+        self.lib_sort = None
+        self._rows = []
+        self.undo_stack = []
+        self.redo_stack = []
+        self.current_playlist = None
+        self.queue_title_extra = ""
+
+        self.setObjectName("Panel")
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_collection_page())
+        self.pages.addWidget(self._build_playlists_page())
+        self.pages.addWidget(self._build_smart_page())
+        self.pages.currentChanged.connect(self._page_changed)
+        self.strip = self._build_strip()
+
+        left = QWidget()
+        left.setObjectName("Panel")
+        left.setMinimumWidth(320)
+        left.setMaximumWidth(1400)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
+        ll.addWidget(self.pages)
+
+        self.split = QSplitter()
+        self.split.setObjectName("Panel")
+        self.split.addWidget(left)
+        self.split.addWidget(self._build_queue_page())
+        self.split.setChildrenCollapsible(False)
+        self.split.setStretchFactor(0, 0)
+        self.split.setStretchFactor(1, 1)
+        sizes = config.get("split") or [760, 640]
+        self.split.setSizes(sizes)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.strip)
+        lay.addWidget(self.split, 1)
+
+        self._search_timer = QTimer(self, singleShot=True, interval=250, timeout=self.refresh)
+        self.search.textChanged.connect(self._search_timer.start)
+        self.player.track_changed.connect(self._highlight)
+        self.player.queue_changed.connect(self.rebuild_queue)
+        self.player.index_changed.connect(self._on_index_changed)
+        self._queue_save_timer = QTimer(self, singleShot=True, interval=800,
+                                        timeout=self._save_queue_state)
+        self.player.queue_changed.connect(self._queue_save_timer.start)
+
+        self.reload_collections()
+        self.refresh()
+        self.reload_playlists()
+        self.reload_smart()
+        self.rebuild_queue()
+        # notice folders that disappear (unmounted or deleted) without a restart
+        self._last_count = self.library.count()
+        self._scan_silent = False
+        self._rg_worker = None
+        self._rg_bar = None
+        self._folder_timer = QTimer(self, interval=30000, timeout=self._auto_rescan)
+        self._folder_timer.start()
+
+    # ---------------- chrome ----------------
+    def _build_strip(self):
+        strip = QWidget()
+        strip.setObjectName("Strip")
+        strip.setFixedWidth(46)
+        lay = QVBoxLayout(strip)
+        lay.setContentsMargins(0, 6, 0, 6)
+        lay.setSpacing(2)
+        self.strip_buttons = {}
+        for key, tip in (("collection", "Collection"), ("playlists", "Playlists"),
+                         ("smart", "Smart playlists")):
+            b = QToolButton()
+            b.setIcon(strip_icon(key))
+            b.setIconSize(QSize(24, 24))
+            b.setObjectName("StripButton")
+            b.setCheckable(True)
+            b.setFixedSize(44, 42)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _checked=False, k=key: self.set_view(k))
+            lay.addWidget(b)
+            self.strip_buttons[key] = b
+        lay.addStretch()
+        self.set_view(self.config.get("view", "collection"))
+        return strip
+
+    def set_view(self, key):
+        order = ["collection", "playlists", "smart"]
+        if key not in order:
+            key = "collection"
+        self.config["view"] = key
+        self.pages.setCurrentIndex(order.index(key))
+        for k, b in self.strip_buttons.items():
+            b.setChecked(k == key)
+
+    def _page_changed(self, _i):
+        key = ["collection", "playlists", "smart"][self.pages.currentIndex()]
+        for k, b in self.strip_buttons.items():
+            b.setChecked(k == key)
+        self.config["view"] = key
+
+    def _build_collection_page(self):
+        page = QWidget()
+        page.setObjectName("Panel")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 6, 6, 0)
+        lay.setSpacing(4)
+
+        search_box = QFrame()
+        search_box.setObjectName("SearchBox")
+        box = QHBoxLayout(search_box)
+        box.setContentsMargins(2, 1, 1, 1)
+        box.setSpacing(0)
+
+        self.search = QLineEdit()
+        self.search.setObjectName("SearchInput")
+        self.search.setPlaceholderText("Enter search terms here…")
+        self.search.setClearButtonEnabled(False)
+        self.search.setToolTip(FILTER_HELP)
+        self.search_clear = QToolButton()
+        self.search_clear.setText("✕")
+        self.search_clear.setToolTip("Clear search")
+        self.search_clear.setCursor(Qt.PointingHandCursor)
+        self.search_clear.setFixedWidth(22)
+        self.search_clear.clicked.connect(self.search.clear)
+
+        self.wrench = QToolButton()
+        self.wrench.setIcon(gear_icon())
+        self.wrench.setToolTip("Library options")
+        self.wrench.setPopupMode(QToolButton.InstantPopup)
+        self.library_menu = QMenu(self)
+        self.wrench.setMenu(self.library_menu)
+        self._build_library_menu()
+
+        self.fold_btn = QToolButton()
+        self.fold_btn.setText("\u21d5")
+        self.fold_btn.setCursor(Qt.PointingHandCursor)
+        self.fold_btn.setToolTip("Open or close folders")
+        self.fold_btn.setPopupMode(QToolButton.InstantPopup)
+        fold_menu = QMenu(self.fold_btn)
+        self.fold_actions = {}
+        for label, mode in (("Open all", "all"),
+                            ("Open letter markers only", "letters"),
+                            ("Close all", "none")):
+            action = fold_menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked=False, m=mode: self._fold_all(m))
+            self.fold_actions[mode] = action
+        self.fold_btn.setMenu(fold_menu)
+        self._fold_menu_sync()
+
+        box.addWidget(self.search_clear)
+        box.addWidget(self.search, 1)
+        box.addWidget(self.fold_btn)
+        box.addWidget(self.wrench)
+        lay.addWidget(search_box)
+        self.search.textChanged.connect(
+            lambda text: self.search_clear.setVisible(bool(text.strip())))
+        self.search_clear.setVisible(False)
+
+        self.filter_hint = QLabel("")
+        self.filter_hint.setObjectName("Muted")
+        self.filter_hint.setWordWrap(True)
+        lay.addWidget(self.filter_hint)
+
+        row = QHBoxLayout()
+        row.setSpacing(3)
+        self.collection_combo = QComboBox()
+        self.collection_combo.setToolTip("Collection")
+        self.collection_combo.setMinimumWidth(92)
+        self.collection_combo.setMaximumWidth(190)
+        self.collection_combo.currentIndexChanged.connect(self._collection_selected)
+        row.addWidget(self.collection_combo)
+        row.addWidget(QLabel("Group"))
+        self.grouping = QComboBox()
+        for key, label in GROUPINGS:
+            self.grouping.addItem(label, key)
+        if self.grouping.findData("custom") < 0:
+            self.grouping.addItem("Custom grouping", "custom")
+        self.grouping.setCurrentIndex(
+            max(self.grouping.findData(self.config.get("grouping", "artist_album")), 0))
+        self.grouping.setToolTip("Grouping presets — the … button opens the three-level dialog")
+        self.grouping.currentIndexChanged.connect(self._grouping_changed)
+        row.addWidget(self.grouping, 1)
+        group_btn = QToolButton()
+        group_btn.setText("…")
+        group_btn.setToolTip("Group by… (three levels and saved groupings)")
+        group_btn.clicked.connect(self.open_group_by)
+        row.addWidget(group_btn)
+        self.list_btn = QToolButton()
+        self.list_btn.setText("List")
+        self.list_btn.setCheckable(True)
+        self.list_btn.setChecked(self.config.get("lib_mode", "list") != "covers")
+        self.list_btn.setToolTip("Details list")
+        self.list_btn.clicked.connect(lambda: self.set_library_mode("list"))
+        self.covers_btn = QToolButton()
+        self.covers_btn.setText("Covers")
+        self.covers_btn.setCheckable(True)
+        self.covers_btn.setChecked(self.config.get("lib_mode", "list") == "covers")
+        self.covers_btn.setToolTip("Album cover grid")
+        self.covers_btn.clicked.connect(lambda: self.set_library_mode("covers"))
+        row.addWidget(self.list_btn)
+        row.addWidget(self.covers_btn)
+        lay.addLayout(row)
+
+        self.tree = LibraryTree()
+        self.tree.setHeaderHidden(True)
+        self.tree.setIconSize(QSize(18, 18))
+        self.tree.setIndentation(18)
+        self.tree.setItemDelegate(DividerDelegate(self.tree))
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
+        self.tree.itemDoubleClicked.connect(self._tree_double)
+        self.tree.middle_clicked.connect(self._tree_middle)
+        self.tree.setToolTip("Double-click to add to the queue; use the arrow to open a group")
+        header = self.tree.header()
+        header.setSectionsClickable(True)
+        header.setStretchLastSection(False)
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._header_menu)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionsMovable(True)
+        header.sectionMoved.connect(self._columns_moved)
+        header.sectionClicked.connect(self._sort_by_column)
+
+        self.covers = QListWidget()
+        self.covers.setViewMode(QListWidget.IconMode)
+        self.covers.setIconSize(QSize(120, 120))
+        self.covers.setGridSize(QSize(168, 202))
+        self.covers.setResizeMode(QListWidget.Adjust)
+        self.covers.setMovement(QListWidget.Static)
+        self.covers.setWordWrap(True)
+        self.covers.setUniformItemSizes(True)
+        self.covers.setSpacing(6)
+        self.covers.itemClicked.connect(self._covers_click)
+        self.covers.itemDoubleClicked.connect(self._covers_double)
+        self.covers.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.covers.customContextMenuRequested.connect(self._covers_menu)
+        self.covers.setToolTip("Click an album to open it, double-click to queue it")
+        # a click opens the album, but only once it cannot still become a double-click
+        self._cover_pending = None
+        self._cover_click_timer = QTimer(self)
+        self._cover_click_timer.setSingleShot(True)
+        self._cover_click_timer.setInterval(max(120, QApplication.doubleClickInterval()))
+        self._cover_click_timer.timeout.connect(self._open_pending_cover)
+        self._album_focus = None
+
+        # what an opened album shows: its name and the way back to the grid
+        self.album_bar = QWidget()
+        self.album_bar.setObjectName("AlbumBar")
+        album_row = QHBoxLayout(self.album_bar)
+        album_row.setContentsMargins(2, 0, 2, 2)
+        album_row.setSpacing(8)
+        self.album_back = QToolButton()
+        self.album_back.setObjectName("AlbumBack")
+        self.album_back.setText("\u2039 Albums")
+        self.album_back.setCursor(Qt.PointingHandCursor)
+        self.album_back.setToolTip("Back to the album covers")
+        self.album_back.clicked.connect(self.close_album)
+        self.album_title = QLabel("")
+        self.album_title.setObjectName("Heading")
+        album_row.addWidget(self.album_back)
+        album_row.addWidget(self.album_title, 1)
+        self.album_bar.hide()
+        lay.addWidget(self.album_bar)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.tree)
+        self.stack.addWidget(self.covers)
+        lay.addWidget(self.stack, 1)
+
+        self.scan_bar = QProgressBar()
+        self.scan_bar.hide()
+        lay.addWidget(self.scan_bar)
+        self.tree_status = QLabel("")
+        self.tree_status.setObjectName("Muted")
+        lay.addWidget(self.tree_status)
+        return page
+
+    def _build_playlists_page(self):
+        page = QWidget()
+        page.setObjectName("Panel")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+        head = QLabel("Playlists")
+        head.setObjectName("Heading")
+        lay.addWidget(head)
+        hint = QLabel("Double-click to add a playlist to the queue")
+        hint.setObjectName("Muted")
+        lay.addWidget(hint)
+        self.playlist_list = QListWidget()
+        self.playlist_list.itemDoubleClicked.connect(self._playlist_double)
+        self.playlist_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.playlist_list.customContextMenuRequested.connect(self._playlist_menu)
+        lay.addWidget(self.playlist_list, 1)
+        row = QHBoxLayout()
+        for text, fn in (("New", self.new_playlist), ("Import…", self.import_playlist),
+                         ("Rename", self.rename_playlist), ("Delete", self.delete_playlist)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+        add = QPushButton("Add selected playlist to queue")
+        add.clicked.connect(self.add_playlist_to_queue)
+        lay.addWidget(add)
+        return page
+
+    def _build_smart_page(self):
+        page = QWidget()
+        page.setObjectName("Panel")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+        head = QLabel("Smart playlists")
+        head.setObjectName("Heading")
+        lay.addWidget(head)
+        hint = QLabel("Live queries that update with your library")
+        hint.setObjectName("Muted")
+        lay.addWidget(hint)
+        self.smart_list = QListWidget()
+        self.smart_list.itemDoubleClicked.connect(self._smart_double)
+        self.smart_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.smart_list.customContextMenuRequested.connect(self._smart_menu)
+        lay.addWidget(self.smart_list, 1)
+        row = QHBoxLayout()
+        for text, fn in (("New rule…", self.new_smart), ("Edit…", self.edit_smart),
+                         ("Delete", self.delete_smart)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+        add = QPushButton("Add selected smart playlist to queue")
+        add.clicked.connect(self.add_smart_to_queue)
+        lay.addWidget(add)
+        return page
+
+    def _build_queue_page(self):
+        page = QWidget()
+        page.setObjectName("Panel")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(4, 6, 6, 1)
+        lay.setSpacing(3)
+
+        self.queue_title = QLabel("Queue")
+        self.queue_title.setObjectName("Heading")
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.setFixedSize(54, 26)
+        self.undo_btn.setToolTip("Undo queue change")
+        self.undo_btn.clicked.connect(self.undo)
+        self.undo_btn.setEnabled(False)
+        self.redo_btn = QPushButton("Redo")
+        self.redo_btn.setFixedSize(54, 26)
+        self.redo_btn.setToolTip("Redo queue change")
+        self.redo_btn.clicked.connect(self.redo)
+        self.redo_btn.setEnabled(False)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(3)
+        toolbar.addWidget(self.queue_title)
+        toolbar.addSpacing(6)
+        toolbar.addWidget(self.undo_btn)
+        toolbar.addWidget(self.redo_btn)
+        toolbar.addStretch()
+        for text, tip, fn, width in (("+", "Add files to the queue", self.add_files_dialog, 28),
+                                     ("−", "Remove selected queue tracks", self.remove_selected, 28),
+                                     ("×", "Clear queue", self.clear_queue, 28),
+                                     ("Save", "Save queue as playlist", self.save_playlist, 52)):
+            b = QPushButton(text)
+            b.setFixedSize(width, 26)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            toolbar.addWidget(b)
+        playlists_btn = QToolButton()
+        playlists_btn.setText("Playlists ▾")
+        playlists_btn.setPopupMode(QToolButton.InstantPopup)
+        self.queue_menu = QMenu(self)
+        playlists_btn.setMenu(self.queue_menu)
+        toolbar.addWidget(playlists_btn)
+        lay.addLayout(toolbar)
+
+        self.table = QueueTable(0, len(QUEUE_COLS))
+        self.table.setHorizontalHeaderLabels(QUEUE_COLS)
+        header = self.table.horizontalHeader()
+        header.setMinimumSectionSize(40)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        for col, width in enumerate(QUEUE_WIDTHS):
+            self.table.setColumnWidth(col, width)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionsClickable(True)
+        header.setToolTip("Click a column to sort the queue — drag rows to reorder")
+        header.sectionClicked.connect(self._sort_queue)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(23)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._queue_menu)
+        self.table.cellDoubleClicked.connect(lambda row, _c: self.play_row(row))
+        self.table.row_moved.connect(self._move_row)
+        self.table.files_dropped.connect(self._add_dropped)
+        lay.addWidget(self.table, 1)
+
+        self.queue_status = QLabel("0 tracks · 0:00")
+        self.queue_status.setObjectName("Muted")
+        lay.addWidget(self.queue_status)
+        return page
+
+    # ---------------- library tree ----------------
+    def grouping_levels(self):
+        key = self.config.get("grouping", "artist_album")
+        if key == "custom":
+            levels = [k for k in (self.config.get("grouping_levels") or []) if k in LIB_GROUP_LABEL]
+            return levels or ["artist", "album"]
+        return list(GROUPING_LEVELS.get(key, ["artist", "album"]))
+
+    def _grouping_changed(self, _i):
+        key = self.grouping.currentData()
+        if not key:
+            return
+        self.config["grouping"] = key
+        if key != "custom":
+            self.config["grouping_levels"] = list(GROUPING_LEVELS.get(key, ["artist", "album"]))
+        save_config(self.config)
+        self.refresh()
+
+    def set_library_mode(self, mode):
+        if getattr(self, "_album_focus", None):
+            self._album_focus = None
+            self.album_bar.hide()
+        self.config["lib_mode"] = "covers" if mode == "covers" else "list"
+        if hasattr(self, "list_btn"):
+            self.list_btn.setChecked(self.config["lib_mode"] == "list")
+            self.covers_btn.setChecked(self.config["lib_mode"] == "covers")
+        if hasattr(self, "stack"):
+            self.stack.setCurrentWidget(self.covers if self.config["lib_mode"] == "covers"
+                                        else self.tree)
+        if self.config["lib_mode"] == "covers" and not self.covers.count():
+            self._build_covers(getattr(self, "_rows", []), self.grouping_levels())
+
+    def _va_sets(self, rows):
+        sets = {}
+        for row in rows:
+            sets.setdefault(row["album"] or "Unknown album", set()).add(
+                (row["artist"] or "").strip())
+        return {k: {a for a in v if a} for k, v in sets.items()}
+
+    @staticmethod
+    def _album_label(row):
+        return (row["album"] or "").strip() or "Unknown album"
+
+    @staticmethod
+    def _album_year(rows):
+        year = (rows[0]["date"] or "").strip()[:4] if rows else ""
+        return year if year.isdigit() else ""
+
+    def _group_info(self, level, row, sets):
+        """(sort key, label, kind) for one row at one grouping level."""
+        if level in ("artist", "albumartist"):
+            key = "artist" if level == "artist" else "albumartist"
+            name = (row[key] or "").strip()
+            distinct = sets.get(row["album"] or "Unknown album", set())
+            if not name or (level == "artist" and not (row["albumartist"] or "").strip()
+                            and len(distinct) > 1):
+                name = ("Various Artists" if len(distinct) > 1
+                        else (row["artist"] or "Unknown artist").strip() or "Unknown artist")
+            return name.lower(), name, "artist"
+        if level == "album":
+            label = self._album_label(row)
+            return label.lower(), label, "album"
+        if level == "albumdisc":
+            label = self._album_label(row)
+            disc = _num(row["discnumber"])
+            if disc > 1:
+                label += f" — Disc {disc}"
+            return (label.lower(), disc), label, "album"
+        if level == "disc":
+            disc = _num(row["discnumber"]) or 1
+            return disc, f"Disc {disc}", "group"
+        if level == "year":
+            year = (row["date"] or "")[:4]
+            return (int(year) if year.isdigit() else 9999,
+                    year if year.isdigit() else "Unknown year", "group")
+        if level == "decade":
+            year = (row["date"] or "")[:4]
+            if year.isdigit() and len(year) == 4:
+                return int(year[:3]) * 10, f"{year[:3]}0s", "group"
+            return 9999, "Unknown year", "group"
+        if level in ("genre", "composer", "performer", "grouping"):
+            name = (row[level] or "").strip()
+            label = name or {"genre": "Unknown genre", "composer": "Unknown composer",
+                             "performer": "Unknown performer",
+                             "grouping": "No grouping"}[level]
+            return label.lower(), label, "group"
+        if level == "filetype":
+            name = (row["filetype"] or "").strip() or "Unknown"
+            return name.lower(), name, "group"
+        if level == "samplerate":
+            rate = int(row["sample_rate"] or 0)
+            return (rate or 10 ** 9,
+                    f"{rate / 1000:.1f} kHz" if rate else "Unknown sample rate", "group")
+        if level == "bitdepth":
+            depth = int(row["bits_per_sample"] or 0)
+            return (depth or 10 ** 9, f"{depth}-bit" if depth else "Unknown bit depth", "group")
+        if level == "bitrate":
+            bitrate = int(row["bitrate"] or 0)
+            return (bitrate or 10 ** 9,
+                    f"{round(bitrate / 1000)} kbps" if bitrate else "Unknown bitrate", "group")
+        return "unknown", "Unknown", "group"
+
+    def refresh(self):
+        text = self.search.text().strip()
+        where, params, error = "", [], ""
+        if text:
+            try:
+                where, params = parse_filter(text)
+            except FilterError as exc:
+                error = str(exc)
+        if error or (text and not where):
+            rows = self.library.tracks(text)
+        elif where:
+            rows = self.library.tracks(where=where, args=params)
+        else:
+            rows = self.library.tracks()
+        focus = getattr(self, "_album_focus", None)
+        if focus:
+            wanted = set(focus[0])
+            rows = [r for r in rows if r["path"] in wanted]
+        self._rows = rows
+        self._rows_cache = {r["path"]: r for r in rows}
+        levels = self.grouping_levels()
+        self._apply_columns(levels)
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+        sets = self._va_sets(rows)
+        if levels == ["none"]:
+            for row in self._song_order(rows, album_order=True):
+                self._song_item(self.tree, row)
+        else:
+            self._build_level(self.tree, rows, levels, 0, bool(text), sets)
+        if text or focus:
+            self.tree.expandAll()
+        elif self.config.get("lib_fold") in FOLD_MODES:
+            # the folders stay the way they were left, next launch included
+            self._apply_fold(self.config["lib_fold"])
+        else:
+            self.tree.expandToDepth(1 if self.config.get("lib_auto_open") else 0)
+        self.tree.setUpdatesEnabled(True)
+        if focus:
+            self.stack.setCurrentWidget(self.tree)
+        elif self.config.get("lib_mode") == "covers":
+            self._build_covers(rows, levels)
+        else:
+            self.covers.clear()
+
+        shown, total = len(rows), self.library.count()
+        artists = {(r["albumartist"] or r["artist"] or "").strip() for r in rows} - {""}
+        albums = {(r["album"] or "").strip() for r in rows} - {""}
+        length = sum(float(r["length"] or 0) for r in rows)
+        self.tree_status.setText(
+            f"{shown} track{'s' if shown != 1 else ''} · {len(artists)} artist"
+            f"{'s' if len(artists) != 1 else ''} · {len(albums)} album"
+            f"{'s' if len(albums) != 1 else ''} · {fmt_time(length)}"
+            + (f"   (library: {total})" if shown != total else ""))
+        if error:
+            self.filter_hint.setObjectName("Amber")
+            self.filter_hint.setText(f"Filter error: {error} — showing a plain text search")
+        elif text:
+            self.filter_hint.setText(f"{shown} match{'es' if shown != 1 else ''} · "
+                                     "field:value filters — artist:… · year:1990-1999 · bitrate:>320")
+        else:
+            self.filter_hint.setText('field:value filters — artist:aphex · album:"…" · '
+                                     'bitrate:>320 · rating:>=4')
+        self.filter_hint.style().unpolish(self.filter_hint)
+        self.filter_hint.style().polish(self.filter_hint)
+        self._fit_title_column()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_title_column()
+
+    def _apply_columns(self, levels=None):
+        levels = levels if levels is not None else self.grouping_levels()
+        self.columns = [k for k in (self.config.get("lib_columns") or DETAIL_KEYS)
+                        if k in LIB_COLUMN_LABELS] or list(DETAIL_KEYS)
+        self.details = bool(self.config.get("lib_details", True)) or levels == ["none"]
+        if not self.details:
+            self.columns = ["title"]
+        self.tree.setColumnCount(len(self.columns))
+        self.tree.setHeaderHidden(not self.details)
+        if not self.details:
+            # Hierarchy-only library: artist > album > "01. Title", full width.
+            self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+            return
+        self.tree.setHeaderLabels([LIB_COLUMN_LABELS[k] for k in self.columns])
+        widths = self.config.get("lib_column_widths") or []
+        defaults = {k: w for k, _label, w in LIB_COLUMNS}
+        for i, key in enumerate(self.columns):
+            width = widths[i] if i < len(widths) else defaults.get(key, 90)
+            self.tree.setColumnWidth(i, max(40, int(width)))
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        if not getattr(self, "_grid_bound", False):
+            self._grid_bound = True
+            bind_grid_layout(self.tree, self.config, "library", remember_widths=False)
+        else:
+            self.tree._grid_reapply()
+        self._fit_title_column()
+
+    def _fit_title_column(self):
+        """Give the name column the leftover width (Qt's stretch overshoots by a scrollbar)."""
+        if not getattr(self, "details", False) or not hasattr(self, "tree"):
+            return
+        columns = getattr(self, "columns", [])
+        if "title" not in columns:
+            return
+        width = self.tree.viewport().width()
+        if width < 220:
+            return
+        title = columns.index("title")
+        other = sum(self.tree.columnWidth(i) for i in range(len(columns)) if i != title)
+        self.tree.setColumnWidth(title, max(140, width - other - 4))
+
+    def _label_column(self):
+        return self.columns.index("title") if "title" in self.columns else 0
+
+    def _node_values(self, label, rows=None, kind=None):
+        if not self.details:
+            return [label]
+        values = [""] * len(self.columns)
+        values[self._label_column()] = label
+        if rows and kind == "album":
+            if "year" in self.columns:
+                values[self.columns.index("year")] = self._album_year(rows)
+            if "length" in self.columns:
+                total = sum(float(r["length"] or 0) for r in rows)
+                values[self.columns.index("length")] = fmt_time(total)
+        return values
+
+    def _node_label(self, item):
+        for i in range(self.tree.columnCount()):
+            text = item.text(i)
+            if text:
+                return text
+        return ""
+
+    def _build_level(self, parent, rows, levels, depth, searching, sets):
+        level = levels[depth]
+        if level == "folder":
+            self._build_folders(parent, rows, levels, depth, searching, sets)
+            return
+        groups = {}
+        for row in rows:
+            key, label, kind = self._group_info(level, row, sets)
+            groups.setdefault(key, {"label": label, "kind": kind, "rows": []})["rows"].append(row)
+        textual = level in ("artist", "albumartist", "album", "genre", "composer",
+                            "performer", "grouping", "filetype")
+        dividers = self.config.get("lib_show_dividers", True)
+        letter = None
+        letter_node = None
+        for key in sorted(groups):
+            info = groups[key]
+            label = info["label"]
+            holder = parent
+            if depth == 0 and textual and dividers and not searching:
+                head = label[:1].upper()
+                if not head.isalpha():
+                    head = "#"
+                if head != letter:
+                    letter = head
+                    letter_node = QTreeWidgetItem(parent, self._node_values(head))
+                    font = letter_node.font(0)
+                    font.setBold(True)
+                    letter_node.setFont(0, font)
+                    letter_node.setForeground(self._label_column(),
+                                              QBrush(QColor(ACCENT)))
+                    letter_node.setData(0, KIND_ROLE, "divider")
+                    letter_node.setToolTip(0, "Section %s" % head)
+                    letter_node.setFlags(letter_node.flags() & ~Qt.ItemIsSelectable)
+                    if self.details:
+                        letter_node.setFirstColumnSpanned(True)
+                holder = letter_node if letter_node is not None else parent
+            item = QTreeWidgetItem(holder, self._node_values(label, info["rows"],
+                                                             info["kind"]))
+            item.setData(0, KIND_ROLE, info["kind"])
+            label_col = self._label_column()
+            item.setToolTip(0, f"{label} — {len(info['rows'])} track(s)")
+            if depth == 0:
+                font = item.font(label_col)
+                font.setBold(True)
+                item.setFont(label_col, font)
+            if self.config.get("lib_show_covers", True) and info["kind"] == "album":
+                icon = self._cover(info["rows"][0]["path"])
+                if icon.isNull():
+                    icon = self._placeholder_cover()
+                if not icon.isNull():
+                    item.setIcon(label_col, icon)
+            if depth == len(levels) - 1:
+                for row in self._song_order(info["rows"]):
+                    self._song_item(item, row)
+            else:
+                self._build_level(item, info["rows"], levels, depth + 1, searching, sets)
+
+    def _sort_value(self, key, row):
+        if key == "track":
+            return (_num(row["discnumber"]), _num(row["tracknumber"]))
+        if key == "length":
+            return float(row["length"] or 0)
+        if key == "rating":
+            return int(row["rating"] or 0)
+        if key == "plays":
+            return int(row["play_count"] or 0)
+        if key == "year":
+            return (row["date"] or "")[:4]
+        if key == "format":
+            key = "filetype"
+        return str(row.get(key) or "").lower()
+
+    def _song_order(self, rows, album_order=False):
+        sort = getattr(self, "lib_sort", None)
+        if sort:
+            key, desc = sort
+            return sorted(rows, key=lambda r: self._sort_value(key, r), reverse=desc)
+        if album_order:
+            return sorted(rows, key=lambda r: ((r["albumartist"] or r["artist"] or "").lower(),
+                                               (r["album"] or "").lower(),
+                                               _num(r["discnumber"]), _num(r["tracknumber"]),
+                                               (r["title"] or "").lower()))
+        return sorted(rows, key=lambda r: (_num(r["discnumber"]), _num(r["tracknumber"]),
+                                           (r["title"] or "").lower()))
+
+    def _columns_moved(self, *_args):
+        header = self.tree.header()
+        order = []
+        for visual in range(header.count()):
+            logical = header.logicalIndex(visual)
+            if 0 <= logical < len(self.columns):
+                order.append(self.columns[logical])
+        if not order or order == list(self.config.get("lib_columns") or []):
+            return
+        widths = {}
+        for logical, key in enumerate(self.columns):
+            widths[key] = self.tree.columnWidth(logical)
+        self.config["lib_columns"] = order
+        self.config["lib_column_widths"] = [widths.get(key, 90) for key in order]
+        save_config(self.config)
+        self._fit_title_column()
+
+    def _sort_by_column(self, index):
+        if not getattr(self, "details", False) or not self.columns:
+            return
+        if index >= len(self.columns):
+            return
+        key = self.columns[index]
+        current = getattr(self, "lib_sort", None)
+        if current and current[0] == key:
+            self.lib_sort = None if current[1] else (key, True)
+        else:
+            self.lib_sort = (key, False)
+        self.refresh()
+
+    def _song_item(self, parent, row):
+        path = row["path"]
+        title = row["title"] or os.path.basename(path)
+        shown_title = self._song_title(row)
+        loved = bool(row.get("loved"))
+        rating = int(row.get("rating") or 0)
+        tooltip = f"{row['artist'] or 'Unknown artist'} — {row['album'] or 'Unknown album'}"
+        if row["length"]:
+            tooltip += f"\n{fmt_time(row['length'])} · {fmt_specs(row)}"
+        if rating:
+            tooltip += f"\nRating: {stars(rating)}"
+        if loved:
+            tooltip += "\n♥ Loved"
+        if row.get("play_count"):
+            tooltip += f"\nPlayed {int(row['play_count'])}×"
+        if row.get("skipcount"):
+            tooltip += f" · skipped {int(row['skipcount'])}×"
+        tooltip += f"\n{path}"
+        if not self.details:
+            label = ("♥ " if loved else "") + shown_title
+            item = QTreeWidgetItem(parent, [label])
+        else:
+            values = []
+            for key in self.columns:
+                if key == "track":
+                    track = _num(row["tracknumber"])
+                    values.append(f"{track:02d}" if track else "")
+                elif key == "title":
+                    values.append(("♥ " if loved else "") + shown_title)
+                elif key == "length":
+                    values.append(fmt_time(row["length"]) if row["length"] else "")
+                elif key == "year":
+                    values.append((row["date"] or "")[:4])
+                elif key == "rating":
+                    values.append(stars(rating))
+                elif key == "plays":
+                    values.append(str(int(row["play_count"])) if row.get("play_count") else "")
+                elif key == "format":
+                    values.append(row["filetype"] or filetype(path))
+                elif key in ("album", "artist", "genre"):
+                    values.append(row[key] or "")
+                else:
+                    values.append("")
+            item = QTreeWidgetItem(parent, values)
+        item.setData(0, PATH_ROLE, path)
+        item.setToolTip(0, tooltip)
+        for i, key in enumerate(self.columns if self.details else []):
+            if key in ("track", "length", "rating", "plays"):
+                item.setTextAlignment(i, Qt.AlignRight | Qt.AlignVCenter)
+
+    def _folder_parts(self, path, roots):
+        folder = os.path.dirname(path)
+        cached = getattr(self, "_folder_part_cache", None)
+        if cached is None:
+            cached = self._folder_part_cache = {}
+        if folder in cached:
+            return cached[folder]
+        parts = None
+        for root in roots:
+            try:
+                rel = os.path.relpath(folder, root)
+            except ValueError:
+                continue
+            if not rel.startswith(".."):
+                parts = [p for p in rel.split(os.sep) if p and p != "."]
+                break
+        if parts is None:
+            parts = [os.path.basename(folder)] if os.path.basename(folder) else [folder]
+        cached[folder] = parts
+        return parts
+
+    def _build_folders(self, parent, rows, levels=None, depth=0, searching=False, sets=None):
+        """Folder nodes nest as deep as the filesystem goes, then the remaining
+        grouping levels continue underneath."""
+        levels = list(levels if levels is not None else ["folder"])
+        self._folder_part_cache = {}
+        roots = [f for f in self.config["library_folders"] if os.path.isdir(f)]
+        entries = [(row, self._folder_parts(row["path"], roots)) for row in rows]
+        self._folder_nodes(parent, entries, levels, depth, searching, sets)
+
+    def _folder_nodes(self, parent, entries, levels, depth, searching, sets):
+        direct, children = [], {}
+        for row, parts in entries:
+            if parts:
+                children.setdefault(parts[0], []).append((row, parts[1:]))
+            else:
+                direct.append(row)
+        if direct:
+            if depth + 1 < len(levels):
+                self._build_level(parent, direct, levels, depth + 1, searching, sets)
+            else:
+                for row in self._song_order(direct):
+                    self._song_item(parent, row)
+        for name in sorted(children, key=str.lower):
+            item = QTreeWidgetItem(parent, self._node_values(name))
+            item.setData(0, KIND_ROLE, "folder")
+            item.setToolTip(0, name)
+            self._folder_nodes(item, children[name], levels, depth, searching, sets)
+
+    def _placeholder_cover(self):
+        """Tiny square artwork placeholder for albums with no embedded image."""
+        if "placeholder" not in self.cover_pix_cache:
+            pm = QPixmap(32, 32)
+            pm.fill(QColor(PANEL_ALT))
+            painter = QPainter(pm)
+            painter.setPen(QPen(QColor("#4f4f4f"), 2))
+            painter.drawRect(2, 2, 27, 27)
+            painter.drawLine(9, 23, 9, 11)
+            painter.drawLine(9, 11, 22, 8)
+            painter.drawEllipse(QRectF(5, 19, 7, 7))
+            painter.end()
+            self.cover_pix_cache["placeholder"] = QIcon(pm)
+        return self.cover_pix_cache["placeholder"]
+
+    def _song_title(self, row):
+        title = row["title"] or os.path.basename(row["path"])
+        if not self.config.get("lib_track_prefix", True):
+            return title
+        if "track" in self.columns:
+            return title
+        track = _num(row["tracknumber"])
+        return ("%02d. %s" % (track, title)) if track else title
+
+    def _cover(self, path):
+        if not self.config.get("lib_show_covers", True):
+            return QIcon()
+        folder = os.path.dirname(path)
+        if folder not in self.cover_cache:
+            data = read_cover(path)
+            pm = QPixmap()
+            if data and pm.loadFromData(data):
+                self.cover_cache[folder] = QIcon(pm.scaled(64, 64, Qt.KeepAspectRatio,
+                                                           Qt.SmoothTransformation))
+            else:
+                self.cover_cache[folder] = QIcon()
+        return self.cover_cache[folder]
+
+    def _cover_pixmap(self, path, size=120):
+        folder = os.path.dirname(path)
+        key = (folder, size)
+        if key not in self.cover_pix_cache:
+            data = read_cover(path)
+            pm = QPixmap()
+            if data and pm.loadFromData(data):
+                pm = pm.scaled(size, size, Qt.KeepAspectRatioByExpanding,
+                               Qt.SmoothTransformation)
+                x = max(0, (pm.width() - size) // 2)
+                y = max(0, (pm.height() - size) // 2)
+                pm = pm.copy(x, y, size, size)
+            else:
+                pm = QPixmap(size, size)
+                pm.fill(QColor(PANEL_ALT))
+                painter = QPainter(pm)
+                painter.setRenderHint(QPainter.Antialiasing)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor("#4a4a4a")))
+                painter.drawEllipse(QRectF(size * 0.62, size * 0.44, size * 0.11, size * 0.11))
+                painter.drawEllipse(QRectF(size * 0.30, size * 0.56, size * 0.11, size * 0.11))
+                pen = QPen(QColor("#4a4a4a"))
+                pen.setWidth(3)
+                painter.setPen(pen)
+                painter.drawLine(int(size * 0.68), int(size * 0.48), int(size * 0.68),
+                                 int(size * 0.26))
+                painter.drawLine(int(size * 0.36), int(size * 0.60), int(size * 0.36),
+                                 int(size * 0.34))
+                painter.drawLine(int(size * 0.36), int(size * 0.34), int(size * 0.68),
+                                 int(size * 0.26))
+                painter.end()
+            self.cover_pix_cache[key] = pm
+        return self.cover_pix_cache[key]
+
+    def _build_covers(self, rows, levels):
+        self.covers.clear()
+        level = "album"
+        for candidate in reversed(levels or []):
+            if candidate not in ("none", "folder"):
+                level = candidate
+                break
+        sets = self._va_sets(rows)
+        entries = {}
+        for row in rows:
+            if level == "folder":
+                folder = os.path.dirname(row["path"])
+                label = os.path.basename(folder) or folder
+            else:
+                _key, label, _kind = self._group_info(level, row, sets)
+            entries.setdefault(label, []).append(row)
+        for label in sorted(entries, key=str.lower):
+            group = entries[label]
+            artist = group[0]["albumartist"] or group[0]["artist"] or ""
+            lines = [label] + ([artist] if artist else [])
+            lines.append(f"{len(group)} track{'s' if len(group) != 1 else ''}")
+            item = QListWidgetItem(QIcon(self._cover_pixmap(group[0]["path"])),
+                                   "\n".join(lines))
+            item.setTextAlignment(Qt.AlignHCenter)
+            item.setData(Qt.UserRole, [r["path"] for r in group])
+            artist = group[0]["albumartist"] or group[0]["artist"] or ""
+            item.setToolTip(f"{label}" + (f" — {artist}" if artist else "") +
+                            f"\nClick to open the album"
+                            f"\nDouble-click to queue {len(group)} track(s)")
+            self.covers.addItem(item)
+
+    def _covers_click(self, item):
+        """A click on a cover opens the album — after the double-click interval, so a
+        double-click (add to queue) never also opens it on the way.
+
+        What the click pointed at is copied out now: the grid can be rebuilt (a rescan,
+        a grouping change) inside that interval, and its items go with it."""
+        if item is None:
+            return
+        self._cover_pending = (list(item.data(Qt.UserRole) or []),
+                               item.text().split("\n")[0])
+        self._cover_click_timer.start()
+
+    def _open_pending_cover(self):
+        pending, self._cover_pending = self._cover_pending, None
+        if not pending:
+            return
+        self.open_album(pending[0], pending[1])
+
+    def open_album(self, paths, label=""):
+        """Open one album: its tracks in the list, with the covers one click away."""
+        paths = [p for p in (paths or []) if p]
+        if not paths:
+            return
+        self._album_focus = (list(paths), label or "")
+        self.album_title.setText(label or "")
+        self.album_title.setToolTip(label or "")
+        self.album_bar.show()
+        self.refresh()
+        self.stack.setCurrentWidget(self.tree)
+
+    def close_album(self):
+        """Leave an opened album and go back to the album covers."""
+        if not getattr(self, "_album_focus", None):
+            return
+        self._album_focus = None
+        self.album_bar.hide()
+        self.refresh()
+        self.stack.setCurrentWidget(self.covers if self.config.get("lib_mode") == "covers"
+                                    else self.tree)
+
+    def _covers_double(self, item):
+        # a double-click means "queue it": cancel the album open the first click armed
+        self._cover_click_timer.stop()
+        self._cover_pending = None
+        self._enqueue_paths(item.data(Qt.UserRole) or [],
+                            play=self.config.get("lib_double_click") == "play",
+                            label=item.text().split("\n")[0])
+
+    def _covers_menu(self, pos):
+        item = self.covers.itemAt(pos)
+        if item is None:
+            return
+        paths = item.data(Qt.UserRole) or []
+        label = item.text().split("\n")[0]
+        menu = QMenu(self)
+        menu.addAction("Play now", lambda: self._enqueue_paths(paths, play=True, label=label))
+        menu.addAction("Add to queue", lambda: self._enqueue_paths(paths, label=label))
+        sub = menu.addMenu("Add to playlist")
+        for name in self.playlists.names():
+            sub.addAction(name, lambda n=name: self._append_to_playlist(n, paths))
+        sub.addAction("New playlist…", lambda: self._new_playlist_with(paths))
+        menu.addAction("Burn to Disc…", lambda: self.window().burn_paths(paths, label))
+        menu.exec(self.covers.viewport().mapToGlobal(pos))
+
+    def _ordered(self, paths, mode=None):
+        """Apply the shuffle mode (or an explicit one) and album order to paths."""
+        mode = mode or self.config.get("shuffle_mode", "off")
+        if mode not in SHUFFLE_LABELS:
+            mode = "off"
+        album_order = self.config.get("album_play_order", "in_order")
+        rows = [dict(self._rows_cache.get(p) or {}, path=p) for p in paths if p]
+        return [r["path"] for r in order_queue(rows, mode, album_order)]
+
+    def play_selection_as(self, mode):
+        """Music > Play selection as: play the selection once in the given mode."""
+        paths = self.selected_paths()
+        if not paths:
+            self.window().notify("Select some tracks first")
+            return
+        self._enqueue_paths(paths, play=True, mode=mode,
+                            label=f"{len(paths)} track(s), {SHUFFLE_LABELS[mode].lower()}")
+
+    def preferences_changed(self):
+        self.cover_cache.clear()
+        self.refresh()
+        devices = getattr(self.window(), "devices_tab", None)
+        if devices is not None:
+            devices.apply_layout()
+
+    def refresh_theme(self):
+        """Recolour what is painted by hand after the theme changed."""
+        for key, button in getattr(self, "strip_buttons", {}).items():
+            button.setIcon(strip_icon(key))
+        self.cover_pix_cache.clear()
+        self._on_index_changed(self.player.index)
+
+    def _enqueue_paths(self, paths, play=False, label="", mode=None):
+        paths = self._ordered(paths, mode)
+        if not paths:
+            return
+        if play:
+            self._push_undo("Play selection")
+            self.player.set_queue(paths, 0, play=True)
+            self.window().notify(f"Playing {label or str(len(paths)) + ' track(s)'}")
+        else:
+            self._push_undo("Add to queue")
+            self.player.add_paths(paths, play_if_idle=False)
+            self.window().notify(f"Added {label or str(len(paths)) + ' track(s)'} to the queue")
+
+    def _paths_under(self, item):
+        path = item.data(0, PATH_ROLE)
+        if path:
+            return [path]
+        out = []
+        for i in range(item.childCount()):
+            out.extend(self._paths_under(item.child(i)))
+        return out
+
+    def selected_paths(self):
+        out = []
+        for it in self.tree.selectedItems():
+            for p in self._paths_under(it):
+                if p not in out:
+                    out.append(p)
+        return out
+
+    def _tree_double(self, item, _col):
+        if item is None:
+            return
+        path = item.data(0, PATH_ROLE)
+        if path:
+            row = self._rows_cache.get(path, {})
+            self._enqueue_paths([path], play=self.config.get("lib_double_click") == "play",
+                                label=row.get("title") or os.path.basename(path))
+        else:
+            self._enqueue_paths(self._paths_under(item),
+                                play=self.config.get("lib_double_click") == "play",
+                                label=self._node_label(item))
+
+    def _tree_middle(self, item):
+        paths = self._paths_under(item)
+        if paths:
+            self._enqueue_paths(paths, label=self._node_label(item))
+
+    def _header_menu(self, pos):
+        if not getattr(self, "details", False):
+            return
+        menu = QMenu(self)
+        current = self.config.get("lib_columns") or DETAIL_KEYS
+        for key, label, _width in LIB_COLUMNS:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(key in current)
+            action.toggled.connect(lambda checked, k=key: self._toggle_column(k, checked))
+        menu.addSeparator()
+        menu.addAction("Reset columns", self._reset_columns)
+        menu.exec(self.tree.header().mapToGlobal(pos))
+
+    def _reset_columns(self):
+        self.config["lib_columns"] = list(DEFAULT_CONFIG["lib_columns"])
+        save_config(self.config)
+        self.refresh()
+
+    def _tree_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        if not item.data(0, PATH_ROLE) and not item.isSelected():
+            self.tree.clearSelection()
+            item.setSelected(True)
+        paths = self.selected_paths() or self._paths_under(item)
+        if not paths:
+            return
+        rows = [self._rows_cache.get(p, {}) for p in paths]
+        loved = bool(rows) and all(r.get("loved") for r in rows)
+        menu = QMenu(self)
+
+        menu.addAction("Play now",
+                       lambda: self._enqueue_paths(paths, play=True,
+                                                   label=self._node_label(item)))
+        if item.data(0, KIND_ROLE) == "album" and not item.data(0, PATH_ROLE):
+            album_paths = self._paths_under(item)
+            menu.addAction("Play album in order",
+                           lambda: self._enqueue_paths(album_paths, play=True, mode="off",
+                                                       label=self._node_label(item)))
+        menu.addAction("Append to queue", lambda: self._enqueue_paths(paths))
+        menu.addAction("Queue to play next", lambda: self.queue_next(paths))
+        menu.addAction("Replace current playlist",
+                       lambda: (self._push_undo("Replace queue"),
+                                self.player.set_queue(self._ordered(paths))))
+        menu.addAction("Open in new playlist", lambda: self._new_playlist_with(paths))
+        menu.addSeparator()
+
+        sub = menu.addMenu("Add to playlist")
+        names = self.playlists.names()
+        for name in names:
+            sub.addAction(name, lambda n=name: self._append_to_playlist(n, paths))
+        sub.addAction("New playlist…", lambda: self._new_playlist_with(paths))
+        if not names:
+            sub.addAction("No playlists yet").setEnabled(False)
+        menu.addSeparator()
+
+        rating_menu = menu.addMenu("Rating")
+        for n in (5, 4, 3, 2, 1):
+            rating_menu.addAction(f"{'★' * n}{'☆' * (5 - n)}",
+                                  lambda n=n: self.rate_paths(paths, n))
+        rating_menu.addSeparator()
+        rating_menu.addAction("Clear rating", lambda: self.rate_paths(paths, 0))
+        menu.addAction("Unlove" if loved else "Love",
+                       lambda: self.toggle_loved(paths, not loved))
+        menu.addSeparator()
+
+        menu.addAction("Burn to Disc…", lambda: self.window().burn_paths(paths, self._node_label(item)))
+        menu.addAction("Search for this", lambda: self.search_for_path(paths[0]))
+        menu.addAction("Edit tags…", lambda: self.edit_tags(paths))
+        menu.addAction("Edit tags in Tagger", lambda: self.window().open_in_tagger(paths))
+        menu.addAction("Organize files…", lambda: self.organize_selected(paths))
+        menu.addAction("Rescan song(s)", lambda: self.rescan_paths(paths))
+        copy_menu = menu.addMenu("Copy")
+        copy_menu.addAction("File path",
+                            lambda: QApplication.clipboard().setText("\n".join(paths)))
+        copy_menu.addAction("Artist — Title",
+                            lambda: QApplication.clipboard().setText(
+                                "\n".join(self._track_label(p) for p in paths)))
+        menu.addAction("Show in file browser", lambda: self.show_in_browser(paths[0]))
+        menu.addAction("Copy to device…", lambda: self.window().copy_to_device(paths))
+        menu.addSeparator()
+        menu.addAction("Look up metadata & cover…",
+                       lambda: self.lookup_online(paths))
+        menu.addAction("Analyse ReplayGain", lambda: self.analyse_replaygain(paths))
+        menu.addSeparator()
+        delete_menu = menu.addMenu("Delete")
+        delete_menu.addAction("Remove from library (keep file)",
+                              lambda: self.remove_from_library(paths))
+        delete_menu.addAction("Move file to Trash",
+                              lambda: self.delete_paths(paths, True))
+        delete_menu.addAction("Delete file permanently…",
+                              lambda: self.delete_paths(paths, False))
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    # ---------------- Strawberry-style library actions ----------------
+    def _track_label(self, path):
+        row = self._rows_cache.get(path, {})
+        artist = row.get("artist") or "Unknown artist"
+        title = row.get("title") or os.path.basename(path)
+        return f"{artist} — {title}"
+
+    def _all_items(self):
+        stack = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+        while stack:
+            item = stack.pop()
+            yield item
+            stack.extend(item.child(i) for i in range(item.childCount()))
+
+    def queue_next(self, paths):
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        self._push_undo("Queue next")
+        self.player.play_next(paths)
+        self.window().notify(f"Queued {len(paths)} track(s) to play next")
+
+    def rate_paths(self, paths, rating):
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        self.library.set_rating(paths, rating)
+        self.refresh()
+        arrow = f"{rating}★" if rating else "cleared"
+        self.window().notify(f"Rating {arrow} for {len(paths)} track(s)")
+
+    def rate_selected(self, rating):
+        self.rate_paths(self.selected_paths(), rating)
+
+    def toggle_loved(self, paths, loved):
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        self.library.set_loved(paths, loved)
+        self.refresh()
+        self.window().notify(f"{'♥ Loved' if loved else 'Unloved'} {len(paths)} track(s)")
+
+    def locate_playing(self):
+        path = self.player.current_path()
+        if not path:
+            self.window().notify("Nothing is playing")
+            return
+        self.stack.setCurrentWidget(self.tree)
+        for item in self._all_items():
+            if item.data(0, PATH_ROLE) == path:
+                parent = item.parent()
+                while parent is not None:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+                self.tree.setCurrentItem(item)
+                self.tree.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                self.tree.setFocus()
+                return
+        self.window().notify("The playing track is not in the current filter")
+
+    def rescan_paths(self, paths):
+        done = 0
+        for path in paths:
+            if os.path.isfile(path):
+                try:
+                    self.library.update_track(path)
+                    done += 1
+                except (OSError, ValueError):
+                    continue
+        self.cover_cache.clear()
+        self.cover_pix_cache.clear()
+        self.refresh()
+        self.window().notify(f"Rescanned {done} track(s)")
+
+    def search_for_path(self, path):
+        row = self._rows_cache.get(path, {})
+        field = "artist" if (row.get("artist") or "").strip() else "album"
+        value = str(row.get(field) or "").replace('"', '\\"')
+        if not value:
+            return
+        self.search.setText(f'{field}:"{value}"')
+        self.refresh()
+
+    def show_in_browser(self, path):
+        folder = os.path.dirname(path)
+        try:
+            subprocess.Popen(["xdg-open", folder])
+        except OSError as e:
+            QMessageBox.information(self, "Show in file browser", f"{folder}\n\n{e}")
+
+    def remove_from_library(self, paths):
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        question = (f"Remove {len(paths)} track(s) from the library?\n\n"
+                    "The files stay on disk, only the index entry is removed.")
+        if QMessageBox.question(self, "Remove from library", question) != QMessageBox.Yes:
+            return
+        self.library.remove_paths(paths)
+        self.refresh()
+        self.reload_smart()
+        self.window().notify(f"Removed {len(paths)} track(s) from the library")
+
+    def delete_paths(self, paths, to_trash=True):
+        """Delete the selected files (trash by default) and drop their rows."""
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        where = "the Trash" if to_trash else "permanently"
+        question = (f"Delete {len(paths)} file(s) {where}?\n\n"
+                    + "\n".join(os.path.basename(p) for p in paths[:6])
+                    + ("\n…" if len(paths) > 6 else ""))
+        if QMessageBox.question(self, "Delete files", question) != QMessageBox.Yes:
+            return
+        removed, failed = self.library.delete_paths(paths, to_trash)
+        self.cover_cache.clear()
+        self.cover_pix_cache.clear()
+        self.refresh()
+        self.reload_smart()
+        if failed:
+            QMessageBox.warning(self, "Delete files",
+                                "%d file(s) could not be deleted:\n\n" % len(failed)
+                                + "\n".join("%s: %s" % (os.path.basename(p), msg)
+                                             for p, msg in failed[:6]))
+        self.window().notify("Deleted %d file(s) %s" % (len(removed), where))
+
+    def lookup_online(self, paths=None):
+        paths = [p for p in (paths if paths is not None else self.selected_paths()) if p]
+        if not paths:
+            self.window().notify("Select one or more tracks to look up")
+            return
+        if not self.config.get("online_lookup", True):
+            QMessageBox.information(self, "Online lookup",
+                                    "Online lookup is disabled in the config.")
+            return
+        rows = [self._rows_cache.get(p) or {"path": p} for p in paths]
+        dialog = OnlineLookupDialog(rows, self.library, self)
+        dialog.exec()
+        if dialog.applied:
+            self.cover_cache.clear()
+            self.cover_pix_cache.clear()
+            self._rows_cache.clear()
+            self.refresh()
+            self.reload_smart()
+            self.window().notify("Online metadata applied to %d track(s)" % len(rows))
+
+    def _replaygain_album_groups(self, paths):
+        """Group selected tracks into albums for the album-gain pass.
+
+        Tracks sharing albumartist and album are one album, even across disc
+        folders; without albumartist the folder decides, so two albums with the
+        same name in different folders are never measured as one.
+        """
+        groups = {}
+        for path in paths:
+            row = self._rows_cache.get(path) or {}
+            album = str(row.get("album") or "").strip()
+            artist = str(row.get("albumartist") or "").strip()
+            if album and artist:
+                key = ("tag", artist.lower(), album.lower())
+                label = f"{artist} — {album}"
+            else:
+                folder = os.path.dirname(path)
+                key = ("folder", folder, album.lower())
+                label = album or os.path.basename(folder) or folder
+            groups.setdefault(key, {"label": label, "paths": []})["paths"].append(path)
+        return [g for g in groups.values() if len(g["paths"]) > 1]
+
+    def analyse_replaygain(self, paths):
+        paths = [p for p in paths if p and os.path.isfile(p)]
+        if not paths:
+            return
+        if self._rg_worker is not None and self._rg_worker.isRunning():
+            self.window().notify("ReplayGain analysis is already running")
+            return
+        album_groups = self._replaygain_album_groups(paths)
+        total = len(paths) + len(album_groups)
+        bar = QProgressDialog(f"Measuring loudness for {len(paths)} track(s)…", "Cancel",
+                              0, total, self)
+        bar.setWindowTitle("ReplayGain")
+        bar.setWindowModality(Qt.NonModal)
+        bar.setMinimumDuration(0)
+        bar.setAutoClose(False)
+        bar.setAutoReset(False)
+        bar.setValue(0)
+        bar.show()
+        self._rg_bar = bar
+
+        def job(progress, _log, cancel):
+            results = analyze_replaygain(paths, progress=progress, cancel=cancel,
+                                         album_groups=album_groups)
+            written = []
+            for item in results:
+                if cancel():
+                    break
+                if write_replaygain(item["path"], item["gain"], item["peak"],
+                                    item.get("album_gain"), item.get("album_peak")):
+                    written.append(item)
+            return {"written": written, "cancelled": bool(cancel()),
+                    "albums": len(album_groups)}
+
+        worker = Worker(job, self)
+        self._rg_worker = worker
+        worker.progress.connect(self._rg_progress)
+        worker.done.connect(self._rg_done)
+        worker.failed.connect(self._rg_failed)
+        worker.finished.connect(lambda w=worker: self._rg_finished(w))
+        bar.canceled.connect(worker.cancel)
+        self.window().statusBar().showMessage(
+            f"Measuring loudness for {total} track(s)…", 6000)
+        worker.start()
+
+    def _rg_progress(self, done, total, message):
+        bar = getattr(self, "_rg_bar", None)
+        if bar is not None:
+            bar.setMaximum(max(int(total), 1))
+            bar.setValue(int(done))
+            if message:
+                bar.setLabelText(f"Measuring {message} ({done} of {total})…")
+        self.window().statusBar().showMessage(
+            f"Measuring loudness: {done} of {total}…", 6000)
+
+    def _rg_done(self, result):
+        result = result or {}
+        written = result.get("written") or []
+        entries = []
+        for item in written:
+            rg = read_replaygain(item["path"])
+            entries.append((rg["track_gain"], rg["track_peak"], rg["album_gain"],
+                            rg["album_peak"], item["path"]))
+        if entries:
+            self.library.set_replaygain_many(entries)
+            self.refresh()
+        if result.get("cancelled"):
+            self.window().notify(f"ReplayGain stopped: {len(written)} track(s) written")
+            return
+        if not written:
+            QMessageBox.information(
+                self, "ReplayGain",
+                "ffmpeg was not found (or could not decode these files).\n\n"
+                "Tracks that already carry REPLAYGAIN_* tags still work — "
+                "set the RG button in the player bar to Track or Album gain.")
+            return
+        albums = int(result.get("albums") or 0)
+        suffix = f" · album tags for {albums} album(s)" if albums else ""
+        self.window().notify(f"ReplayGain written for {len(written)} track(s){suffix}")
+
+    def _rg_failed(self, error):
+        self.window().notify("ReplayGain measurement failed")
+        QMessageBox.warning(self, "ReplayGain", error)
+
+    def _rg_finished(self, worker=None):
+        if worker is not None and worker is not self._rg_worker:
+            return      # a newer run owns the bar and the reference now
+        bar = getattr(self, "_rg_bar", None)
+        if bar is not None:
+            bar.close()
+        self._rg_bar = None
+        self._rg_worker = None
+
+    def _organize_root(self, paths):
+        for folder in self.config.get("library_folders", []):
+            prefix = folder.rstrip(os.sep) + os.sep
+            if all(p.startswith(prefix) for p in paths):
+                return folder
+        return os.path.dirname(paths[0]) if paths else os.path.expanduser("~/Music")
+
+    def edit_tags(self, paths=None):
+        paths = [p for p in (paths if paths is not None else self.selected_paths()) if p]
+        if not paths:
+            self.window().notify("Select some tracks to edit")
+            return
+        dialog = EditTagsDialog(paths, self.library, self)
+        if dialog.exec() == QDialog.Accepted and dialog.saved:
+            self.cover_cache.clear()
+            self.cover_pix_cache.clear()
+            self._rows_cache.clear()
+            self.refresh()
+            self.window().notify(f"Saved tags for {len(dialog.saved)} file(s)")
+
+    def organize_selected(self, paths=None):
+        paths = [p for p in (paths if paths is not None else self.selected_paths()) if p]
+        if not paths:
+            self.window().notify("Select some tracks to organize")
+            return
+        dialog = OrganizeDialog(paths, self.library, self._organize_root(paths), self)
+        if dialog.exec() == QDialog.Accepted and dialog.organized:
+            self.cover_cache.clear()
+            self.cover_pix_cache.clear()
+            self._rows_cache.clear()
+            self.refresh()
+            self.reload_playlists()
+            self.window().notify(f"Organized {len(dialog.organized)} file(s)")
+
+    def find_duplicates(self):
+        dialog = DuplicateDialog(self.library, self)
+        dialog.exec()
+        if dialog.removed:
+            self.refresh()
+            self.reload_smart()
+            self.window().notify(f"Removed {len(dialog.removed)} duplicate(s) from the library")
+
+    def show_statistics(self):
+        stats = self.library.stats()
+        QMessageBox.information(
+            self, "Collection statistics",
+            f"Artists: {stats['artists']}\n"
+            f"Albums: {stats['albums']}\n"
+            f"Tracks: {stats['tracks']}\n"
+            f"Total length: {fmt_time(stats['length'])}\n"
+            f"Total plays: {stats['plays']}\n"
+            f"On disk: {fmt_human_size(stats['size'])}")
+
+    # ---------------- grouping ----------------
+    def open_group_by(self):
+        dialog = GroupByDialog(self, self.grouping_levels(),
+                               self.config.get("saved_groupings"))
+        if dialog.exec() != QDialog.Accepted:
+            return
+        levels = dialog.pick()
+        self.config["grouping_levels"] = levels
+        self.config["saved_groupings"] = dialog.saved
+        self.config["grouping"] = "custom"
+        save_config(self.config)
+        self.grouping.setCurrentIndex(max(self.grouping.findData("custom"), 0))
+        self._rebuild_saved_menu()
+        self.refresh()
+        self.window().notify("Grouping: " + " / ".join(LIB_GROUP_LABEL.get(k, k)
+                                                       for k in levels))
+
+    def apply_saved_grouping(self, grouping):
+        levels = [k for k in (grouping.get("levels") or []) if k in LIB_GROUP_LABEL]
+        if not levels:
+            return
+        self.config["grouping_levels"] = levels
+        self.config["grouping"] = "custom"
+        save_config(self.config)
+        self.grouping.setCurrentIndex(max(self.grouping.findData("custom"), 0))
+        self.refresh()
+
+    # ---------------- view options ----------------
+    def _build_library_menu(self):
+        menu = self.library_menu
+        menu.clear()
+        menu.addAction("Add music folder…", self.add_folder)
+        menu.addAction("Remove music folder…", self.remove_folder)
+        menu.addSeparator()
+        menu.addAction("Rescan library", self.rescan)
+        menu.addAction("Reset play counts", self.reset_play_counts)
+        menu.addSeparator()
+
+        collections = menu.addMenu("Collections")
+        for index, entry in enumerate(migrate_collections(self.config)):
+            action = collections.addAction(
+                ("● " if index == self.config.get("active_collection", 0) else "   ")
+                + entry["name"])
+            action.triggered.connect(lambda _c=False, i=index: self._collection_selected(i))
+        collections.addSeparator()
+        collections.addAction("New collection…", self.new_collection)
+        collections.addAction("Rename current collection…", self.rename_collection)
+        collections.addAction("Remove current collection…", self.remove_collection)
+        menu.addSeparator()
+
+        menu.addAction("Look up metadata & cover…", lambda: self.lookup_online())
+        menu.addAction("Analyse ReplayGain for selection",
+                       lambda: self.analyse_replaygain(self.selected_paths()))
+        menu.addSeparator()
+
+        details = menu.addAction("Details columns")
+        details.setCheckable(True)
+        details.setChecked(bool(self.config.get("lib_details", True)))
+        details.toggled.connect(self._toggle_details)
+
+        columns = menu.addMenu("Columns")
+        current = self.config.get("lib_columns") or DETAIL_KEYS
+        for key, label, _width in LIB_COLUMNS:
+            action = columns.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(key in current)
+            action.toggled.connect(lambda checked, k=key: self._toggle_column(k, checked))
+
+        menu.addSeparator()
+        menu.addAction("Group by…", self.open_group_by)
+        self.saved_menu = menu.addMenu("Saved groupings")
+        self._rebuild_saved_menu()
+        menu.addSeparator()
+        menu.addAction("Locate playing track", self.locate_playing)
+        menu.addAction("Find duplicates…", self.find_duplicates)
+        menu.addAction("Collection statistics…", self.show_statistics)
+
+    def _rebuild_saved_menu(self):
+        if not hasattr(self, "saved_menu") or self.saved_menu is None:
+            return
+        self.saved_menu.clear()
+        groupings = self.config.get("saved_groupings") or []
+        if not groupings:
+            self.saved_menu.addAction("No saved groupings yet").setEnabled(False)
+            return
+        for grouping in groupings:
+            levels = " / ".join(LIB_GROUP_LABEL.get(k, k) for k in grouping.get("levels", []))
+            action = self.saved_menu.addAction(f"{grouping['name']}  ({levels})")
+            action.triggered.connect(
+                lambda _checked=False, g=grouping: self.apply_saved_grouping(g))
+
+    def _toggle_details(self, checked):
+        self.config["lib_details"] = bool(checked)
+        save_config(self.config)
+        self.refresh()
+
+    def _apply_fold(self, mode):
+        """Open the folders the way the fold menu says (no config, no menu update)."""
+        self.tree.collapseAll()
+        if mode == "all":
+            self.tree.expandAll()
+        elif mode == "letters":
+            for i in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(i)
+                if item.data(0, KIND_ROLE) == "divider":
+                    item.setExpanded(True)
+
+    def _fold_menu_sync(self):
+        """Show in the menu which of the three positions the folders are in."""
+        current = self.config.get("lib_fold") or ""
+        for mode, action in getattr(self, "fold_actions", {}).items():
+            action.blockSignals(True)
+            action.setChecked(mode == current)
+            action.blockSignals(False)
+
+    def _fold_all(self, mode):
+        """mode: 'all' opens everything, 'letters' opens only the A-Z markers, 'none' closes all.
+
+        The choice is saved, so the library comes back the same way next time the app
+        starts instead of collapsing to whatever the auto-open setting says."""
+        if mode not in FOLD_MODES:
+            return
+        self.config["lib_fold"] = mode
+        save_config(self.config)
+        self._apply_fold(mode)
+        self._fold_menu_sync()
+
+    def _toggle_column(self, key, checked):
+        columns = [k for k in (self.config.get("lib_columns") or DETAIL_KEYS) if k != key]
+        if checked:
+            columns = [k for k in DETAIL_KEYS if k == key or k in columns]
+        if not columns:
+            columns = ["title"]
+        self.config["lib_columns"] = columns
+        save_config(self.config)
+        self.refresh()
+
+    # ---------------- queue ----------------
+    def rebuild_queue(self):
+        paths = list(self.player.queue)
+        meta = self._rows_cache if getattr(self, "_rows_cache", None) else {}
+        missing = [p for p in paths
+                   if p not in meta and not is_cd_entry(p) and not is_device_entry(p)]
+        if missing:
+            meta = dict(meta)
+            meta.update(self.library.by_path())
+            # Files the library does not hold and no device claims read their own tags, so
+            # the queue shows a title, length and format instead of blanks.
+            fresh = False
+            for path in missing:
+                if path in meta or is_cd_entry(path) or not os.path.isfile(path):
+                    continue
+                row = QUEUE_META.get(path)
+                if row is None or row.get("stat") != _file_hint(path):
+                    fresh = True
+                meta[path] = queue_meta(path)
+            if fresh:
+                save_queue_meta()
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(len(paths))
+        total = 0.0
+        current = self.player.current_path()
+        for r, path in enumerate(paths):
+            on_disc = is_cd_entry(path)
+            device = device_entry_info(path) if not on_disc else None
+            row = (device.get("meta") or {} if device else
+                   (cd_entry_meta(path) if on_disc else meta.get(path, {})))
+            length = float(row.get("length") or 0)
+            total += length
+            rate = int(row.get("sample_rate") or 0)
+            depth = int(row.get("bits_per_sample") or 0)
+            bitrate = int(row.get("bitrate") or 0)
+            values = [
+                (str(_num(row.get("tracknumber")) or r + 1), _num(row.get("tracknumber")) or r + 1),
+                (row.get("title") or os.path.basename(path), 0),
+                (row.get("artist") or "", 0),
+                (row.get("album") or "", 0),
+                (fmt_time(length), length),
+                (f"{rate} Hz" if rate else "—", rate),
+                (f"{depth} Bit" if depth else "—", depth),
+                (f"{round(bitrate / 1000)} kbps" if bitrate else "—", bitrate),
+                ("CD" if on_disc else (device.get("source") if device else "Local"), 0),
+                ("Audio CD" if on_disc else (row.get("filetype") or filetype(path)), 0),
+            ]
+            for c, (text, sort_val) in enumerate(values):
+                item = QTableWidgetItem(text)
+                if c in (0, 4, 5, 6, 7):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    item.setData(Qt.UserRole + 5, sort_val)
+                if c == 1:
+                    item.setData(PATH_ROLE, path)
+                    tip = f"{row.get('artist', '')} — {row.get('album', '')}".strip(" —")
+                    if device:
+                        tip = (tip + f"\nFrom {device.get('name') or 'device'} "
+                               f"({device.get('source')})").strip()
+                    item.setToolTip(tip)
+                self.table.setItem(r, c, item)
+            if path == current:
+                self._paint_current_row(r)
+        self.table.setUpdatesEnabled(True)
+        self.queue_status.setText(f"{len(paths)} tracks · {fmt_time(total)}")
+        self._update_undo_ui()
+        self.queue_title.setText(self.queue_title_extra or "Queue")
+
+    def _paint_current_row(self, row):
+        for c in range(self.table.columnCount()):
+            item = self.table.item(row, c)
+            if not item:
+                continue
+            f = item.font()
+            f.setBold(True)
+            item.setFont(f)
+            if not item.isSelected():
+                item.setBackground(QBrush(QColor(ACCENT_DIM)))
+                item.setForeground(QBrush(QColor("#ffffff")))
+
+    def _on_index_changed(self, _i):
+        current = self.player.current_path()
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 1)
+            if not item:
+                continue
+            on = item.data(PATH_ROLE) == current
+            for c in range(self.table.columnCount()):
+                cell = self.table.item(r, c)
+                if not cell:
+                    continue
+                f = cell.font()
+                f.setBold(on)
+                cell.setFont(f)
+                if on and not cell.isSelected():
+                    cell.setBackground(QBrush(QColor(ACCENT_DIM)))
+                    cell.setForeground(QBrush(QColor("#ffffff")))
+                elif not cell.isSelected():
+                    cell.setBackground(QBrush())
+                    cell.setForeground(QBrush())
+
+    def _highlight(self, _path):
+        self._on_index_changed(self.player.index)
+
+    def play_row(self, row):
+        if 0 <= row < len(self.player.queue):
+            self.player.play_index(row)
+
+    def _sort_queue(self, col):
+        """Header click sorts the real queue (and stays undoable)."""
+        keys = {
+            0: lambda r: (_num(r.get("discnumber")), _num(r.get("tracknumber"))),
+            1: lambda r: (r.get("title") or "").lower(),
+            2: lambda r: (r.get("artist") or "").lower(),
+            3: lambda r: (r.get("album") or "").lower(),
+            4: lambda r: float(r.get("length") or 0),
+            5: lambda r: int(r.get("sample_rate") or 0),
+            6: lambda r: int(r.get("bits_per_sample") or 0),
+            7: lambda r: int(r.get("bitrate") or 0),
+            8: lambda r: (r.get("source") or "local").lower(),
+            9: lambda r: (r.get("filetype") or "").lower(),
+        }
+        key = keys.get(col)
+        if key is None or not self.player.queue:
+            return
+        if getattr(self, "_last_sort_col", None) == col:
+            self._sort_desc = not getattr(self, "_sort_desc", False)
+        else:
+            self._last_sort_col, self._sort_desc = col, False
+        meta = self.library.by_path()
+        current = self.player.current_path()
+
+        def row_for(path):
+            if is_device_entry(path):
+                info = device_entry_info(path) or {}
+                row = dict(info.get("meta") or {})
+                row["source"] = info.get("source") or ""
+                return row
+            if is_cd_entry(path):
+                row = dict(cd_entry_meta(path))
+                row["source"] = "CD"
+                return row
+            return meta.get(path, {})
+
+        ordered = sorted(self.player.queue, key=lambda p: key(row_for(p)),
+                         reverse=self._sort_desc)
+        self._push_undo("Sort queue")
+        index = ordered.index(current) if current in ordered else -1
+        self.player.set_queue(ordered, index, play=False)
+        self.window().notify(f"Queue sorted by {QUEUE_COLS[col]}"
+                             f" ({'descending' if self._sort_desc else 'ascending'})")
+
+    def _move_row(self, src, dst):
+        paths = list(self.player.queue)
+        if not (0 <= src < len(paths)) or not (0 <= dst < len(paths)) or src == dst:
+            return
+        self._push_undo("Move in queue")
+        path = paths.pop(src)
+        paths.insert(dst, path)
+        current = self.player.current_path()
+        index = paths.index(current) if current in paths else self.player.index
+        self.player.set_queue(paths, index, play=False)
+
+    def _add_dropped(self, paths):
+        audio = [p for p in paths if is_audio(p)]
+        if not audio:
+            return
+        self._push_undo("Add files")
+        self.player.add_paths(audio, play_if_idle=False)
+        self.window().notify(f"Added {len(audio)} file(s) to the queue")
+
+    def add_files_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add files to queue", os.path.expanduser("~/Music"),
+            "Audio (*.mp3 *.flac *.ogg *.opus *.m4a *.mp4 *.aac *.wav *.wma *.aiff *.ape *.wv)",
+            options=FILE_DIALOG_OPTIONS)
+        self._add_dropped(paths)
+
+    def remove_selected(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not rows:
+            return
+        self._push_undo("Remove from queue")
+        self.player.remove_indices(rows)
+
+    def clear_queue(self):
+        if not self.player.queue:
+            return
+        self._push_undo("Clear queue")
+        self.current_playlist = None
+        self.queue_title_extra = ""
+        self.player.clear_queue()
+
+    def _queue_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        menu = QMenu(self)
+        if row >= 0:
+            menu.addAction("Play", lambda: self.play_row(row))
+            menu.addAction("Remove from queue", self.remove_selected)
+            menu.addAction("Move to top", lambda: self._move_row(row, 0))
+            menu.addSeparator()
+            menu.addAction("Add to playlist…", lambda: self._new_playlist_with(self.player.queue))
+        menu.addAction("Save queue as playlist…", self.save_playlist)
+        menu.addAction("Export .m3u8…", self.export_m3u)
+        menu.addSeparator()
+        menu.addAction("Clear queue", self.clear_queue)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    # ---------- undo / redo ----------
+    def _push_undo(self, label):
+        self.undo_stack.append((label, list(self.player.queue), self.player.index))
+        del self.undo_stack[:-60]
+        self.redo_stack.clear()
+
+    def _update_undo_ui(self):
+        self.undo_btn.setEnabled(bool(self.undo_stack))
+        self.redo_btn.setEnabled(bool(self.redo_stack))
+        self.undo_btn.setToolTip(f"Undo {self.undo_stack[-1][0]}" if self.undo_stack else "Nothing to undo")
+        self.redo_btn.setToolTip(f"Redo {self.redo_stack[-1][0]}" if self.redo_stack else "Nothing to redo")
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+        label, paths, index = self.undo_stack.pop()
+        self.redo_stack.append((label, list(self.player.queue), self.player.index))
+        self.player.set_queue(paths, index, play=False)
+        self.window().notify(f"Undo: {label}")
+
+    def redo(self):
+        if not self.redo_stack:
+            return
+        label, paths, index = self.redo_stack.pop()
+        self.undo_stack.append((label, list(self.player.queue), self.player.index))
+        self.player.set_queue(paths, index, play=False)
+        self.window().notify(f"Redo: {label}")
+
+    def _save_queue_state(self):
+        self.config["queue"] = list(self.player.queue)
+        self.config["queue_index"] = self.player.index
+
+    # ---------------- playlists ----------------
+    def reload_playlists(self):
+        names = self.playlists.names()
+        self.playlist_list.clear()
+        for name in names:
+            count = len(self.playlists.read(name))
+            item = QListWidgetItem(f"▸  {name}   ({count})")
+            item.setData(SMART_ROLE, name)
+            self.playlist_list.addItem(item)
+        self.queue_menu.clear()
+        for name in names:
+            self.queue_menu.addAction(name, lambda n=name: self.open_playlist(n))
+        if not names:
+            self.queue_menu.addAction("No playlists yet").setEnabled(False)
+        self.queue_menu.addSeparator()
+        self.queue_menu.addAction("New playlist from queue…", self.save_playlist)
+        self.queue_menu.addAction("Import .m3u8…", self.import_playlist)
+        self.queue_menu.addAction("Export queue…", self.export_m3u)
+        self.queue_menu.addAction("Refresh list", self.reload_playlists)
+
+    def _playlist_double(self, item):
+        self.open_playlist(item.data(SMART_ROLE))
+
+    def open_playlist(self, name):
+        paths = self.playlists.read(name)
+        if not paths:
+            self.window().notify(f"Playlist '{name}' is empty or its files are gone")
+            return
+        self._push_undo(f"Open playlist {name}")
+        self.player.set_queue(paths)
+        self.current_playlist = name
+        self.queue_title_extra = f"Playlist: {name}"
+        self.rebuild_queue()
+
+    def add_playlist_to_queue(self):
+        item = self.playlist_list.currentItem()
+        if item:
+            paths = self.playlists.read(item.data(SMART_ROLE))
+            self._push_undo("Add playlist")
+            self.player.add_paths(paths, play_if_idle=False)
+
+    def new_playlist(self):
+        self._new_playlist_with([])
+
+    def _new_playlist_with(self, paths):
+        name, ok = QInputDialog.getText(self, "New playlist", "Name:")
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        self.playlists.write(name, paths)
+        self.reload_playlists()
+        self.window().notify(f"Saved playlist '{name}'")
+
+    def _append_to_playlist(self, name, paths):
+        existing = self.playlists.read(name)
+        self.playlists.write(name, existing + [p for p in paths if p not in existing])
+        self.reload_playlists()
+        self.window().notify(f"Added {len(paths)} track(s) to '{name}'")
+
+    def save_playlist(self):
+        name = self.current_playlist
+        if not name:
+            name, ok = QInputDialog.getText(self, "Save queue as playlist", "Name:")
+            name = name.strip() if ok else ""
+            if not name:
+                return
+        self.playlists.write(name, list(self.player.queue))
+        self.current_playlist = name
+        self.queue_title_extra = f"Playlist: {name}"
+        self.queue_title.setText(self.queue_title_extra)
+        self.reload_playlists()
+        self.window().notify(f"Saved {len(self.player.queue)} tracks to '{name}'")
+
+    def rename_playlist(self):
+        item = self.playlist_list.currentItem()
+        if not item:
+            return
+        old = item.data(SMART_ROLE)
+        new, ok = QInputDialog.getText(self, "Rename playlist", "New name:", text=old)
+        new = new.strip() if ok else ""
+        if new and new != old and self.playlists.rename(old, new):
+            if self.current_playlist == old:
+                self.current_playlist = new
+                self.queue_title_extra = f"Playlist: {new}"
+            self.reload_playlists()
+
+    def delete_playlist(self):
+        item = self.playlist_list.currentItem()
+        if not item:
+            return
+        name = item.data(SMART_ROLE)
+        if QMessageBox.question(self, "Delete playlist", f"Delete '{name}'?") != QMessageBox.Yes:
+            return
+        self.playlists.remove(name)
+        if self.current_playlist == name:
+            self.current_playlist = None
+            self.queue_title_extra = ""
+        self.reload_playlists()
+
+    def import_playlist(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import playlist", os.path.expanduser("~/Music"),
+            "Playlists (*.m3u8 *.m3u)", options=FILE_DIALOG_OPTIONS)
+        if not path:
+            return
+        name = self.playlists.import_file(path)
+        if name:
+            self.reload_playlists()
+            self.window().notify(f"Imported '{name}'")
+        else:
+            QMessageBox.warning(self, "Import", "That playlist has no readable entries.")
+
+    def export_m3u(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export playlist", (self.current_playlist or "queue") + ".m3u8",
+            "Playlists (*.m3u8)", options=FILE_DIALOG_OPTIONS)
+        if path:
+            try:
+                self.playlists.write_file(path, self.player.queue)
+            except OSError as e:
+                QMessageBox.warning(self, "Export", str(e))
+                return
+            self.window().notify(f"Exported {len(self.player.queue)} track(s)")
+
+    def _playlist_menu(self, pos):
+        item = self.playlist_list.itemAt(pos)
+        menu = QMenu(self)
+        if item:
+            name = item.data(SMART_ROLE)
+            menu.addAction("Add to queue", lambda: (self._push_undo("Add playlist"),
+                                                    self.player.add_paths(self.playlists.read(name),
+                                                                          play_if_idle=False)))
+            menu.addAction("Replace queue", lambda: self.open_playlist(name))
+            menu.addAction("Burn to Disc…", lambda: self.window().burn_paths(self.playlists.read(name), name))
+            menu.addSeparator()
+        menu.addAction("New playlist…", self.new_playlist)
+        menu.addAction("Import…", self.import_playlist)
+        menu.addAction("Rename…", self.rename_playlist)
+        menu.addAction("Delete", self.delete_playlist)
+        menu.exec(self.playlist_list.viewport().mapToGlobal(pos))
+
+    # ---------------- smart playlists ----------------
+    def reload_smart(self):
+        self.smart_list.clear()
+        for preset in SMART_PRESETS:
+            count = len(self.smart.preset_tracks(self.library, preset))
+            item = QListWidgetItem(f"▸  {preset['name']}   ({count})")
+            item.setToolTip(preset["hint"])
+            item.setData(SMART_ROLE, {"preset": preset["name"]})
+            self.smart_list.addItem(item)
+        for custom in self.smart.items:
+            count = len(self.smart.tracks(custom))
+            item = QListWidgetItem(f"▸  {custom.get('name')}   ({count})")
+            item.setToolTip("Custom rule: " + ", ".join(
+                f"{r.get('field')} {r.get('op')} {r.get('value')}" for r in custom.get("rules", [])))
+            item.setData(SMART_ROLE, {"custom": custom.get("name")})
+            self.smart_list.addItem(item)
+
+    def _smart_item_tracks(self, data):
+        if not data:
+            return []
+        if "preset" in data:
+            for preset in SMART_PRESETS:
+                if preset["name"] == data["preset"]:
+                    return self.smart.preset_tracks(self.library, preset)
+            return []
+        for custom in self.smart.items:
+            if custom.get("name") == data["custom"]:
+                return self.smart.tracks(custom)
+        return []
+
+    def _smart_double(self, item):
+        paths = [r["path"] for r in self._smart_item_tracks(item.data(SMART_ROLE))]
+        if paths:
+            self._push_undo("Add smart playlist")
+            self.player.add_paths(paths, play_if_idle=False)
+            self.window().notify(f"Added {len(paths)} tracks from “{item.text()}”")
+
+    def add_smart_to_queue(self):
+        item = self.smart_list.currentItem()
+        if item:
+            self._smart_double(item)
+
+    def new_smart(self):
+        dialog = SmartPlaylistDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            item = dialog.result_item()
+            if not item["rules"]:
+                QMessageBox.information(self, "Smart playlist", "Add at least one rule.")
+                return
+            self.smart.add(item)
+            self.reload_smart()
+
+    def edit_smart(self):
+        current = self.smart_list.currentItem()
+        data = current.data(SMART_ROLE) if current else None
+        if not data or "custom" not in data:
+            QMessageBox.information(self, "Smart playlist", "Only custom smart playlists can be edited.")
+            return
+        name = data["custom"]
+        existing = next((s for s in self.smart.items if s.get("name") == name), None)
+        if not existing:
+            return
+        dialog = SmartPlaylistDialog(self, existing)
+        if dialog.exec() == QDialog.Accepted:
+            item = dialog.result_item()
+            self.smart.remove(name)
+            self.smart.add(item)
+            self.reload_smart()
+
+    def delete_smart(self):
+        current = self.smart_list.currentItem()
+        data = current.data(SMART_ROLE) if current else None
+        if not data or "custom" not in data:
+            QMessageBox.information(self, "Smart playlist", "Built-in smart playlists cannot be deleted.")
+            return
+        if QMessageBox.question(self, "Delete", f"Delete '{data['custom']}'?") == QMessageBox.Yes:
+            self.smart.remove(data["custom"])
+            self.reload_smart()
+
+    def _smart_menu(self, pos):
+        item = self.smart_list.itemAt(pos)
+        menu = QMenu(self)
+        if item:
+            menu.addAction("Add to queue", lambda: self._smart_double(item))
+            menu.addAction("Replace queue and play", lambda: (self._push_undo("Play smart playlist"),
+                                                              self.player.set_queue(
+                                                                  [r["path"] for r in self._smart_item_tracks(
+                                                                      item.data(SMART_ROLE))], 0, play=True)))
+            menu.addSeparator()
+        menu.addAction("New smart playlist…", self.new_smart)
+        menu.addAction("Edit…", self.edit_smart)
+        menu.addAction("Delete", self.delete_smart)
+        menu.exec(self.smart_list.viewport().mapToGlobal(pos))
+
+    # ---------------- collections ----------------
+    def reload_collections(self):
+        cols = migrate_collections(self.config)
+        if not hasattr(self, "collection_combo"):
+            return
+        self.collection_combo.blockSignals(True)
+        self.collection_combo.clear()
+        for entry in cols:
+            self.collection_combo.addItem(entry["name"])
+        self.collection_combo.setCurrentIndex(self.config.get("active_collection", 0))
+        self.collection_combo.blockSignals(False)
+
+    def _collection_selected(self, index):
+        if index < 0:
+            return
+        if index == int(self.config.get("active_collection", 0)):
+            return
+        window = self.window()
+        if hasattr(window, "switch_collection"):
+            window.switch_collection(index)
+        else:
+            cols = migrate_collections(self.config)
+            if 0 <= index < len(cols):
+                store_active_collection(self.config)
+                self.config["active_collection"] = index
+                self.config["library_folders"] = list(cols[index]["folders"])
+                save_config(self.config)
+                self.library.set_db_file(cols[index]["db"])
+                self.reset_after_collection_change()
+
+    def reset_after_collection_change(self):
+        self.cover_cache.clear()
+        self.cover_pix_cache.clear()
+        self._rows_cache = {}
+        self.current_playlist = None
+        self.reload_collections()
+        self.refresh()
+        self.reload_playlists()
+        self.reload_smart()
+        self.rebuild_queue()
+
+    def new_collection(self):
+        name, ok = QInputDialog.getText(self, "New collection", "Collection name:",
+                                        text="Collection")
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        store_active_collection(self.config)
+        cols = migrate_collections(self.config)
+        if any(c["name"].lower() == name.lower() for c in cols):
+            QMessageBox.information(self, "New collection",
+                                    "A collection with that name already exists.")
+            return
+        cols.append({"name": name, "folders": [], "db": new_collection_db(name)})
+        self.config["collections"] = cols
+        save_config(self.config)
+        window = self.window()
+        index = len(cols) - 1
+        if hasattr(window, "switch_collection"):
+            window.switch_collection(index)
+        else:
+            self.reload_collections()
+        if QMessageBox.question(self, "New collection",
+                                "Add a music folder to '%s' now?" % name) == QMessageBox.Yes:
+            self.add_folder()
+
+    def rename_collection(self):
+        cols = migrate_collections(self.config)
+        index = int(self.config.get("active_collection", 0))
+        if not (0 <= index < len(cols)):
+            return
+        name, ok = QInputDialog.getText(self, "Rename collection", "Name:",
+                                        text=cols[index]["name"])
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        cols[index]["name"] = name
+        save_config(self.config)
+        self.reload_collections()
+
+    def remove_collection(self):
+        cols = migrate_collections(self.config)
+        index = int(self.config.get("active_collection", 0))
+        if len(cols) <= 1:
+            QMessageBox.information(self, "Remove collection",
+                                    "Keep at least one collection.")
+            return
+        if QMessageBox.question(
+                self, "Remove collection",
+                "Remove '%s' from the collection list?\n\n"
+                "Its database file is kept on disk." % cols[index]["name"]) \
+                != QMessageBox.Yes:
+            return
+        del cols[index]
+        self.config["collections"] = cols
+        self.config["active_collection"] = 0
+        self.config["library_folders"] = list(cols[0]["folders"])
+        save_config(self.config)
+        window = self.window()
+        if hasattr(window, "switch_collection"):
+            window.switch_collection(0, force=True)
+        else:
+            self.library.set_db_file(cols[0]["db"])
+            self.reset_after_collection_change()
+
+    # ---------------- folders / scanning ----------------
+    def add_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Add music folder", os.path.expanduser("~/Music"),
+            options=DIRECTORY_DIALOG_OPTIONS)
+        self.add_folders([folder] if folder else [])
+
+    def add_folders(self, folders):
+        """Add one or more music folders to this collection and scan them."""
+        added = [f for f in folders if f and f not in self.config["library_folders"]]
+        if not added:
+            return []
+        self.config["library_folders"].extend(added)
+        store_active_collection(self.config)
+        save_config(self.config)
+        self.folders_changed.emit()
+        self.rescan()
+        return added
+
+    def remove_folder(self, folder=None):
+        """Drop a music folder and everything it contributed to the library.
+
+        `folder` is optional so the folder list and tests can remove a known
+        path without the modal dialog.
+        """
+        folders = self.config["library_folders"]
+        if not folders:
+            return
+        if folder is None:
+            folder, ok = QInputDialog.getItem(self, "Remove folder", "Folder:",
+                                              folders, 0, False)
+            if not ok:
+                return
+        if folder not in folders:
+            return
+        folders.remove(folder)
+        store_active_collection(self.config)
+        save_config(self.config)
+        gone = self.library.forget_prefix(folder)
+        self.refresh()
+        self.reload_smart()
+        self.rebuild_queue()
+        self.folders_changed.emit()
+        self.rescan()
+        self.window().notify("Removed %s — %d track(s) dropped" %
+                             (os.path.basename(folder.rstrip(os.sep)) or folder, gone))
+
+    def reset_play_counts(self):
+        if QMessageBox.question(self, "Reset", "Reset play counts for every track?") == QMessageBox.Yes:
+            self.library.reset_play_counts()
+            self.refresh()
+            self.reload_smart()
+            self.rebuild_queue()
+
+    def _auto_rescan(self):
+        if self.config.get("library_folders"):
+            self.rescan(silent=True)
+
+    def rescan(self, silent=False):
+        if getattr(self, "_scan", None) and self._scan.isRunning():
+            # one pass is already running: queue a fresh one instead of
+            # silently ignoring the request (that is what made a removed
+            # folder linger in the library)
+            self._scan_again = True
+            return
+        self._scan_again = False
+        folders = list(self.config["library_folders"])
+        if not folders and not silent:
+            self.window().notify("Library is empty — add a music folder")
+        self._scan_silent = silent
+        if not silent:
+            self.scan_bar.show()
+            self.scan_bar.setFormat("Scanning… %v/%m")
+        self._scan = Worker(lambda prog, _log, cancel:
+                            self.library.scan(folders, prog, cancel), self)
+        self._scan.progress.connect(lambda d, t, _m: (self.scan_bar.setMaximum(max(t, 1)),
+                                                      self.scan_bar.setValue(d)))
+        self._scan.done.connect(lambda _r: self._scan_done())
+        self._scan.failed.connect(lambda e: (self.scan_bar.hide(),
+                                             None if silent else
+                                             QMessageBox.warning(self, "Scan failed", e)))
+        self._scan.start()
+
+    def _scan_done(self):
+        self.scan_bar.hide()
+        count = self.library.count()
+        changed = count != self._last_count
+        self._last_count = count
+        if getattr(self, "_scan_again", False):
+            self._scan_again = False
+            if changed:
+                self.refresh()
+                self.reload_smart()
+                self.cover_cache.clear()
+                self.player._covers.clear()
+                self.rebuild_queue()
+            self.rescan(silent=self._scan_silent)
+            return
+        if self._scan_silent and not changed:
+            return
+        self.refresh()
+        self.reload_smart()
+        self.cover_cache.clear()
+        self.player._covers.clear()
+        self.rebuild_queue()
+        self.folders_changed.emit()
+        self.window().notify(f"Library updated — {count} tracks")
+
+    def shutdown(self):
+        self._save_queue_state()
+        self.config["split"] = self.split.sizes()
+        if getattr(self, "details", False) and self.columns:
+            self.config["lib_column_widths"] = [self.tree.columnWidth(i)
+                                                for i in range(len(self.columns))]
+# ======================================================================
+# ui/tagger_tab.py
+# ======================================================================
+KEEP = "< keep >"
+# the tag panel exposes the nine core fields plus Comment, like mp3tag's
+EDIT_FIELDS = FIELDS + ["comment"]
+COLS = ["filename", "title", "tracknumber", "artist", "albumartist", "album",
+        "discnumber", "tag", "date", "genre", "comment"]
+LABELS = {"filename": "Filename", "title": "Title", "artist": "Artist",
+          "album": "Album", "albumartist": "Album artist", "tracknumber": "Track",
+          "discnumber": "Disc", "date": "Year", "genre": "Genre",
+          "composer": "Composer", "tag": "Tag", "comment": "Comment"}
+COL_WIDTHS = {"filename": 200, "title": 150, "tracknumber": 46, "artist": 105,
+              "albumartist": 105, "album": 130, "discnumber": 46, "tag": 108,
+              "date": 46, "genre": 78, "comment": 110}
+NUMERIC_COLS = {"tracknumber", "discnumber", "date"}
+
+
+def tool_icon(kind, color="#c9c9c9", size=48):
+    """Small flat toolbar icons, drawn so no icon theme is required."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(size * 0.072)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    s = float(size)
+
+    def line(x1, y1, x2, y2):
+        p.drawLine(int(x1 * s), int(y1 * s), int(x2 * s), int(y2 * s))
+
+    if kind == "open":
+        p.drawPolygon(QPolygonF([
+            QPointF(0.13 * s, 0.28 * s), QPointF(0.40 * s, 0.28 * s),
+            QPointF(0.48 * s, 0.37 * s), QPointF(0.87 * s, 0.37 * s),
+            QPointF(0.87 * s, 0.76 * s), QPointF(0.13 * s, 0.76 * s)]))
+        line(0.13, 0.44, 0.87, 0.44)
+    elif kind == "add":
+        line(0.5, 0.22, 0.5, 0.78)
+        line(0.22, 0.5, 0.78, 0.5)
+    elif kind == "remove":
+        line(0.22, 0.5, 0.78, 0.5)
+    elif kind == "clear":
+        line(0.28, 0.28, 0.72, 0.72)
+        line(0.72, 0.28, 0.28, 0.72)
+    elif kind == "save":
+        line(0.5, 0.14, 0.5, 0.56)
+        p.drawPolyline(QPolygonF([QPointF(0.33 * s, 0.42 * s),
+                                  QPointF(0.5 * s, 0.60 * s),
+                                  QPointF(0.67 * s, 0.42 * s)]))
+        p.drawPolyline(QPolygonF([QPointF(0.18 * s, 0.62 * s),
+                                  QPointF(0.18 * s, 0.82 * s),
+                                  QPointF(0.82 * s, 0.82 * s),
+                                  QPointF(0.82 * s, 0.62 * s)]))
+    elif kind in ("undo", "redo"):
+        if kind == "redo":
+            p.save()
+            p.translate(s, 0)
+            p.scale(-1, 1)
+        p.drawArc(int(0.20 * s), int(0.26 * s), int(0.60 * s), int(0.56 * s),
+                  0 * 16, 150 * 16)
+        p.drawPolyline(QPolygonF([QPointF(0.25 * s, 0.28 * s),
+                                  QPointF(0.10 * s, 0.42 * s),
+                                  QPointF(0.27 * s, 0.52 * s)]))
+        if kind == "redo":
+            p.restore()
+    elif kind in ("tag_from_name", "name_from_tag"):
+        line(0.16, 0.30, 0.46, 0.30)
+        line(0.16, 0.50, 0.46, 0.50)
+        line(0.16, 0.70, 0.46, 0.70)
+        if kind == "tag_from_name":
+            line(0.54, 0.50, 0.86, 0.50)
+            p.drawPolyline(QPolygonF([QPointF(0.72 * s, 0.34 * s),
+                                      QPointF(0.54 * s, 0.50 * s),
+                                      QPointF(0.72 * s, 0.66 * s)]))
+        else:
+            line(0.86, 0.50, 0.54, 0.50)
+            p.drawPolyline(QPolygonF([QPointF(0.68 * s, 0.34 * s),
+                                      QPointF(0.86 * s, 0.50 * s),
+                                      QPointF(0.68 * s, 0.66 * s)]))
+    elif kind == "number":
+        line(0.38, 0.16, 0.31, 0.84)
+        line(0.69, 0.16, 0.62, 0.84)
+        line(0.18, 0.38, 0.84, 0.33)
+        line(0.15, 0.66, 0.81, 0.61)
+    elif kind == "replace":
+        line(0.20, 0.36, 0.72, 0.36)
+        p.drawPolyline(QPolygonF([QPointF(0.60 * s, 0.22 * s),
+                                  QPointF(0.80 * s, 0.36 * s),
+                                  QPointF(0.60 * s, 0.50 * s)]))
+        line(0.80, 0.66, 0.28, 0.66)
+        p.drawPolyline(QPolygonF([QPointF(0.40 * s, 0.52 * s),
+                                  QPointF(0.20 * s, 0.66 * s),
+                                  QPointF(0.40 * s, 0.80 * s)]))
+    elif kind == "case":
+        p.drawPolyline(QPolygonF([QPointF(0.06 * s, 0.76 * s),
+                                  QPointF(0.26 * s, 0.22 * s),
+                                  QPointF(0.46 * s, 0.76 * s)]))
+        line(0.15, 0.56, 0.37, 0.56)
+        p.drawEllipse(int(0.58 * s), int(0.48 * s), int(0.32 * s), int(0.28 * s))
+        line(0.90, 0.48, 0.90, 0.76)
+    elif kind == "online":
+        p.drawArc(int(0.12 * s), int(0.30 * s), int(0.34 * s), int(0.30 * s), 60 * 16, 240 * 16)
+        p.drawArc(int(0.26 * s), int(0.22 * s), int(0.46 * s), int(0.38 * s), 20 * 16, 220 * 16)
+        p.drawArc(int(0.58 * s), int(0.34 * s), int(0.30 * s), int(0.26 * s), 270 * 16, 200 * 16)
+        p.drawLine(int(0.20 * s), int(0.56 * s), int(0.80 * s), int(0.56 * s))
+        line(0.50, 0.62, 0.50, 0.86)
+        p.drawPolyline(QPolygonF([QPointF(0.38 * s, 0.74 * s),
+                                  QPointF(0.50 * s, 0.86 * s),
+                                  QPointF(0.62 * s, 0.74 * s)]))
+    elif kind == "search":
+        p.drawEllipse(int(0.20 * s), int(0.18 * s), int(0.44 * s), int(0.44 * s))
+        line(0.60, 0.60, 0.82, 0.82)
+    p.end()
+    return QIcon(pm)
+
+
+class TaggerTab(QWidget):
+    def __init__(self, library, parent=None):
+        super().__init__(parent)
+        self.library = library
+        self.files = []     # list of dicts: path, tags, orig, newname
+        self._updating = False
+        self._restoring = False
+        self._undo_stack = []
+        self._redo_stack = []
+        self._sort_key = ""
+        self._sort_desc = False
+        self.editors = {}
+        self.column_actions = {}
+        self.tool_buttons = {}
+
+        # ---------------- toolbar (flat icons, grouped like mp3tag's)
+        bar = QWidget()
+        bar.setObjectName("TagToolbar")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(10, 5, 10, 5)
+        h.setSpacing(2)
+        groups = [
+            [("open", "Open folder…", "Ctrl+O", self.open_folder),
+             ("add", "Add files…", "Ctrl+Shift+O", self.add_files),
+             ("remove", "Remove selected files", "Del", self.remove_selected),
+             ("save", "Save tag", "Ctrl+S", self.save)],
+            [("undo", "Undo", "Ctrl+Z", self.undo),
+             ("redo", "Redo", "Ctrl+Y", self.redo)],
+            [("tag_from_name", "Filename → Tag", "Alt+1", self.tag_from_name),
+             ("name_from_tag", "Tag → Filename", "Alt+2", self.name_from_tag),
+             ("number", "Auto-numbering wizard…", "", self.auto_number)],
+            [("replace", "Replace…", "Ctrl+H", self.replace_text),
+             ("case", "Case conversion…", "", self.case_convert)],
+            [("online", "Look up metadata & cover…", "Ctrl+M", self.lookup_online)],
+        ]
+        for gi, group in enumerate(groups):
+            if gi:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.VLine)
+                sep.setObjectName("TagToolSep")
+                h.addWidget(sep)
+            for kind, tip, shortcut, slot in group:
+                button = QToolButton()
+                button.setObjectName("TagTool")
+                button.setIcon(tool_icon(kind))
+                button.setIconSize(QSize(18, 18))
+                button.setAutoRaise(True)
+                button.setToolTip(f"{tip}  ({shortcut})" if shortcut else tip)
+                button.clicked.connect(slot)
+                self.tool_buttons[kind] = button
+                h.addWidget(button)
+        h.addStretch(1)
+        self.toolbar = bar
+
+        # ---------------- tag panel (labels above the fields, two columns)
+        panel = QWidget()
+        panel.setObjectName("TagPanel")
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(16, 14, 16, 12)
+        pl.setSpacing(10)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        heading = QLabel("Tag")
+        heading.setObjectName("Heading")
+        self.count_label = QLabel("No files loaded")
+        self.count_label.setObjectName("Muted")
+        head.addWidget(heading)
+        head.addStretch(1)
+        head.addWidget(self.count_label)
+        pl.addLayout(head)
+
+        self.cover = QLabel()
+        self.cover.setFixedSize(168, 168)
+        self.cover.setAlignment(Qt.AlignCenter)
+        self.cover.setObjectName("TagCover")
+        self.cover.setText("♪")
+        self.cover.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.cover_menu = CoverMenu(self, self)
+        self.cover.customContextMenuRequested.connect(
+            lambda pos: self.cover_menu.popup(self.cover, pos))
+        self.cover.setToolTip("Right-click for cover actions")
+        pl.addWidget(self.cover, 0, Qt.AlignHCenter)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        rows = [("title",), ("artist",), ("album",),
+                ("albumartist", "tracknumber"), ("date", "discnumber"),
+                ("genre", "composer"), ("comment",)]
+        for r, spec in enumerate(rows):
+            for c, field in enumerate(spec):
+                widget = self._field_widget(field)
+                if len(spec) == 1:
+                    grid.addWidget(widget, r, 0, 1, 2)
+                else:
+                    grid.addWidget(widget, r, c, 1, 1)
+        pl.addLayout(grid)
+
+        ext_head = QHBoxLayout()
+        ext_heading = QLabel("Extended tags")
+        ext_heading.setObjectName("FieldLabel")
+        ext_add = QPushButton("Add…")
+        ext_add.clicked.connect(self._ext_add)
+        ext_remove = QPushButton("Remove")
+        ext_remove.clicked.connect(self._ext_remove)
+        ext_head.addWidget(ext_heading)
+        ext_head.addStretch(1)
+        ext_head.addWidget(ext_add)
+        ext_head.addWidget(ext_remove)
+        pl.addLayout(ext_head)
+        self._ext_keys = []
+        self.ext_table = QTableWidget(0, 2)
+        self.ext_table.setHorizontalHeaderLabels(["Key", "Value"])
+        self.ext_table.verticalHeader().setVisible(False)
+        self.ext_table.horizontalHeader().setStretchLastSection(True)
+        self.ext_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ext_table.setEditTriggers(QAbstractItemView.DoubleClicked
+                                       | QAbstractItemView.EditKeyPressed)
+        self.ext_table.setMinimumHeight(140)
+        self.ext_table.itemChanged.connect(self._ext_edit)
+        pl.addWidget(self.ext_table)
+        pl.addStretch(1)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("TagStatus")
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setMinimumWidth(360)
+        scroll.setMaximumWidth(560)
+        self.side_panel = scroll
+
+        # ---------------- file list
+        self.table = QTableWidget(0, len(COLS))
+        self.table.setHorizontalHeaderLabels([LABELS[c] for c in COLS])
+        for col, key in enumerate(COLS):
+            self.table.setColumnWidth(col, COL_WIDTHS.get(key, 120))
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setSortIndicatorShown(True)
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._sort_by)
+        self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(23)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setSortingEnabled(False)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked
+                                   | QAbstractItemView.EditKeyPressed)
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.table.itemChanged.connect(self._cell_edit)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
+
+        # mp3tag keeps the filter under the file list, next to the file count
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setObjectName("FilterInput")
+        self.filter_edit.setPlaceholderText("Filter files…")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.addAction(tool_icon("search", MUTED), QLineEdit.LeadingPosition)
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        self.filter_bar = QWidget()
+        self.filter_bar.setObjectName("TagListFooter")
+        frow = QHBoxLayout(self.filter_bar)
+        frow.setContentsMargins(8, 5, 10, 5)
+        frow.setSpacing(8)
+        frow.addWidget(QLabel("Filter:"))
+        frow.addWidget(self.filter_edit, 1)
+        frow.addWidget(self.status_label)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(0)
+        rl.addWidget(self.table, 1)
+        rl.addWidget(self.filter_bar)
+        self.list_panel = right
+
+        split = QSplitter()
+        split.addWidget(scroll)
+        split.addWidget(right)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([400, 1040])
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.toolbar)
+        lay.addWidget(split, 1)
+        self._update_status()
+
+    def _field_widget(self, field):
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(3)
+        label = QLabel(LABELS[field])
+        label.setObjectName("FieldLabel")
+        edit = QComboBox()
+        edit.setEditable(True)
+        edit.setInsertPolicy(QComboBox.NoInsert)
+        edit.lineEdit().editingFinished.connect(lambda f=field: self._panel_edit(f))
+        edit.activated.connect(lambda _i, f=field: self._panel_edit(f))
+        self.editors[field] = edit
+        v.addWidget(label)
+        v.addWidget(edit)
+        return box
+
+    # ---------- filter, columns, status ----------
+    def _apply_filter(self, *_args):
+        text = self.filter_edit.text().strip().lower()
+        tokens = [t for t in text.split() if t]
+        for r in range(self.table.rowCount()):
+            values = []
+            for c in range(len(COLS)):
+                item = self.table.item(r, c)
+                values.append(item.text().lower() if item else "")
+            self.table.setRowHidden(r, bool(tokens)
+                                    and not all(any(tok in v for v in values) for tok in tokens))
+        self._update_status()
+
+    def focus_filter(self):
+        self.set_filter_visible(True)
+        self.filter_edit.setFocus()
+        self.filter_edit.selectAll()
+
+    def set_filter_visible(self, on):
+        self.filter_bar.setVisible(bool(on))
+
+    def set_toolbar_visible(self, on):
+        self.toolbar.setVisible(bool(on))
+
+    def set_panel_visible(self, on):
+        self.side_panel.setVisible(bool(on))
+
+    def set_file_list_visible(self, on):
+        self.list_panel.setVisible(bool(on))
+
+    def set_column_visible(self, key, on):
+        if key in COLS:
+            self.table.setColumnHidden(COLS.index(key), not on)
+
+    def column_visible(self, key):
+        return not self.table.isColumnHidden(COLS.index(key)) if key in COLS else False
+
+    def _selection_changed(self):
+        self._fill_panel()
+        self._fill_ext()
+        self._fill_cover()
+        self._update_status()
+
+    def _update_status(self):
+        rows = len(self.files)
+        shown = sum(0 if self.table.isRowHidden(r) else 1 for r in range(rows))
+        selected = len({i.row() for i in self.table.selectedIndexes()})
+        size = 0
+        for entry in self.files:
+            try:
+                size += os.path.getsize(entry["path"])
+            except OSError:
+                pass
+        parts = [f"{shown} files" if shown != rows else f"{rows} files"]
+        if selected:
+            parts.append(f"{selected} selected")
+        parts.append(fmt_human_size(size) if size else "0 bytes")
+        dirty = len(self._dirty())
+        if dirty:
+            parts.append(f"{dirty} modified")
+        self.status_label.setText("  ·  ".join(parts))
+
+    def _sort_by(self, index):
+        if not (0 <= index < len(COLS)):
+            return
+        key = COLS[index]
+        self._sort_desc = (self._sort_key == key and not self._sort_desc)
+        self._sort_key = key
+
+        def sort_key(f):
+            if key == "filename":
+                return ((f["newname"] or os.path.basename(f["path"])).lower(), f["path"])
+            if key == "tag":
+                return (tag_label(f["path"]).lower(), f["path"])
+            value = (f["tags"].get(key) or "").lower()
+            if key in NUMERIC_COLS:
+                head = value.split("/")[0].strip()
+                return (int(head) if head.isdigit() else -1, value, f["path"])
+            return (value, f["path"])
+
+        self.files.sort(key=sort_key, reverse=self._sort_desc)
+        self.table.horizontalHeader().setSortIndicator(
+            index, Qt.DescendingOrder if self._sort_desc else Qt.AscendingOrder)
+        self._rebuild()
+
+    # ---------- undo, clipboard ----------
+    def _snapshot(self):
+        return [(f["path"], _copy_tags(f["tags"]), _copy_tags(f["orig"]), f["newname"])
+                for f in self.files]
+
+    def _push_undo(self):
+        if self._restoring:
+            return
+        snap = self._snapshot()
+        if not self._undo_stack or self._undo_stack[-1] != snap:
+            self._undo_stack.append(snap)
+            del self._undo_stack[:-80]
+        self._redo_stack.clear()
+
+    def _restore(self, snap):
+        self._restoring = True
+        self.files = [{"path": p, "tags": _copy_tags(t), "orig": _copy_tags(o), "newname": n}
+                      for p, t, o, n in snap]
+        self._restoring = False
+        self._rebuild()
+
+    def undo(self):
+        if not self._undo_stack:
+            self.window().notify("Nothing to undo")
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore(self._undo_stack.pop())
+        self.window().notify("Undo")
+
+    def redo(self):
+        if not self._redo_stack:
+            self.window().notify("Nothing to redo")
+            return
+        self._undo_stack.append(self._snapshot())
+        self._restore(self._redo_stack.pop())
+        self.window().notify("Redo")
+
+    def revert(self):
+        """Reload every listed file from disk, dropping unsaved edits."""
+        if not self.files:
+            return
+        if self._dirty() and QMessageBox.question(
+                self, "Revert", "Discard unsaved changes and reload from disk?") \
+                != QMessageBox.Yes:
+            return
+        self._push_undo()
+        for f in self.files:
+            tags = self._read_values(f["path"])
+            f["tags"] = tags
+            f["orig"] = _copy_tags(tags)
+            f["newname"] = None
+            f.pop("cover", None)
+        self._rebuild()
+        self.window().notify("Reloaded tags from disk")
+
+    def remove_selected(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        self._push_undo()
+        for r in rows:
+            if 0 <= r < len(self.files):
+                del self.files[r]
+        self._rebuild()
+
+    def select_all(self):
+        self.table.selectAll()
+
+    def deselect_all(self):
+        self.table.clearSelection()
+
+    def invert_selection(self):
+        chosen = {i.row() for i in self.table.selectedIndexes()}
+        self.table.clearSelection()
+        for r in range(self.table.rowCount()):
+            if r in chosen or self.table.isRowHidden(r):
+                continue
+            for c in range(self.table.columnCount()):
+                item = self.table.item(r, c)
+                if item:
+                    item.setSelected(True)
+
+    def copy_selection(self):
+        cells = sorted((i.row(), i.column()) for i in self.table.selectedIndexes())
+        if not cells:
+            return
+        lines, line, current = [], [], None
+        for r, c in cells:
+            if current is not None and r != current:
+                lines.append("\t".join(line))
+                line = []
+            item = self.table.item(r, c)
+            line.append(item.text() if item else "")
+            current = r
+        if line:
+            lines.append("\t".join(line))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.window().notify(f"Copied {len(cells)} cell(s)")
+
+    def paste_selection(self):
+        text = QApplication.clipboard().text()
+        if not text.strip():
+            return
+        rows = [line.split("\t") for line in text.replace("\r\n", "\n").split("\n")]
+        while rows and rows[-1] == [""]:
+            rows.pop()
+        if not rows:
+            return
+        start_row = max(0, self.table.currentRow())
+        start_col = max(0, self.table.currentColumn())
+        self._push_undo()
+        touched = set()
+        for dr, values in enumerate(rows):
+            r = start_row + dr
+            if r >= len(self.files):
+                break
+            for dc, value in enumerate(values):
+                c = start_col + dc
+                if c >= len(COLS):
+                    break
+                key = COLS[c]
+                if key == "tag":
+                    continue
+                if key == "filename":
+                    base = os.path.basename(self.files[r]["path"])
+                    self.files[r]["newname"] = None if value == base else value
+                else:
+                    self.files[r]["tags"][key] = value
+                touched.add(r)
+        self._refresh_rows(sorted(touched))
+        self.window().notify(f"Pasted into {len(touched)} file(s)")
+
+    def cut_selection(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not rows:
+            return
+        self.copy_selection()
+        self._push_undo()
+        for r in rows:
+            for key in EDIT_FIELDS:
+                self.files[r]["tags"][key] = ""
+        self._refresh_rows(rows)
+
+    # ---------- loading ----------
+    def _read_values(self, path):
+        tags = read_tags(path)
+        out = {k: tags.get(k, "") for k in FIELDS}
+        out["comment"] = read_extra_tags(path).get("comment", "")
+        out["ext"] = read_extended(path)
+        return out
+
+    def load_paths(self, paths):
+        known = {f["path"] for f in self.files}
+        todo = [p for p in paths if p not in known and is_audio(p)]
+        total = len(todo)
+        added = 0
+        bar = None
+        if total > 1:
+            # reading tags is the slow part of opening a folder: say which file it is on
+            bar = QProgressDialog(f"Reading files 0/{total}", "Cancel", 0, total, self)
+            bar.setWindowTitle("Reading files")
+            bar.setWindowModality(Qt.WindowModal)
+            bar.setMinimumDuration(0 if total <= 20 else 200)
+            bar.setValue(0)
+            QApplication.processEvents()
+        stopped = False
+        try:
+            for i, p in enumerate(todo, 1):
+                if bar is not None:
+                    bar.setLabelText(f"Reading files {i}/{total}")
+                    bar.setValue(i)
+                    if bar.wasCanceled():
+                        stopped = True
+                        break
+                tags = self._read_values(p)
+                self.files.append({"path": p, "tags": tags,
+                                   "orig": _copy_tags(tags), "newname": None})
+                added += 1
+        finally:
+            if bar is not None:
+                bar.close()
+                bar.deleteLater()
+        if stopped:
+            self.window().notify(f"Stopped after {added} of {total} files")
+        if added:
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+        self._rebuild()
+        if added:
+            first = len(self.files) - added
+            self.table.selectRow(first)
+            self.table.setCurrentCell(first, 1)
+
+    def open_folder(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Open folder", os.path.expanduser("~/Music"),
+            options=DIRECTORY_DIALOG_OPTIONS)
+        if d:
+            paths = [os.path.join(r, n) for r, _d, ns in os.walk(d) for n in sorted(ns)]
+            self.load_paths(sorted(paths))
+
+    def add_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add files", os.path.expanduser("~/Music"),
+            "Audio (*.mp3 *.flac *.ogg *.opus *.m4a *.mp4 *.aac *.wma *.wav *.aiff)",
+            options=FILE_DIALOG_OPTIONS)
+        self.load_paths(paths)
+
+    def clear(self):
+        if self._dirty() and QMessageBox.question(self, "Discard",
+                                                  "Discard unsaved changes?") != QMessageBox.Yes:
+            return
+        if self.files:
+            self._push_undo()
+        self.files = []
+        self._rebuild()
+
+    def _dirty(self):
+        return [f for f in self.files
+                if f["tags"] != f["orig"] or f["newname"] or "cover" in f]
+
+    def lookup_online(self):
+        rows = []
+        for entry in self.files:
+            tags = read_tags(entry["path"])
+            tags["path"] = entry["path"]
+            rows.append(tags)
+        if not rows:
+            self.window().notify("Load some files first")
+            return
+        dialog = OnlineLookupDialog(rows, self.library, self)
+        dialog.exec()
+        if dialog.applied:
+            for entry in self.files:
+                tags = self._read_values(entry["path"])
+                entry["tags"] = tags
+                entry["orig"] = _copy_tags(tags)
+                entry["newname"] = None
+            self._rebuild()
+            self.window().notify("Online metadata applied")
+
+    def _rebuild(self):
+        self._updating = True
+        self.table.setRowCount(len(self.files))
+        for r, f in enumerate(self.files):
+            self._set_row(r, f)
+        self._updating = False
+        self.count_label.setText(f"{len(self.files)} files")
+        self._fill_cover()
+        self._fill_panel()
+        self._fill_ext()
+        self._apply_filter()
+        self._update_status()
+
+    def _set_row(self, r, f):
+        dirty = f["tags"] != f["orig"] or f["newname"]
+        name = f["newname"] or os.path.basename(f["path"])
+        for c, col in enumerate(COLS):
+            if col == "tag":
+                val = tag_label(f["path"])
+            elif col == "filename":
+                val = name
+            else:
+                val = f["tags"].get(col, "")
+            it = QTableWidgetItem(val)
+            if col == "tag":
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                it.setForeground(QBrush(QColor(MUTED)))
+            elif dirty:
+                it.setForeground(QBrush(QColor(AMBER)))
+            if col in NUMERIC_COLS:
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table.setItem(r, c, it)
+
+    def _fill_cover(self):
+        path, data, kind, desc = self.cover_host()
+        pm = QPixmap()
+        if data and pm.loadFromData(data):
+            self.cover.setText("")
+            self.cover.setPixmap(pm.scaled(168, 168, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            role = cover_type_name(kind)
+            if desc and desc != role:
+                role += f" \u00b7 {desc}"
+            self.cover.setToolTip(f"{_image_mime(data)} \u00b7 {pm.width()}\u00d7{pm.height()}\n"
+                                  f"{fmt_human_size(len(data))} \u00b7 {role}\n"
+                                  "Right-click for cover actions")
+        else:
+            self.cover.setPixmap(QPixmap())
+            self.cover.setText("♪")
+            self.cover.setToolTip("No cover \u2014 right-click to add one" if path
+                                  else "Right-click for cover actions")
+
+    # ---------- cover menu host ----------
+    def cover_host(self):
+        """(path, bytes, picture type, description) of the file on screen."""
+        rows = self._selected_file_rows()
+        row = rows[0] if rows else 0
+        if not self.files or row < 0 or row >= len(self.files):
+            return "", None, FRONT_COVER, DEFAULT_COVER_DESC
+        entry = self.files[row]
+        path = entry["path"]
+        rec = entry.get("cover")
+        if rec is not None:
+            return (path, rec.get("data"), rec.get("type", FRONT_COVER),
+                    rec.get("desc", DEFAULT_COVER_DESC))
+        data, kind, desc = read_cover_details(path)
+        return path, data, kind, desc
+
+    def cover_store(self, record):
+        """Keep a cover edit in memory until Save writes it, like the tag edits."""
+        rows = self._selected_file_rows()
+        row = rows[0] if rows else 0
+        if not self.files or row < 0 or row >= len(self.files):
+            return
+        self.files[row]["cover"] = record
+        self._fill_cover()
+
+    def selected_rows(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        return rows or list(range(len(self.files)))
+
+    # ---------- whole-tag window ----------
+    def extended_entries(self, rows):
+        """The selected files as flat tag dicts (core fields plus the format's own keys)."""
+        entries = []
+        for r in rows:
+            tags = self.files[r]["tags"]
+            flat = {key: tags.get(key, "") for key in FIELDS}
+            flat["comment"] = tags.get("comment", "")
+            flat.update(tags.get("ext") or {})
+            entries.append({"path": self.files[r]["path"], "tags": flat})
+        return entries
+
+    def _extended_entry_for_rows(self, rows):
+        """Per-file entries, or one aggregate entry when several files are selected.
+
+        The aggregate lists every key any selected file carries. Values that are
+        identical on every file keep that value; anything else shows < keep >, so
+        accepting the window cannot flatten a real difference by accident.
+        """
+        entries = self.extended_entries(rows)
+        if len(entries) <= 1:
+            return entries
+        buckets = {}
+        for entry in entries:
+            for key, value in entry["tags"].items():
+                low = str(key).lower()
+                bucket = buckets.setdefault(low, {"key": key, "values": [],
+                                                  "present": 0})
+                bucket["values"].append(str(value or "").strip())
+                bucket["present"] += 1
+        aggregate = {}
+        for bucket in buckets.values():
+            values = [value for value in bucket["values"] if value]
+            if not values:
+                continue
+            if bucket["present"] == len(entries) and len(set(bucket["values"])) == 1:
+                aggregate[bucket["key"]] = bucket["values"][0]
+            else:
+                aggregate[bucket["key"]] = KEEP
+        core_order = list(ExtendedTagsDialog.CORE)
+        ordered = {}
+        for core_key in core_order:
+            for key in aggregate:
+                if key.lower() == core_key:
+                    ordered[core_key] = aggregate[key]
+                    break
+        for key in sorted((k for k in aggregate if k.lower() not in core_order),
+                          key=str.lower):
+            ordered[key] = aggregate[key]
+        covers = []
+        for r in rows:
+            record = self.files[r].get("cover")
+            if record is not None:
+                covers.append(record.get("data") or b"")
+            else:
+                covers.append(read_cover(self.files[r]["path"]) or b"")
+        variants = len(set(covers)) > 1
+        return [{"path": entries[0]["path"],
+                 "paths": [entry["path"] for entry in entries],
+                 "tags": ordered, "multi": True, "cover_variants": variants,
+                 "cover": None if variants else (covers[0] if covers else None)}]
+
+    def apply_extended(self, rows, entries):
+        """Fold edited flat tag dicts back into the file list (still unsaved)."""
+        core = set(FIELDS) | {"comment"}
+        for r, entry in zip(rows, entries):
+            tags = self.files[r]["tags"]
+            # a single-file entry replaces the free-form map; an aggregate entry
+            # must keep the keys whose values differ across the selection
+            ext = dict(tags.get("ext") or {}) if entry.get("multi") else {}
+            for key, value in entry["tags"].items():
+                if value == KEEP:
+                    continue
+                if key.lower() in core:
+                    tags[key.lower()] = value
+                    continue
+                for old in [k for k in ext if k.lower() == key.lower()]:
+                    del ext[old]
+                if value:
+                    ext[key] = value
+            for key in core:
+                tags.setdefault(key, "")
+            tags["ext"] = ext
+
+    def extended_tags(self):
+        """Right-click > Extended tags: every tag, with add and remove."""
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not rows:
+            row = self.table.currentRow()
+            rows = [row] if 0 <= row < len(self.files) else []
+        rows = [r for r in rows if 0 <= r < len(self.files)]
+        if not rows:
+            self.window().notify("Select a file first")
+            return
+        entries = self._extended_entry_for_rows(rows)
+        dialog = ExtendedTagsDialog(entries, 0, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._push_undo()
+        if len(rows) > 1:
+            for r in rows:
+                self.apply_extended([r], entries)
+        else:
+            self.apply_extended(rows, entries)
+        pending = dialog.pending_covers()
+        for r in rows:
+            path = self.files[r]["path"]
+            if path in pending:
+                self.files[r]["cover"] = pending[path]
+        self._refresh_rows(rows)
+        self._fill_panel()
+        self._fill_ext()
+        self._fill_cover()
+        self.window().notify(f"Updated tags for {len(rows)} file(s) \u2014 save to write them")
+
+    def _table_menu(self, pos):
+        item = self.table.itemAt(pos)
+        if item is not None and not item.isSelected():
+            self.table.clearSelection()
+            self.table.selectRow(item.row())
+        menu = self._build_table_menu()
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _build_table_menu(self):
+        """The file-list context menu, without the conversion commands.
+
+        Filename/tag conversion stays on the toolbar and in the Convert menu; having it
+        in this right-click menu as well was the remaining inconsistent copy.
+        """
+        menu = QMenu(self)
+        menu.addAction("Extended tags\u2026", self.extended_tags)
+        menu.addSeparator()
+        menu.addAction("Cut", self.cut_selection)
+        menu.addAction("Copy", self.copy_selection)
+        menu.addAction("Paste", self.paste_selection)
+        menu.addAction("Remove selected files", self.remove_selected)
+        menu.addSeparator()
+        menu.addAction("Look up metadata & cover\u2026", self.lookup_online)
+        menu.addSeparator()
+        menu.addAction("Save tag", self.save)
+        menu.addAction("Revert to disk", self.revert)
+        return menu
+
+    # ---------- editing ----------
+    def _fill_panel(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        for f, e in self.editors.items():
+            vals = sorted({self.files[r]["tags"].get(f, "") for r in rows
+                           if r < len(self.files)})
+            e.blockSignals(True)
+            e.clear()
+            if len(vals) == 1:
+                e.addItems(vals)
+            elif vals:
+                e.addItems([KEEP] + vals)
+            e.blockSignals(False)
+
+    def _panel_edit(self, field):
+        val = self.editors[field].currentText()
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if val == KEEP or not rows:
+            return
+        changed = [r for r in rows if r < len(self.files)
+                   and self.files[r]["tags"].get(field, "") != val]
+        if not changed:
+            return
+        self._push_undo()
+        for r in changed:
+            self.files[r]["tags"][field] = val
+        self._refresh_rows(changed)
+
+    # ---------- extended tags (free-form key/value list) ----------
+    def _selected_file_rows(self):
+        return sorted({i.row() for i in self.table.selectedIndexes() if i.row() < len(self.files)})
+
+    def _ext_value(self, r, key):
+        return self.files[r]["tags"].get("ext", {}).get(key, "")
+
+    def _apply_ext(self, rows, key, text):
+        changed = [r for r in rows if self._ext_value(r, key) != text]
+        if not changed:
+            return
+        self._push_undo()
+        for r in changed:
+            ext = self.files[r]["tags"].setdefault("ext", {})
+            if text:
+                ext[key] = text
+            else:
+                ext.pop(key, None)
+        self._refresh_rows(changed)
+
+    def _fill_ext(self):
+        exts = [self.files[r]["tags"].get("ext", {}) for r in self._selected_file_rows()]
+        keys = sorted({k for e in exts for k in e}, key=str.lower)
+        self._ext_keys = keys
+        self.ext_table.blockSignals(True)
+        self.ext_table.setRowCount(len(keys))
+        for i, key in enumerate(keys):
+            vals = {e.get(key, "") for e in exts}
+            key_item = QTableWidgetItem(key)
+            key_item.setFlags(key_item.flags() & ~Qt.ItemIsEditable)
+            self.ext_table.setItem(i, 0, key_item)
+            self.ext_table.setItem(i, 1, QTableWidgetItem(vals.pop() if len(vals) == 1 else KEEP))
+        self.ext_table.blockSignals(False)
+
+    def _ext_edit(self, item):
+        if item.column() != 1 or item.row() >= len(self._ext_keys):
+            return
+        if item.text() == KEEP:
+            return
+        self._apply_ext(self._selected_file_rows(), self._ext_keys[item.row()], item.text())
+        # re-sync the table after the signal returns, since clearing a value removes the key
+        QTimer.singleShot(0, self._fill_ext)
+
+    def _ext_add(self):
+        rows = self._selected_file_rows()
+        if not rows:
+            self.window().notify("Select files first")
+            return
+        key, ok = QInputDialog.getText(self, "Add tag", "Key:")
+        key = key.strip()
+        if not ok or not key:
+            return
+        if key.lower() in EXT_CORE_KEYS:
+            QMessageBox.information(self, "Add tag", f"'{key}' is a core field; edit it above.")
+            return
+        text, ok = QInputDialog.getText(self, "Add tag", f"Value for {key}:")
+        if ok and text:
+            self._apply_ext(rows, key, text)
+            self._fill_ext()
+
+    def _ext_remove(self):
+        keys = [self._ext_keys[r] for r in sorted({i.row() for i in self.ext_table.selectedIndexes()})
+                if r < len(self._ext_keys)]
+        changed = [r for r in self._selected_file_rows()
+                   if any(k in self.files[r]["tags"].get("ext", {}) for k in keys)]
+        if not changed:
+            return
+        self._push_undo()
+        for r in changed:
+            ext = self.files[r]["tags"].setdefault("ext", {})
+            for k in keys:
+                ext.pop(k, None)
+        self._refresh_rows(changed)
+        self._fill_ext()
+
+    def _cell_edit(self, item):
+        if self._updating:
+            return
+        f = self.files[item.row()]
+        col = COLS[item.column()]
+        if col == "tag":
+            return
+        if col == "filename":
+            current = f["newname"] or os.path.basename(f["path"])
+            if item.text() == current:
+                return
+            self._push_undo()
+            f["newname"] = None if item.text() == os.path.basename(f["path"]) else item.text()
+        else:
+            if f["tags"].get(col, "") == item.text():
+                return
+            self._push_undo()
+            f["tags"][col] = item.text()
+        self._refresh_rows([item.row()])
+
+    def _refresh_rows(self, rows):
+        self._updating = True
+        for r in rows:
+            self._set_row(r, self.files[r])
+        self._updating = False
+        self.count_label.setText(f"{len(self.files)} files")
+        self._apply_filter()
+        self._update_status()
+
+    # ---------- batch actions ----------
+    def tag_from_name(self):
+        pat, ok = QInputDialog.getText(self, "Filename → Tag", "Pattern:",
+                                       text="%tracknumber% - %artist% - %title%")
+        if not ok:
+            return
+        self._push_undo()
+        rows, miss = self.selected_rows(), 0
+        for r in rows:
+            parsed = tags_from_filename(self.files[r]["path"], pat)
+            if parsed is None:
+                miss += 1
+            else:
+                self.files[r]["tags"].update(parsed)
+        self._refresh_rows(rows)
+        if miss:
+            QMessageBox.information(self, "Filename → Tag",
+                                    f"{miss} file(s) did not match the pattern.")
+
+    def name_from_tag(self):
+        pat, ok = QInputDialog.getText(self, "Tag → Filename", "Pattern:",
+                                       text="%tracknumber% - %title%")
+        if not ok:
+            return
+        self._push_undo()
+        rows = self.selected_rows()
+        for r in rows:
+            f = self.files[r]
+            f["newname"] = filename_from_tags(f["tags"], pat, os.path.splitext(f["path"])[1])
+        self._refresh_rows(rows)
+
+    def tag_to_tag(self):
+        names = [LABELS[f] for f in EDIT_FIELDS]
+        source, ok = QInputDialog.getItem(self, "Tag → Tag", "Copy field:", names, 0, False)
+        if not ok:
+            return
+        target, ok = QInputDialog.getItem(self, "Tag → Tag", "To field:", names, 1, False)
+        if not ok:
+            return
+        src = EDIT_FIELDS[names.index(source)]
+        dst = EDIT_FIELDS[names.index(target)]
+        if src == dst:
+            return
+        self._push_undo()
+        rows = self.selected_rows()
+        for r in rows:
+            self.files[r]["tags"][dst] = self.files[r]["tags"].get(src, "")
+        self._refresh_rows(rows)
+
+    def auto_number(self):
+        self._push_undo()
+        rows = self.selected_rows()
+        total = len(rows)
+        for i, r in enumerate(rows, 1):
+            self.files[r]["tags"]["tracknumber"] = f"{i}/{total}"
+        self._refresh_rows(rows)
+
+    def replace_text(self):
+        field, ok = QInputDialog.getItem(self, "Replace", "Field:",
+                                         [LABELS[f] for f in EDIT_FIELDS], 0, False)
+        if not ok:
+            return
+        key = EDIT_FIELDS[[LABELS[f] for f in EDIT_FIELDS].index(field)]
+        find, ok = QInputDialog.getText(self, "Replace", "Find (regex allowed):")
+        if not ok or not find:
+            return
+        repl, ok = QInputDialog.getText(self, "Replace", "Replace with:")
+        if not ok:
+            return
+        self._push_undo()
+        rows = self.selected_rows()
+        for r in rows:
+            value = self.files[r]["tags"].get(key, "")
+            try:
+                self.files[r]["tags"][key] = re.sub(find, repl, value)
+            except re.error:
+                self.files[r]["tags"][key] = value.replace(find, repl)
+        self._refresh_rows(rows)
+
+    def case_convert(self, mode=None):
+        if mode is None:
+            mode, ok = QInputDialog.getItem(self, "Case", "Convert to:",
+                                            ["Title Case", "lower case", "UPPER CASE"],
+                                            0, False)
+            if not ok:
+                return
+        fn = {"Title Case": str.title, "lower case": str.lower, "UPPER CASE": str.upper}[mode]
+        self._push_undo()
+        rows = self.selected_rows()
+        for r in rows:
+            for k in ("title", "artist", "album", "albumartist"):
+                self.files[r]["tags"][k] = fn(self.files[r]["tags"][k])
+        self._refresh_rows(rows)
+
+    def save(self):
+        errors = []
+        for f in self._dirty():
+            try:
+                if f["tags"] != f["orig"]:
+                    core = {k: v for k, v in f["tags"].items()
+                            if k != "ext" and v != f["orig"].get(k)}
+                    skipped_core = write_tags(f["path"], core) if core else []
+                    if skipped_core:
+                        errors.append(f"{os.path.basename(f['path'])}: not stored in this "
+                                      f"format: {', '.join(skipped_core)}")
+                    ext = ext_diff(f["tags"], f["orig"])
+                    skipped_ext = []
+                    if ext:
+                        skipped_ext = write_extended(f["path"], ext)
+                        if skipped_ext:
+                            errors.append(f"{os.path.basename(f['path'])}: not stored in this "
+                                          f"format: {', '.join(skipped_ext)}")
+                    if skipped_core or skipped_ext:
+                        # Keep the fields that did not reach the file marked as changed.
+                        for key in core:
+                            if key not in skipped_core:
+                                f["orig"][key] = f["tags"].get(key, "")
+                        orig_ext = f["orig"].setdefault("ext", {})
+                        now_ext = f["tags"].get("ext", {})
+                        for key in ext:
+                            if key in skipped_ext:
+                                continue
+                            if key in now_ext:
+                                orig_ext[key] = now_ext[key]
+                            else:
+                                orig_ext.pop(key, None)
+                    else:
+                        f["orig"] = _copy_tags(f["tags"])
+                if "cover" in f:
+                    rec = f["cover"]
+                    write_cover(f["path"], rec.get("data"), rec.get("type", FRONT_COVER),
+                                rec.get("desc", DEFAULT_COVER_DESC))
+                    del f["cover"]
+                if f["newname"]:
+                    new = os.path.join(os.path.dirname(f["path"]), f["newname"])
+                    if os.path.exists(new):
+                        raise OSError(f"{f['newname']} already exists")
+                    old = f["path"]
+                    os.rename(old, new)
+                    self.library.forget(old)
+                    player = getattr(self.window(), "player", None)
+                    if player and old in player.queue:
+                        player.queue[player.queue.index(old)] = new
+                        player.queue_changed.emit()
+                    f["path"], f["newname"] = new, None
+                if os.path.exists(f["path"]):
+                    self.library.update_track(f["path"])
+            except Exception as e:
+                errors.append(f"{os.path.basename(f['path'])}: {e}")
+        self._rebuild()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        if errors:
+            QMessageBox.warning(self, "Some files failed", "\n".join(errors[:20]))
+        library_tab = getattr(self.window(), "library_tab", None)
+        if library_tab is not None:
+            library_tab.refresh()
+        self.window().notify(f"Saved {max(0, len(self.files) - len(errors))} file(s)")
+
+# ui/devices_tab.py
+# ======================================================================
+REL_ROLE = Qt.UserRole          # device-relative path of one track row or cover
+GROUP_ROLE = Qt.UserRole + 1    # device paths a group row or a cover stands for
+INDEX_ROLE = Qt.UserRole + 2    # where that track sits in the visible order
+COVER_ROLE = Qt.UserRole + 3    # the folder a cover's artwork comes from
+
+MTP_HINT = ("If your phone is plugged in but not listed, set it to 'File transfer' "
+            "and click here")
+
+# what a device folder is called while nothing else has been chosen for it
+DEVICE_DIR_DEFAULT = "Music"
+
+
+def device_label(device):
+    """How a device is named in the list and the bar: kind, then its name."""
+    return ("MTP · " if getattr(device, "kind", "") == "mtp" else "USB · ") + device.name
+
+
+# A device is remembered by its stable id — the gvfs host for a phone, the mount point
+# for a stick — so it keeps its place in the bar and the sidebar while it is unplugged,
+# and keeps the nickname given to it. The dot says whether it is here right now.
+DEVICE_ID_ROLE = Qt.UserRole + 10
+DEVICE_NAME_ROLE = Qt.UserRole + 11
+DEVICE_STATUS_ROLE = Qt.UserRole + 12
+DEVICE_CONNECTED_ROLE = Qt.UserRole + 13
+
+DEVICE_STATUS_ON = "connected"
+DEVICE_STATUS_OFF = "not connected"
+DEVICE_DOT_ON = "#3fb950"
+DEVICE_DOT_OFF = "#6e7681"
+
+
+def remember_device(config, device):
+    """Record a device in the config, so the next launch lists it before it is plugged in.
+
+    Returns True when the record was added or changed, so the caller only writes the
+    config when something actually moved.
+    """
+    registry = config.setdefault("device_registry", [])
+    entry = {"id": device.id, "name": device.name, "kind": device.kind,
+             "root": device.root, "uri": device.uri or ""}
+    for rec in registry:
+        if rec.get("id") == device.id:
+            if any(rec.get(key) != value for key, value in entry.items()):
+                rec.update(entry)
+                return True
+            return False
+    registry.append(entry)
+    return True
+
+
+def configured_device_name(config, device_id, fallback):
+    """The nickname given to a device, or its own name when it has none."""
+    nick = ((config or {}).get("device_names") or {}).get(device_id) or ""
+    return nick.strip() or (fallback or device_id)
+
+
+def _paint_device_cell(painter, rect, name, status, connected, name_colour, status_colour):
+    """Draw a device as a name over a coloured dot and its state."""
+    painter.save()
+    try:
+        base = QFont(painter.font())
+        bold = QFont(base)
+        bold.setBold(True)
+        painter.setFont(bold)
+        fm = painter.fontMetrics()
+        line = max(14, fm.height())
+        painter.setPen(QPen(name_colour))
+        painter.drawText(QRectF(rect.left(), rect.top(), rect.width(), line),
+                         Qt.AlignLeft | Qt.AlignVCenter, str(name))
+        small = QFont(base)
+        if base.pointSizeF() > 0:
+            small.setPointSizeF(max(7.0, base.pointSizeF() * 0.86))
+        painter.setFont(small)
+        fm = painter.fontMetrics()
+        top = rect.top() + line
+        radius = 3.5
+        centre_y = top + fm.height() / 2.0
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(DEVICE_DOT_ON if connected else DEVICE_DOT_OFF)))
+        painter.drawEllipse(QPointF(rect.left() + radius + 1.0, centre_y), radius, radius)
+        painter.setPen(QPen(status_colour))
+        painter.drawText(QRectF(rect.left() + radius * 2 + 6.0, top,
+                                max(0.0, rect.width() - radius * 2 - 6.0), fm.height()),
+                         Qt.AlignLeft | Qt.AlignVCenter, str(status))
+    finally:
+        painter.restore()
+
+
+class DeviceItemDelegate(QStyledItemDelegate):
+    """Two lines in the sidebar: the device's name, then a dot and connected / not."""
+
+    def sizeHint(self, option, index):
+        return QSize(0, 48)
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        _paint_device_cell(
+            painter, QRectF(opt.rect).adjusted(8, 3, -6, -3),
+            index.data(DEVICE_NAME_ROLE) or "",
+            index.data(DEVICE_STATUS_ROLE) or "",
+            bool(index.data(DEVICE_CONNECTED_ROLE)),
+            QColor(ON_ACCENT if selected else TEXT),
+            QColor(ON_ACCENT if selected else MUTED))
+
+
+class DeviceBarButton(QToolButton):
+    """One device in the top bar: its name, and a dot with its state under it."""
+
+    def __init__(self, device_id, name, connected, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(48)
+        self.device_id = device_id
+        self.connected = bool(connected)
+        self.set_state(name, connected)
+
+    def set_state(self, name, connected):
+        self.device_name = name
+        self.connected = bool(connected)
+        # the text is not painted (the two lines are drawn in paintEvent) but keeps the
+        # button's accessible name and the widget tree searchable
+        self.setText(name)
+        self.setAccessibleName(f"{name}, {DEVICE_STATUS_ON if self.connected else DEVICE_STATUS_OFF}")
+        self.updateGeometry()
+        self.update()
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        width = max(fm.horizontalAdvance(self.device_name),
+                    fm.horizontalAdvance(DEVICE_STATUS_ON if self.connected
+                                         else DEVICE_STATUS_OFF)) + 40
+        return QSize(max(width, 92), 48)
+
+    def paintEvent(self, event):
+        opt = QStyleOptionToolButton()
+        self.initStyleOption(opt)
+        opt.text = ""
+        opt.icon = QIcon()
+        painter = QStylePainter(self)
+        painter.drawComplexControl(QStyle.CC_ToolButton, opt)
+        _paint_device_cell(painter, QRectF(self.rect()).adjusted(10, 4, -10, -4),
+                           self.device_name,
+                           DEVICE_STATUS_ON if self.connected else DEVICE_STATUS_OFF,
+                           self.connected,
+                           QColor(ACCENT) if self.isChecked() else QColor(TEXT),
+                           QColor(ACCENT) if self.isChecked() else QColor(MUTED))
+
+
+# A device's music is filtered with the library's own query language, answered against
+# the entries the device was read into instead of SQL: field -> (entry key, kind).
+DEVICE_FILTER_FIELDS = {
+    "title": ("title", "text"),
+    "artist": ("artist", "text"),
+    "albumartist": ("albumartist", "text"),
+    "album": ("album", "text"),
+    "filename": ("rel", "path"),
+    "path": ("rel", "path"),
+    "track": ("track", "number"),
+    "tracknumber": ("track", "number"),
+    "length": ("length", "duration"),
+    "duration": ("length", "duration"),
+    "size": ("size", "number"),
+}
+DEVICE_SEARCH_KEYS = ("title", "artist", "albumartist", "album", "rel")
+DEVICE_CATEGORY_LABELS = (("music", "Music"),
+                          ("audiobook", "Audiobooks"))
+DEVICE_FILTER_HINT = ('field:value filters — artist:aphex · album:"…" · '
+                      'track:>=5 · size:>10m')
+DEVICE_FILTER_HELP = ("Filter the device's music with field:value terms, e.g.\n"
+                      "  artist:aphex   album:\"Selected Ambient Works\"\n"
+                      "  track:>=5   size:>10m   length:<3:00   -artist:boards\n\n"
+                      "Fields: " + ", ".join(sorted(DEVICE_FILTER_FIELDS)) +
+                      "\nOperators: : = != < > <= >=   use \"quotes\" for spaces.")
+
+
+def _and(a, b):
+    return lambda entry: a(entry) and b(entry)
+
+
+def _or(a, b):
+    return lambda entry: a(entry) or b(entry)
+
+
+def _not(a):
+    return lambda entry: not a(entry)
+
+
+def _device_term(token):
+    """One query term -> a predicate over a device entry.
+
+    Same grammar as the library's filter; an unknown field or a bare word is a plain
+    text search, which is what the library does with them too.
+    """
+    m = _FIELD_TERM.match(token)
+    if m:
+        field = m.group(1).lower()
+        op = m.group(2)
+        value = _unquote(m.group(3))
+        if op == ":":  # the comparison may follow the colon: size:>10m
+            for candidate in (">=", "<=", "!=", ">", "<", "="):
+                if value.startswith(candidate):
+                    op, value = candidate, value[len(candidate):]
+                    break
+        spec = DEVICE_FILTER_FIELDS.get(field)
+        if spec and value != "":
+            key, kind = spec
+            if kind in ("text", "path"):
+                needle = value.casefold()
+
+                def text_match(entry, op=op, needle=needle, key=key):
+                    actual = str(entry.get(key) or "").casefold()
+                    if op in (":", "="):
+                        return needle in actual
+                    if op == "!=":
+                        return needle not in actual
+                    if op == "<":
+                        return actual < needle
+                    if op == "<=":
+                        return actual <= needle
+                    if op == ">":
+                        return actual > needle
+                    return actual >= needle
+
+                return text_match
+            number = _parse_filter_number(value, kind, field)
+
+            def number_match(entry, op=op, number=number, key=key):
+                actual = float(entry.get(key) or 0)
+                if op in (":", "="):
+                    return actual == number
+                if op == "!=":
+                    return actual != number
+                if op == "<":
+                    return actual < number
+                if op == "<=":
+                    return actual <= number
+                if op == ">":
+                    return actual > number
+                return actual >= number
+
+            return number_match
+    word = _unquote(token).casefold()
+
+    def word_match(entry, word=word):
+        return any(word in str(entry.get(key) or "").casefold() for key in DEVICE_SEARCH_KEYS)
+
+    return word_match
+
+
+def parse_device_query(text):
+    """Turn a Strawberry-style query into a predicate over the device's entries.
+
+    Raises FilterError for an unbalanced quote or parenthesis or a bad number, so the
+    caller can fall back to a plain text search the way the library does.
+    """
+    tokens = _filter_tokens(text or "")
+    if not tokens:
+        return lambda entry: True
+    pos = [0]
+
+    def peek():
+        return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+    def take():
+        token = peek()
+        pos[0] += 1
+        return token
+
+    def parse_or():
+        pred = parse_and()
+        while peek() == "OR":
+            take()
+            pred = _or(pred, parse_and())
+        return pred
+
+    def parse_and():
+        pred = parse_unary()
+        while True:
+            token = peek()
+            if token in (None, ")", "OR"):
+                break
+            if token == "AND":
+                take()
+                if peek() in (None, ")", "OR"):
+                    break
+            pred = _and(pred, parse_unary())
+        return pred
+
+    def parse_unary():
+        token = peek()
+        if token is None:
+            raise FilterError("query ended early")
+        if token == "-":
+            take()
+            return _not(parse_unary())
+        if token == "(":
+            take()
+            pred = parse_or()
+            if peek() != ")":
+                raise FilterError("missing closing parenthesis")
+            take()
+            return pred
+        if token == ")":
+            raise FilterError("unexpected closing parenthesis")
+        take()
+        return _device_term(token)
+
+    pred = parse_or()
+    if pos[0] < len(tokens):
+        raise FilterError(f"unexpected {tokens[pos[0]]!r}")
+    return pred
+
+
+def device_plain_query(text):
+    """Every word has to appear somewhere: what an unparseable query falls back to."""
+    words = [w.casefold() for w in (text or "").split()]
+
+    def match(entry):
+        return all(any(w in str(entry.get(key) or "").casefold()
+                       for key in DEVICE_SEARCH_KEYS) for w in words)
+
+    return match
+
+
+class DeviceFolderDialog(QDialog):
+    """Pick a folder on the device: walk into one, then "Use this folder".
+
+    A file manager would be overkill here — the device tab shows music, not a tree of
+    files — so this only lists folders, which is all a sync target ever needs.
+    """
+
+    def __init__(self, backend, start="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select device folder")
+        self.setMinimumSize(460, 400)
+        self.backend = backend
+        self.path = (start or "").strip("/")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(6)
+        top = QHBoxLayout()
+        self.up_btn = QPushButton("Up")
+        self.up_btn.clicked.connect(self.go_up)
+        self.where = QLabel("")
+        self.where.setObjectName("Muted")
+        top.addWidget(self.up_btn)
+        top.addWidget(self.where, 1)
+        lay.addLayout(top)
+        self.folders = QListWidget()
+        self.folders.itemActivated.connect(lambda it: self.enter(it.text()))
+        lay.addWidget(self.folders, 1)
+        hint = QLabel("Double-click a folder to go into it. The folder shown above is the "
+                      "one this device will browse.")
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        use = QPushButton("Use this folder")
+        use.setObjectName("Primary")
+        use.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(use)
+        lay.addLayout(buttons)
+        self.load()
+
+    def load(self):
+        self.where.setText("/" + self.path if self.path else "(the whole device)")
+        self.up_btn.setEnabled(bool(self.path))
+        self.folders.clear()
+        try:
+            entries = self.backend.listdir(self.path)
+        except OSError:
+            entries = []
+        for name, isdir, _size in sorted(entries, key=lambda e: e[0].lower()):
+            if isdir:
+                self.folders.addItem(name)
+
+    def enter(self, name):
+        self.path = f"{self.path}/{name}" if self.path else name
+        self.load()
+
+    def go_up(self):
+        self.path = os.path.dirname(self.path)
+        self.load()
+
+    def chosen(self):
+        return self.path
+
+
+class CopyToDeviceDialog(QDialog):
+    """Everything a copy to a device needs, in one window.
+
+    The device, whether the folder layout is kept, the folder on the device and any
+    forced transcode are asked together, so a copy is one decision instead of a chain
+    of windows. The chosen folder is remembered per device by the caller.
+    """
+
+    def __init__(self, devices, config, paths, start_id="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Copy to device")
+        self.setMinimumWidth(520)
+        self.config = config if isinstance(config, dict) else {}
+        self.devices = list(devices)
+        self.paths = list(paths)
+        self.remembered = self.config.get("device_dirs") or {}
+        form = self.form = QFormLayout(self)
+        form.setContentsMargins(14, 12, 14, 12)
+        form.setSpacing(8)
+
+        self.device = QComboBox()
+        for dev in self.devices:
+            self.device.addItem(configured_device_name(self.config, dev.id, dev.name), dev.id)
+        index = next((i for i, d in enumerate(self.devices) if d.id == start_id), 0)
+        self.device.setCurrentIndex(max(index, 0))
+        self.device.currentIndexChanged.connect(self._device_changed)
+        form.addRow("Device", self.device)
+
+        self.layout_mode = QComboBox()
+        self.layout_mode.addItem("Track(s) only \u2014 no folders", False)
+        self.layout_mode.addItem("Keep folder organization", True)
+        self.layout_mode.setCurrentIndex(1 if self.config.get("copy_keep_folders", True) else 0)
+        self.layout_mode.currentIndexChanged.connect(self._update_preview)
+        form.addRow("Folders", self.layout_mode)
+
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(6)
+        self.folder = QLineEdit(self._remembered_dir())
+        self.folder.setPlaceholderText("(the whole device)")
+        self.folder.textChanged.connect(self._update_preview)
+        browse = QPushButton("Select folder\u2026")
+        browse.clicked.connect(self._browse)
+        folder_row.addWidget(self.folder, 1)
+        folder_row.addWidget(browse)
+        form.addRow("Folder on device", folder_row)
+
+        self.force = QCheckBox("Force transcode")
+        self.force.toggled.connect(self._force_changed)
+        form.addRow("", self.force)
+
+        self.codec = QComboBox()
+        for key, (label, _ext) in TRANSCODE_CODECS.items():
+            if key:
+                self.codec.addItem(label, key)
+        self.codec.currentIndexChanged.connect(self._fill_bitrates)
+        form.addRow("Codec", self.codec)
+
+        self.bitrate = QComboBox()
+        form.addRow("Bitrate", self.bitrate)
+
+        self.preview = QLabel("")
+        self.preview.setObjectName("Muted")
+        self.preview.setWordWrap(True)
+        form.addRow("", self.preview)
+        self._fill_bitrates()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+        self._force_changed(False)
+        self._update_preview()
+
+    # ---------- what was chosen ----------
+    def device_id(self):
+        return self.device.currentData() or ""
+
+    def chosen_device(self):
+        wanted = self.device_id()
+        return next((d for d in self.devices if d.id == wanted), None)
+
+    def folder_dir(self):
+        return self.folder.text().strip().strip("/")
+
+    def keep_folders(self):
+        return bool(self.layout_mode.currentData())
+
+    def codec_key(self):
+        return (self.codec.currentData() or "") if self.force.isChecked() else ""
+
+    def transcode(self):
+        """(mode, quality) for the chosen bitrate, or None when transcode is off."""
+        if not self.force.isChecked():
+            return None
+        data = self.bitrate.currentData()
+        return tuple(data) if data else None
+
+    def rel_for(self, path):
+        """The path a file takes on the device, with or without its folders."""
+        if self.keep_folders():
+            return copy_device_rel(path, self.config)
+        return os.path.basename(path)
+
+    # ---------- behaviour ----------
+    def _remembered_dir(self):
+        """The folder this device was last copied into, or its media default."""
+        if self.device_id() in self.remembered:
+            return str(self.remembered.get(self.device_id(), "") or "")
+        return default_device_folder_for_paths(self.config, self.paths)
+
+    def _device_changed(self, _index):
+        self.folder.setText(self._remembered_dir())
+        self._update_preview()
+
+    def _force_changed(self, on):
+        for widget in (self.codec, self.bitrate):
+            widget.setEnabled(on)
+            label = self.form.labelForField(widget)
+            if label is not None:
+                label.setEnabled(on)
+        self._update_preview()
+
+    def _fill_bitrates(self, _index=None):
+        codec = self.codec.currentData() or "mp3"
+        choices = TRANSCODE_BITRATES.get(codec, [])
+        want = TRANSCODE_DEFAULTS.get(codec)
+        self.bitrate.blockSignals(True)
+        self.bitrate.clear()
+        for mode, value, label in choices:
+            self.bitrate.addItem(label, (mode, value))
+        pick = next((i for i, (mode, value, _label) in enumerate(choices)
+                     if (mode, value) == want), 0)
+        self.bitrate.setCurrentIndex(max(pick, 0))
+        self.bitrate.blockSignals(False)
+        self._update_preview()
+
+    def _update_preview(self):
+        """Say where the first file lands, so the folder choice is not a guess."""
+        if not self.paths:
+            self.preview.setText("")
+            return
+        folder = self.folder_dir()
+        rel = self.rel_for(self.paths[0])
+        shown = f"{folder}/{rel}" if folder else rel
+        more = f"  (and {len(self.paths) - 1} more)" if len(self.paths) > 1 else ""
+        self.preview.setText(f"On the device: {shown}{more}")
+
+    def _browse(self):
+        device = self.chosen_device()
+        if device is None:
+            return
+        busy = DEVICE_CLAIMS.reason(device.root)
+        if busy:
+            QMessageBox.information(
+                self, "Copy to device",
+                f"{busy} Wait for it to finish before choosing a folder.")
+            return
+        if not os.path.isdir(device.root):
+            QMessageBox.information(
+                self, "Copy to device",
+                f"{device.name} is not mounted. Reconnect it and try again.")
+            return
+        # A device copied to before opens where it was left. A new one — or a folder
+        # that is not on this device, such as the default "Music" above a phone's
+        # storages — opens at the root, where the storages are listed.
+        backend = Backend(device)
+        start = self.folder_dir() if self.device_id() in self.remembered else ""
+        if start and not os.path.isdir(backend.local(start)):
+            start = ""
+        picker = DeviceFolderDialog(backend, start, self)
+        if picker.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.folder.setText(picker.chosen())
+
+
+class CoverReader(QThread):
+    """Read album art off the GUI thread; the tab turns the bytes into icons."""
+
+    cover = Signal(str, object)
+
+    def __init__(self, jobs, parent=None):
+        super().__init__(parent)
+        self.jobs = list(jobs)
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        for key, path in self.jobs:
+            if self._cancelled:
+                break
+            try:
+                data = read_cover(path)
+            except Exception:
+                data = None
+            if self._cancelled:
+                break
+            self.cover.emit(key, data)
+
+
+class DeviceBookReader(QThread):
+    """Read one device audiobook's tags and artwork off the GUI thread."""
+
+    details = Signal(str, object, int)
+
+    def __init__(self, jobs, parent=None):
+        super().__init__(parent)
+        self.jobs = list(jobs)
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        for key, paths, title, generation in self.jobs:
+            if self._cancelled:
+                break
+            try:
+                result = audiobook_details(paths)
+            except Exception:
+                result = None
+            if result is not None and len(paths) == 1:
+                try:
+                    title = read_tags(paths[0]).get("title") or title
+                except Exception:
+                    pass
+            if self._cancelled:
+                break
+            if result is not None:
+                result = tuple(result) + (title,)
+            self.details.emit(key, result, generation)
+
+
+class DevicesTab(QWidget):
+    """What is on each connected device, shown the way the library shows music.
+
+    The device tabs across the top (or down the side — Preferences > Library) pick the
+    device; the folder picker picks which folder on it to look at; below that the music
+    it holds is shown as a list or as album covers. Nothing here edits the device: it is
+    a browser for what the sync profiles put there (and what was put there by hand),
+    with Copy to library to bring music the other way.
+    """
+
+    activity = Signal(str)          # "Copying files to … 42%" while a copy runs
+
+    def __init__(self, player, config=None, library=None, parent=None):
+        super().__init__(parent)
+        self.player = player
+        self.config = config if isinstance(config, dict) else {}
+        self.library = library
+        self.devices = []
+        self.rows = []
+        self._current_id = None
+        self.backend = None
+        self.music = []
+        self._bar_widgets = []
+        self._device_buttons = []
+        self._cover_cache = {}
+        self._cover_jobs = {}
+        self._cover_loader = None
+        self._placeholder_cache = None
+        self._cover_index = None
+        self._book_loader = None
+        self._book_cache = {}
+        self._book_icons = {}
+        self._book_items = {}
+        self._book_groups_by_key = {}
+        self._book_loading = set()
+        self._book_generation = 0
+        self._book_signature = None
+        self._book_sort_column = None
+        self._book_sort_desc = False
+        self._activity_prefix = ""   # what the top-right badge calls the running copy
+        # the device library is read on a worker when the device is MTP: the tab stays
+        # usable, the status bar says what is happening, and a sync goes first.
+        self._scan_worker = None
+        # Scans that were cancelled but whose thread has not stopped yet: a task that
+        # wants the device waits for these, because a cancelled walk is still a reader.
+        self._retired_scans = []
+        self._scan_token = 0
+        self._scan_retry = QTimer(self, interval=700, timeout=self._maybe_scan)
+        self._load_status = ""
+        # While a compare/sync/verify owns the device, nothing in this tab may read it:
+        # gvfs answers one MTP request at a time, so a scan, a capacity probe or a
+        # playback copy started mid-sync queues in front of the sync and leaves the
+        # window unable to answer at all.
+        self._sync_hold_id = ""
+        self._sync_hold_name = ""
+        self._busy_text = ""
+        # What the devices answered their last read: the connected dot follows this
+        # instead of listing the mount on the GUI thread every three seconds.
+        self._device_ready = {}
+        self.category = "music"
+
+        # the devices, in the two shapes the settings offer: a bar across the top
+        # (the default) and the list down the side
+        self.dev_list = QListWidget()
+        self.dev_list.setMaximumWidth(240)
+        self.dev_list.setAlternatingRowColors(True)
+        self.dev_list.setUniformItemSizes(False)
+        self.dev_list.setItemDelegate(DeviceItemDelegate(self.dev_list))
+        self.dev_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.dev_list.customContextMenuRequested.connect(self._list_device_menu)
+        self.dev_list.currentRowChanged.connect(self._select_device)
+        self.mount_btn = QPushButton("Mount phone (MTP)…")
+        self.mount_btn.setToolTip(MTP_HINT)
+        self.mount_btn.clicked.connect(self._mount_mtp)
+        lc = QVBoxLayout()
+        lc.setContentsMargins(0, 0, 0, 0)
+        lc.setSpacing(4)
+        lc.addWidget(self.dev_list, 1)
+        lc.addWidget(self.mount_btn)
+        left = QWidget()
+        left.setLayout(lc)
+        left.setMaximumWidth(240)
+        self.dev_side = left
+
+        self.bar_mount_btn = QPushButton("Mount phone (MTP)…")
+        self.bar_mount_btn.setToolTip(MTP_HINT)
+        self.bar_mount_btn.clicked.connect(self._mount_mtp)
+        self.dev_bar = QWidget()
+        bar_lay = QHBoxLayout(self.dev_bar)
+        bar_lay.setContentsMargins(0, 0, 0, 0)
+        bar_lay.setSpacing(4)
+        bar_lay.addStretch(1)
+        bar_lay.addWidget(self.bar_mount_btn)
+        self.dev_bar_lay = bar_lay
+
+        self.info = QLabel("Plug in a device (phones: choose 'File transfer / MTP').")
+        self.info.setObjectName("Muted")
+        # One browser, separate music and book views: mixing what the device holds in
+        # one list would hide the difference between tracks and books.
+        self.category_tabs = QTabBar()
+        self.category_tabs.setObjectName("DeviceCategories")
+        self.category_tabs.setDocumentMode(True)
+        self.category_tabs.setExpanding(False)
+        for _key, _label in DEVICE_CATEGORY_LABELS:
+            self.category_tabs.addTab(_label)
+        self.category_tabs.currentChanged.connect(self._category_changed)
+        self.category_tabs.setEnabled(False)
+        self.space = QProgressBar()
+        self.space.setTextVisible(True)
+        self.space.hide()
+
+        # the device's music is searched the way the library is, but in memory: the
+        # entries are already read, so typing never reaches the device again
+        self.search = QLineEdit()
+        self.search.setObjectName("SearchInput")
+        self.search.setPlaceholderText("Search the device's music…")
+        self.search.setClearButtonEnabled(False)
+        self.search.setToolTip(DEVICE_FILTER_HELP)
+        self.search_clear = QToolButton()
+        self.search_clear.setText("✕")
+        self.search_clear.setToolTip("Clear search")
+        self.search_clear.setCursor(Qt.PointingHandCursor)
+        self.search_clear.setFixedWidth(22)
+        self.search_clear.clicked.connect(self.search.clear)
+        self.search_clear.setVisible(False)
+        self.search.textChanged.connect(self._search_changed)
+        self.search_box = QFrame()
+        self.search_box.setObjectName("SearchBox")
+        search_lay = QHBoxLayout(self.search_box)
+        search_lay.setContentsMargins(2, 1, 1, 1)
+        search_lay.setSpacing(0)
+        self.fold_btn = QToolButton()
+        self.fold_btn.setText("\u21d5")
+        self.fold_btn.setCursor(Qt.PointingHandCursor)
+        self.fold_btn.setToolTip("Open or close the artists' folders")
+        self.fold_btn.setPopupMode(QToolButton.InstantPopup)
+        fold_menu = QMenu(self.fold_btn)
+        self.fold_actions = {}
+        for label, mode in (("Open all", "all"),
+                            ("Open letter markers only", "letters"),
+                            ("Close all", "none")):
+            action = fold_menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked=False, m=mode: self._fold_all(m))
+            self.fold_actions[mode] = action
+        self.fold_btn.setMenu(fold_menu)
+        self._fold_menu_sync()
+        search_lay.addWidget(self.search_clear)
+        search_lay.addWidget(self.search, 1)
+        search_lay.addWidget(self.fold_btn)
+        self.filter_hint = QLabel(DEVICE_FILTER_HINT)
+        self.filter_hint.setObjectName("Muted")
+        self.filter_hint.setWordWrap(False)
+        self._query = lambda entry: True
+        self._query_text = ""
+        self._query_error = ""
+
+        # which folder on the device is shown, and how its music is drawn
+        self.dir_btn = QPushButton("Select device folder…")
+        self.dir_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.dir_btn.setToolTip("Choose the folder on this device to show music from")
+        self.dir_btn.clicked.connect(self.pick_dir)
+        self.dir_label = QLabel("")
+        self.dir_label.setObjectName("Muted")
+        self.dir_label.hide()
+        self.list_btn = QToolButton()
+        self.list_btn.setText("List")
+        self.list_btn.setCheckable(True)
+        self.list_btn.setToolTip("Artists, albums and tracks as a list")
+        self.list_btn.clicked.connect(lambda: self.set_music_view("list"))
+        self.covers_btn = QToolButton()
+        self.covers_btn.setText("Covers")
+        self.covers_btn.setCheckable(True)
+        self.covers_btn.setToolTip("Albums as covers")
+        self.covers_btn.clicked.connect(lambda: self.set_music_view("covers"))
+        self.play_btn = QPushButton("Play")
+        self.play_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.play_btn.setToolTip("Play everything shown here from the device")
+        self.play_btn.clicked.connect(self.play_all)
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.refresh_btn.setToolTip("Read the device folder again")
+        self.refresh_btn.clicked.connect(self.reload)
+
+        self.tree = QTreeWidget()
+        # Whatever the device's files are called, and how much space they take: the
+        # folder layout already reads as artist -> album -> track, so a second column
+        # of names would only repeat what the tree is showing.
+        self.tree.setHeaderLabels(["Title", "Size"])
+        self.tree.setExpandsOnDoubleClick(False)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.tree.setColumnWidth(1, 110)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._menu)
+        self.tree.itemDoubleClicked.connect(self._tree_double)
+        self.tree.setToolTip("Double-click an artist, album or track to play it (or add it "
+                             "to the queue — Preferences > Library chooses which)")
+
+        self.covers = QListWidget()
+        self.covers.setViewMode(QListWidget.IconMode)
+        self.covers.setIconSize(QSize(120, 120))
+        # Tall enough for a long album name, the artist and the track count. The old
+        # 202 px tile cut the second line of a long artist name in half.
+        self.covers.setGridSize(QSize(184, 270))
+        self.covers.setResizeMode(QListWidget.Adjust)
+        self.covers.setMovement(QListWidget.Static)
+        self.covers.setWordWrap(True)
+        self.covers.setUniformItemSizes(False)
+        self.covers.setSpacing(6)
+        self.covers.itemClicked.connect(self._covers_click)
+        self.covers.itemDoubleClicked.connect(self._cover_double)
+        self.covers.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.covers.customContextMenuRequested.connect(self._covers_menu)
+        # No tooltip on the empty grid: each cover carries the instruction itself, and a
+        # hovered empty view must not promise albums that are not there.
+        self.covers.setToolTip("")
+        # a click opens the album, but only once it cannot still become a double-click
+        self._cover_pending = None
+        self._cover_click_timer = QTimer(self)
+        self._cover_click_timer.setSingleShot(True)
+        self._cover_click_timer.setInterval(max(120, QApplication.doubleClickInterval()))
+        self._cover_click_timer.timeout.connect(self._open_pending_cover)
+        self._album_focus = None
+
+        # The Audiobooks category reads as the Audiobooks tab reads: one row per title,
+        # with its cover, author, chapter count and length. The other categories keep
+        # the artist/album tree and the cover grid.
+        self.books = QTreeWidget()
+        self.books.setHeaderLabels(["", "Title", "Author", "Chapters", "Length"])
+        self.books.setColumnWidth(0, 64)
+        self.books.setColumnWidth(1, 320)
+        self.books.setColumnWidth(2, 220)
+        self.books.setColumnWidth(3, 90)
+        self.books.setColumnWidth(4, 110)
+        self.books.setIconSize(QSize(52, 52))
+        self.books.setAlternatingRowColors(True)
+        self.books.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.books.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.books.customContextMenuRequested.connect(self._book_menu)
+        self.books.itemDoubleClicked.connect(self._book_double)
+        self.books.header().sectionClicked.connect(self._sort_books)
+        self.books.setToolTip("Titles on the device; double-click a title or chapter "
+                              "to play it (or add it to the queue)")
+
+        # the album that was opened from the covers: its name and the way back
+        self.album_bar = QWidget()
+        self.album_bar.setObjectName("AlbumBar")
+        album_row = QHBoxLayout(self.album_bar)
+        album_row.setContentsMargins(2, 0, 2, 2)
+        album_row.setSpacing(8)
+        self.album_back = QToolButton()
+        self.album_back.setObjectName("AlbumBack")
+        self.album_back.setText("\u2039 Albums")
+        self.album_back.setCursor(Qt.PointingHandCursor)
+        self.album_back.setToolTip("Back to the album covers")
+        self.album_back.clicked.connect(self.close_album)
+        self.album_title = QLabel("")
+        self.album_title.setObjectName("Heading")
+        album_row.addWidget(self.album_back)
+        album_row.addWidget(self.album_title, 1)
+        self.album_bar.hide()
+
+        self.views = QStackedWidget()
+        self.views.addWidget(self.tree)
+        self.views.addWidget(self.covers)
+        self.views.addWidget(self.books)
+        # shown in place of the music while a sync owns the device: there is no row
+        # here to click, play or copy, and no read of the device can be started
+        self.sync_page = QWidget()
+        sync_box = QVBoxLayout(self.sync_page)
+        sync_box.setContentsMargins(24, 24, 24, 24)
+        sync_box.setSpacing(6)
+        sync_box.addStretch(1)
+        self.sync_title = QLabel("")
+        self.sync_title.setObjectName("Heading")
+        self.sync_title.setAlignment(Qt.AlignCenter)
+        self.sync_detail = QLabel("")
+        self.sync_detail.setObjectName("Muted")
+        self.sync_detail.setAlignment(Qt.AlignCenter)
+        self.sync_detail.setWordWrap(True)
+        sync_box.addWidget(self.sync_title)
+        sync_box.addWidget(self.sync_detail)
+        sync_box.addStretch(2)
+        self.views.addWidget(self.sync_page)
+        self.summary = QLabel("")
+        self.summary.setObjectName("Muted")
+        self.busy = QProgressBar()
+        self.busy.hide()
+
+        rc = QVBoxLayout()
+        rc.setContentsMargins(0, 0, 0, 0)
+        rc.setSpacing(4)
+        rc.addWidget(self.info)
+        rc.addWidget(self.category_tabs)
+        rc.addWidget(self.search_box)
+        rc.addWidget(self.filter_hint)
+        # The List / Covers switch sits on its own line, under the search box and to the
+        # right, so either view is one click away while the device is read or empty.
+        self.view_row = QWidget()
+        view_row = QHBoxLayout(self.view_row)
+        view_row.setContentsMargins(0, 0, 0, 0)
+        view_row.setSpacing(6)
+        view_row.addStretch(1)
+        view_row.addWidget(self.list_btn)
+        view_row.addWidget(self.covers_btn)
+        rc.addWidget(self.view_row)
+        self.toolbar = QWidget()
+        row = QHBoxLayout(self.toolbar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(self.dir_label, 1)
+        row.addWidget(self.play_btn)
+        row.addWidget(self.refresh_btn)
+        row.addWidget(self.dir_btn)
+        # shown only once a device is open: until then the buttons have nothing to act on
+        self.toolbar.hide()
+        rc.addWidget(self.toolbar)
+        rc.addWidget(self.space)
+        rc.addWidget(self.album_bar)
+        rc.addWidget(self.views, 1)
+        rc.addWidget(self.summary)
+        rc.addWidget(self.busy)
+        self.music_box = QWidget()
+        self.music_box.setLayout(rc)
+
+        # the music sits in one of two frames: devices across the top, or down the side
+        self.bar_container = QWidget()
+        bar_box = QVBoxLayout(self.bar_container)
+        bar_box.setContentsMargins(0, 0, 0, 0)
+        bar_box.setSpacing(4)
+        bar_box.addWidget(self.dev_bar)
+        bar_box.addWidget(self.music_box, 1)
+
+        self.side_container = QWidget()
+        side_box = QHBoxLayout(self.side_container)
+        side_box.setContentsMargins(0, 0, 0, 0)
+        side_box.setSpacing(6)
+        side_box.addWidget(self.dev_side)
+        self.dev_divider = QFrame()
+        self.dev_divider.setObjectName("DeviceDivider")
+        self.dev_divider.setFixedWidth(1)
+        side_box.addWidget(self.dev_divider)
+        side_box.addWidget(self.music_box, 1)
+
+        self.layout_stack = QStackedWidget()
+        self.layout_stack.addWidget(self.bar_container)
+        self.layout_stack.addWidget(self.side_container)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(4)
+        lay.addWidget(self.layout_stack, 1)
+        self.apply_layout()
+        self.set_music_view(self.config.get("devices_music_view", "list"))
+        self._sync_view_controls()
+
+    # ---------- the device list (fed by MainWindow's watcher) ----------
+    def apply_layout(self, key=None):
+        """Device list across the top of the tab, or down the side (Preferences > Library)."""
+        key = key or self.config.get("devices_layout", "bar")
+        if key not in ("bar", "side"):
+            key = "bar"
+        self.config["devices_layout"] = key
+        target = self.bar_container if key == "bar" else self.side_container
+        other = self.side_container if key == "bar" else self.bar_container
+        # the music is one widget, so move it into the frame this layout uses
+        other.layout().removeWidget(self.music_box)
+        if target.layout().indexOf(self.music_box) < 0:
+            target.layout().addWidget(self.music_box, 1)
+        self.layout_stack.setCurrentWidget(target)
+        self._render_devices()
+        return key
+
+    def _device_rows(self):
+        """Every device this app has seen, plugged in or not, in a stable order."""
+        live = {d.id: d for d in self.devices}
+        rows, seen = [], set()
+        hidden = set(self.config.get("removed_devices") or {})
+        for rec in self.config.get("device_registry") or []:
+            dev_id = rec.get("id")
+            if not dev_id or dev_id in seen or dev_id in hidden:
+                continue
+            d = live.get(dev_id)
+            raw = d.name if d is not None else (rec.get("name") or dev_id)
+            rows.append({"id": dev_id,
+                         "name": configured_device_name(self.config, dev_id, raw),
+                         "raw": raw,
+                         "kind": d.kind if d is not None else (rec.get("kind") or "mass"),
+                         "root": d.root if d is not None else (rec.get("root") or ""),
+                         "connected": d is not None,
+                         "device": d})
+            seen.add(dev_id)
+        for d in self.devices:
+            if d.id in seen or d.id in hidden:
+                continue
+            rows.append({"id": d.id,
+                         "name": configured_device_name(self.config, d.id, d.name),
+                         "raw": d.name, "kind": d.kind, "root": d.root,
+                         "connected": True, "device": d})
+        return rows
+
+    @staticmethod
+    def _row_tooltip(entry):
+        kind = "MTP device" if entry["kind"] == "mtp" else "USB storage"
+        state = DEVICE_STATUS_ON if entry["connected"] else DEVICE_STATUS_OFF
+        where = f"\n{entry['root']}" if entry["root"] else ""
+        return f"{entry['raw']}\n{kind} · {state}{where}\nRight-click to rename or remove it"
+
+    def _render_devices(self):
+        """Fill the sidebar list and the top bar from the devices the watcher found.
+
+        A remembered device keeps its place and its name after it is unplugged; the dot
+        says whether it is here. The device that is open stays the checked one when
+        either view is rebuilt, which a layout change does.
+        """
+        self.rows = self._device_rows()
+        row = next((i for i, r in enumerate(self.rows) if r["id"] == self._current_id), -1)
+        for widget in self._bar_widgets:
+            self.dev_bar_lay.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+        self._bar_widgets = []
+        self._device_buttons = []
+
+        self.dev_list.blockSignals(True)
+        self.dev_list.clear()
+        for entry in self.rows:
+            item = QListWidgetItem(entry["name"], self.dev_list)
+            item.setData(DEVICE_ID_ROLE, entry["id"])
+            item.setData(DEVICE_NAME_ROLE, entry["name"])
+            item.setData(DEVICE_STATUS_ROLE, DEVICE_STATUS_ON if entry["connected"]
+                         else DEVICE_STATUS_OFF)
+            item.setData(DEVICE_CONNECTED_ROLE, entry["connected"])
+            item.setToolTip(self._row_tooltip(entry))
+            item.setSizeHint(QSize(0, 48))
+        if row >= 0:
+            self.dev_list.setCurrentRow(row)
+        self.dev_list.blockSignals(False)
+
+        for index, entry in enumerate(self.rows):
+            button = DeviceBarButton(entry["id"], entry["name"], entry["connected"])
+            button.setChecked(index == row)
+            button.setToolTip(self._row_tooltip(entry))
+            button.clicked.connect(lambda _checked=False, i=index: self._select_index(i))
+            button.setContextMenuPolicy(Qt.CustomContextMenu)
+            button.customContextMenuRequested.connect(
+                lambda pos, i=index, b=button: self._device_menu(i, b.mapToGlobal(pos)))
+            self.dev_bar_lay.insertWidget(index, button)
+            self._bar_widgets.append(button)
+            self._device_buttons.append(button)
+        # No placeholder in the bar: the music pane already says that nothing is
+        # connected, and two copies of that sentence read like a bug.
+
+    def set_devices(self, devices):
+        cur = self._current_id or (self.backend.device.id if self.backend else None)
+        # A device that is gone takes its queued tracks and buffered copies with it. The
+        # poll may not be the first to notice (the tab can be reloaded directly), so the
+        # queue is cleaned here as well as by the watcher.
+        old_ids = {d.id for d in self.devices}
+        new_ids = {d.id for d in devices}
+        for device_id in old_ids ^ new_ids:
+            # A re-plugged phone has not answered yet: the last "ready" was about the
+            # previous connection, and a device that left has nothing to answer at all.
+            self._device_ready.pop(device_id, None)
+        for old in self.devices:
+            if old.id not in new_ids:
+                removed = self.player.drop_device_entries(old.id)
+                if removed:
+                    notice = getattr(self.window(), "notify", None)
+                    if notice:
+                        name = configured_device_name(self.config, old.id, old.name)
+                        notice(f"Removed {removed} track(s) from {name}: the device "
+                               f"was disconnected")
+        self.devices = list(devices)
+        # A device is kept by its stable id, so the bar, the sidebar and the nickname
+        # survive both an unplug and an app restart.
+        changed = False
+        for d in self.devices:
+            changed = remember_device(self.config, d) or changed
+        if changed:
+            save_config(self.config)
+        self._render_devices()
+        ids = [r["id"] for r in self.rows]
+        connected = [r["id"] for r in self.rows if r["connected"]]
+        if cur in connected:
+            self._select_index(ids.index(cur))
+        elif connected:
+            # a device that just arrived is what the tab should show, even if the row
+            # selected before it was a remembered device that is still unplugged
+            self._select_index(ids.index(connected[0]))
+        elif cur in ids:
+            self._select_index(ids.index(cur))
+        elif ids:
+            self._select_index(0)
+        else:
+            self._clear_device()
+
+    def _select_index(self, row):
+        if row < 0 or row >= len(self.rows):
+            return
+        entry = self.rows[row]
+        self._current_id = entry["id"]
+        self.dev_list.blockSignals(True)
+        self.dev_list.setCurrentRow(row)
+        self.dev_list.blockSignals(False)
+        for index, button in enumerate(self._device_buttons):
+            button.blockSignals(True)
+            button.setChecked(index == row)
+            button.blockSignals(False)
+        self._cancel_scan()
+        if entry["connected"] and entry["device"] is not None:
+            self.backend = Backend(entry["device"])
+            self._restore_category()
+            self.play_btn.setEnabled(True)
+            self.refresh_btn.setEnabled(True)
+            self.dir_btn.setEnabled(True)
+            reason = self._busy_reason()
+            if reason:
+                self._show_busy_page(reason)
+                return
+            self.reload()
+            return
+        self._show_not_connected(entry)
+
+    def _show_not_connected(self, entry):
+        """A remembered device that is not plugged in: say so, and offer nothing to click."""
+        self.backend = None
+        self._reset_category()
+        self.music = []
+        self._album_focus = None
+        self.album_bar.hide()
+        self._cover_jobs = {}
+        self._stop_cover_loader()
+        self.tree.clear()
+        self.covers.clear()
+        self._forget_books()
+        self._invalidate_books()
+        self.summary.setText("Plug it back in to browse its music.")
+        self.space.hide()
+        self.space.setFormat("")
+        self.toolbar.hide()
+        self.dir_label.hide()
+        self.dir_label.clear()
+        self.play_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.dir_btn.setEnabled(False)
+        self.busy.hide()
+        self._set_controls(True)
+        self.info.setText(f"<b>{entry['name']}</b> — {DEVICE_STATUS_OFF}")
+        self.filter_hint.setObjectName("Muted")
+        self.filter_hint.setText(DEVICE_FILTER_HINT)
+        self.filter_hint.style().unpolish(self.filter_hint)
+        self.filter_hint.style().polish(self.filter_hint)
+        self._show_current_view()
+        self._set_load_status("")
+
+    def _list_device_menu(self, pos):
+        item = self.dev_list.itemAt(pos)
+        if item is None:
+            return
+        self._device_menu(self.dev_list.row(item),
+                          self.dev_list.viewport().mapToGlobal(pos))
+
+    def _device_menu(self, row, global_pos):
+        """Right-click a device, in the bar or the sidebar, to name it."""
+        if row < 0 or row >= len(self.rows):
+            return
+        entry = self.rows[row]
+        menu = QMenu(self)
+        rename = menu.addAction("Rename device…")
+        rename.triggered.connect(lambda _checked=False, i=row: self._rename_device(i))
+        if (self.config.get("device_names") or {}).get(entry["id"]):
+            reset = menu.addAction("Use the device's own name")
+            reset.triggered.connect(lambda _checked=False, i=row: self._rename_device(i, reset=True))
+        menu.addSeparator()
+        remove = menu.addAction("Remove from the Devices tab…")
+        remove.triggered.connect(lambda _checked=False, i=row: self._remove_device(i))
+        menu.exec(global_pos)
+
+    def _rename_device(self, row, reset=False):
+        if row < 0 or row >= len(self.rows):
+            return
+        entry = self.rows[row]
+        names = self.config.setdefault("device_names", {})
+        if reset:
+            names.pop(entry["id"], None)
+        else:
+            current = names.get(entry["id"]) or entry["raw"]
+            text, ok = QInputDialog.getText(self, "Rename device",
+                                            f"Name shown for {entry['raw']}:", text=current)
+            if not ok:
+                return
+            text = text.strip()
+            if text and text != entry["raw"]:
+                names[entry["id"]] = text
+            else:
+                names.pop(entry["id"], None)
+        save_config(self.config)
+        self._render_devices()
+        self._refresh_current_label()
+
+    def _remove_device(self, row):
+        """Hide a device from this tab; Preferences > Devices can add it back."""
+        if row < 0 or row >= len(self.rows):
+            return
+        entry = self.rows[row]
+        if entry["id"] == self._sync_hold_id:
+            QMessageBox.information(self, "Remove device",
+                                    "A sync is using this device. Wait for it to finish first.")
+            return
+        if QMessageBox.question(
+                self, "Remove device",
+                f"Remove \"{entry['name']}\" from the Devices tab?\n\n"
+                "Its music, sync profiles and presets stay where they are, and it can be "
+                "added back from Preferences > Devices.") != QMessageBox.Yes:
+            return
+        self.config.setdefault("removed_devices", {})[entry["id"]] = entry["name"]
+        save_config(self.config)
+        self.refresh_list()
+        notice = getattr(self.window(), "notify", None)
+        if notice:
+            notice(f"Removed {entry['name']} from the Devices tab")
+
+    def refresh_list(self):
+        """Rebuild after a device was hidden or restored in Preferences."""
+        self._render_devices()
+        ids = [r["id"] for r in self.rows]
+        connected = [r["id"] for r in self.rows if r["connected"]]
+        if self._current_id in ids:
+            return      # still open: _render_devices kept its row checked, nothing to read
+        if connected:
+            self._select_index(ids.index(connected[0]))
+        elif ids:
+            self._select_index(0)
+        else:
+            self._clear_device()
+
+    def _refresh_current_label(self):
+        """A rename changes the header too, without reading the device again."""
+        entry = next((r for r in self.rows if r["id"] == self._current_id), None)
+        if entry is None:
+            return
+        if self.backend is not None:
+            d = self.backend.device
+            kind = "MTP" if d.kind == "mtp" else "USB storage"
+            self.info.setText(f"<b>{entry['name']}</b> — {kind} — {d.root}")
+        else:
+            self.info.setText(f"<b>{entry['name']}</b> — {DEVICE_STATUS_OFF}")
+
+    def _clear_device(self):
+        """No device is connected: no music, no capacity bar, no folder from last time."""
+        self._cancel_scan()
+        self._current_id = None
+        self.backend = None
+        self._reset_category()
+        self.music = []
+        self._album_focus = None
+        self.album_bar.hide()
+        self._cover_jobs = {}
+        self._stop_cover_loader()
+        self.tree.clear()
+        self.covers.clear()
+        self._forget_books()
+        self._invalidate_books()
+        self.info.setText("No devices connected." if not self.rows
+                         else "No device is connected right now.")
+        self.summary.clear()
+        self.space.hide()
+        self.space.setFormat("")
+        self.toolbar.hide()
+        self.dir_label.hide()
+        self.dir_label.clear()
+        self.play_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.dir_btn.setEnabled(False)
+        self.busy.hide()
+        self._set_controls(True)
+        self.filter_hint.setObjectName("Muted")
+        self.filter_hint.setText(DEVICE_FILTER_HINT)
+        self.filter_hint.style().unpolish(self.filter_hint)
+        self.filter_hint.style().polish(self.filter_hint)
+        self._show_current_view()
+        self._set_load_status("")
+
+    def _select_device(self, row):
+        if row < 0 or row >= len(self.rows):
+            return
+        self._select_index(row)
+
+    def _reset_category(self):
+        """No connected device: show Music, but leave the tabs out of reach."""
+        self.category = "music"
+        self.category_tabs.blockSignals(True)
+        self.category_tabs.setCurrentIndex(0)
+        self.category_tabs.blockSignals(False)
+        self.category_tabs.setEnabled(False)
+        self._sync_view_controls()
+
+    def _restore_category(self):
+        """Bring back the category this device was last left on."""
+        if not self.backend:
+            return
+        keys = [key for key, _label in DEVICE_CATEGORY_LABELS]
+        saved = (self.config.get("device_categories") or {}).get(
+            self.backend.device.id, "music")
+        key = saved if saved in keys else "music"
+        self.category = key
+        self.category_tabs.blockSignals(True)
+        self.category_tabs.setCurrentIndex(keys.index(key))
+        self.category_tabs.blockSignals(False)
+        self.category_tabs.setEnabled(True)
+        label = dict(DEVICE_CATEGORY_LABELS)[key]
+        self.search.setPlaceholderText(f"Search the device's {label.lower()}…")
+        self._sync_view_controls()
+
+    def _category_changed(self, index):
+        """Switch the one device read between music and books."""
+        if not (0 <= index < len(DEVICE_CATEGORY_LABELS)):
+            return
+        key, label = DEVICE_CATEGORY_LABELS[index]
+        if key == self.category:
+            return
+        self.category = key
+        self._album_focus = None
+        self.album_bar.hide()
+        self.search.setPlaceholderText(f"Search the device's {label.lower()}…")
+        if self.backend is not None:
+            (self.config.setdefault("device_categories", {})
+             [self.backend.device.id]) = key
+            save_config(self.config)
+        self._sync_view_controls()
+        if key != "audiobook":
+            self._stop_book_loader()
+        self._fill_views()
+
+    def _category_for_path(self, path, profiles):
+        """The tab a device path belongs in, from its folder or the profiles' targets."""
+        kind = media_kind_for_path(path, self.config)
+        if kind != "music":
+            return kind
+        low = str(path or "").replace("\\", "/").lower()
+        for profile in profiles:
+            base = str(getattr(profile, "target", "") or "").strip("/")
+            for key, _label in (("music", "music"),
+                                ("audiobook", "audiobook"),
+                                ("podcast", "podcast")):
+                folder = profile_sync_folder(profile, key)
+                full = "/".join(part for part in (base, folder) if part).lower()
+                if full and (low == full or low.startswith(full + "/")):
+                    return key
+        return "music"
+
+    def _mount_mtp(self):
+        if self.backend is not None and self._busy_reason():
+            QMessageBox.information(self, "Devices", "A task is using this device. Wait for it "
+                                    "to finish before mounting again.")
+            return
+        uris = mtp_mount_hint()
+        if not uris:
+            QMessageBox.information(
+                self, "MTP", "No unmounted MTP device found.\nUnlock the phone and pick "
+                "'File transfer' in the USB notification. Requires gvfs-mtp / gvfs-backends.")
+            return
+        for u in uris:
+            mount_uri(u)
+        self.window().poll_devices()
+
+    # ---------- the folder on the device ----------
+    def device_dir(self):
+        """The folder this device is showing, remembered per device."""
+        if not self.backend:
+            return ""
+        return (self.config.get("device_dirs") or {}).get(self.backend.device.id, "")
+
+    def set_device_dir(self, rel):
+        if not self.backend:
+            return
+        dirs = self.config.setdefault("device_dirs", {})
+        dirs[self.backend.device.id] = (rel or "").strip("/")
+        save_config(self.config)
+        self.reload()
+
+    def _default_dir(self):
+        """First visit to a device: show Music when it has one, else the whole device."""
+        key = self.backend.device.id
+        dirs = self.config.setdefault("device_dirs", {})
+        if key in dirs:
+            return dirs[key]
+        try:
+            names = [n for n, isdir, _s in self.backend.listdir("") if isdir]
+        except OSError:
+            names = []
+        chosen = next((n for n in names if n.lower() == DEVICE_DIR_DEFAULT.lower()), "")
+        dirs[key] = chosen
+        return chosen
+
+    def pick_dir(self):
+        if not self.backend:
+            return
+        if self._busy_reason():
+            return      # listing a folder on a device a task is using would block
+        dialog = DeviceFolderDialog(self.backend, self.device_dir(), self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.set_device_dir(dialog.chosen())
+
+    # ---------- what is on the device ----------
+    def _sync_view_controls(self):
+        """The List/Covers switch is for music; a book title list has one shape."""
+        audiobooks = self.category == "audiobook"
+        self.view_row.setVisible(not audiobooks)
+        self.fold_btn.setVisible(not audiobooks)
+
+    def _show_current_view(self):
+        """Show the view the current category and music mode call for."""
+        if self.backend is not None and self._busy_reason():
+            return
+        if self.category == "audiobook":
+            self.views.setCurrentWidget(self.books)
+        elif self._album_focus is not None:
+            self.views.setCurrentWidget(self.tree)
+        else:
+            covers = self.config.get("devices_music_view") == "covers"
+            self.views.setCurrentWidget(self.covers if covers else self.tree)
+
+    def set_music_view(self, key):
+        key = key if key in ("list", "covers") else "list"
+        if key == "covers" and self._album_focus is not None:
+            # the covers are the way out of an opened album
+            self._album_focus = None
+            self.album_bar.hide()
+        self.config["devices_music_view"] = key
+        self.list_btn.setChecked(key == "list")
+        self.covers_btn.setChecked(key == "covers")
+        held = self.backend is not None and self._busy_reason()
+        if held:
+            return
+        if self.category == "audiobook":
+            self.views.setCurrentWidget(self.books)
+            return
+        self.views.setCurrentWidget(self.tree if key == "list" else self.covers)
+        if key == "covers":
+            self._maybe_load_covers()
+
+    # ---------- how open the tree was left ----------
+    def _apply_fold(self, mode):
+        """Open the device tree the way the fold menu says.
+
+        The device tree has no A-Z marker rows of its own, so 'Open letter markers only'
+        opens its first level: the artist rows, with their albums visible and the tracks
+        still closed. That is the shape the tree opens in before a choice is remembered.
+        """
+        self.tree.collapseAll()
+        if mode == "all":
+            self.tree.expandAll()
+        elif mode == "letters":
+            for i in range(self.tree.topLevelItemCount()):
+                self.tree.topLevelItem(i).setExpanded(True)
+
+    def _fold_menu_sync(self):
+        current = self.config.get("dev_fold") or ""
+        for mode, action in getattr(self, "fold_actions", {}).items():
+            action.blockSignals(True)
+            action.setChecked(mode == current)
+            action.blockSignals(False)
+
+    def _fold_all(self, mode):
+        """Remember and apply one of the three fold positions: all, letters, none."""
+        if mode not in DEV_FOLD_MODES:
+            return
+        self.config["dev_fold"] = mode
+        save_config(self.config)
+        self._apply_fold(mode)
+        self._fold_menu_sync()
+
+    # ---------- searching what the device holds ----------
+    def _search_changed(self, text):
+        self.search_clear.setVisible(bool(text.strip()))
+        self._apply_query()
+
+    def _apply_query(self):
+        """Parse the search box into a predicate over the entries already read."""
+        text = self.search.text().strip()
+        error = ""
+        try:
+            query = parse_device_query(text)
+        except FilterError as e:
+            error = str(e)
+            query = device_plain_query(text)
+        self._query = query
+        self._query_text = text
+        self._query_error = error
+        self._fill_views()
+
+    def _visible(self):
+        """The tracks the views show: the opened album, narrowed by the search."""
+        focus = self._album_focus[1] if self._album_focus else None
+        shown = []
+        for index, entry in enumerate(self.music):
+            if entry.get("kind", "music") != self.category:
+                continue
+            if focus is not None and entry["rel"] not in focus:
+                continue
+            if not self._query(entry):
+                continue
+            shown.append((index, entry))
+        return shown
+
+    def _update_hint(self, shown):
+        self.filter_hint.setObjectName("Amber" if self._query_error else "Muted")
+        if self._query_error:
+            self.filter_hint.setText(f"Filter error: {self._query_error} — showing a "
+                                     f"plain text search")
+        elif self._query_text:
+            self.filter_hint.setText(f"{shown} match{'es' if shown != 1 else ''} · "
+                                     + DEVICE_FILTER_HINT)
+        else:
+            self.filter_hint.setText(DEVICE_FILTER_HINT)
+        self.filter_hint.style().unpolish(self.filter_hint)
+        self.filter_hint.style().polish(self.filter_hint)
+
+    def _library_rows(self):
+        if self.library is None:
+            return {}
+        try:
+            return {r["path"]: r for r in self.library.tracks()}
+        except Exception:
+            return {}
+
+    def _entry(self, rel, size, row=None):
+        """One track: tags from the library when this app wrote it, else from its path.
+
+        A synced file is on the device under the name and layout it has on the PC, so the
+        path alone already says artist, album and title. The sync manifest is what turns
+        that guess into the real tags — it remembers which PC file each device path came
+        from, and the library knows that file's title, track number and cover.
+        """
+        parts = rel.split("/")
+        album = parts[-2] if len(parts) >= 2 else ""
+        artist = parts[-3] if len(parts) >= 3 else ""
+        title = os.path.splitext(parts[-1])[0]
+        track = 0
+        match = re.match(r"^(\d{1,3})\s*[-. ]\s*(.+)$", title)
+        if match:
+            track, title = int(match.group(1)), match.group(2)
+        entry = {"rel": rel, "size": size, "title": title, "artist": artist,
+                 "album": album, "albumartist": "", "track": track, "library": row}
+        if row:
+            entry.update(title=row.get("title") or title,
+                         artist=row.get("artist") or artist,
+                         album=row.get("album") or album,
+                         albumartist=row.get("albumartist") or "",
+                         track=_num(row.get("track")) or track)
+            entry["length"] = row.get("length") or 0
+        return entry
+
+    def _manifest(self):
+        """The records of what this app wrote to this device, or None if unreadable."""
+        if not self.backend:
+            return None
+        try:
+            return DeviceManifest(Profile(device_id=self.backend.device.id))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _sources():
+        try:
+            return {p.id: profile_sources(p)[0] for p in load_profiles()
+                    if profile_sources(p)}
+        except Exception:
+            return {}
+
+    def _library_map(self):
+        """Device path -> the PC file it came from, for music this app synced there.
+
+        Copy to library uses it to leave alone a track the library already holds, and the
+        device rows use the library's tags. Playback stays on the device.
+        """
+        manifest = self._manifest()
+        if manifest is None or not self.backend:
+            return {}
+        sources = self._sources()
+        out = {}
+        for entry in self.music:
+            dev = entry.get("dev") or entry["rel"]
+            rec = manifest.get(dev)
+            if not rec:
+                continue
+            source = sources.get(rec.get("profile") or "")
+            rel = rec.get("rel") or ""
+            if not source or not rel:
+                continue
+            path = os.path.join(source, rel)
+            if os.path.isfile(path):
+                out[dev] = path
+        return out
+
+    def _sync_rows(self, listing, prefix):
+        """Map a device path to the library row the manifest says it came from."""
+        rows = self._library_rows()
+        manifest = self._manifest()
+        if not rows or manifest is None:
+            return {}
+        sources = self._sources()
+        out = {}
+        for path in listing:
+            rec = manifest.get(path)
+            if not rec:
+                continue
+            source = sources.get(rec.get("profile") or "")
+            rel = rec.get("rel") or ""
+            if not source or not rel:
+                continue
+            row = rows.get(os.path.join(source, rel))
+            if row is not None:
+                out[path] = row
+        return out
+
+    def reload(self):
+        """Read the chosen device folder and show the music in it.
+
+        The whole read happens on a worker, for every kind of device: walking a phone's
+        MTP mount or a slow USB stick on the GUI thread is what made the window stop
+        answering. While a task owns the device, this reads nothing and shows the task.
+        """
+        if not self.backend:
+            self._clear_device()
+            return
+        reason = self._busy_reason()
+        if reason:
+            self._show_busy_page(reason)
+            return
+        self._cancel_scan()
+        self._set_controls(True)
+        self._show_current_view()
+        d = self.backend.device
+        shown = configured_device_name(self.config, d.id, d.name)
+        self.info.setText(f"<b>{shown}</b> — {'MTP' if d.kind == 'mtp' else 'USB storage'}"
+                          f" — {d.root}")
+        self.toolbar.show()
+        self.dir_label.show()
+        self.space.show()
+        self.play_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        self.dir_btn.setEnabled(True)
+        if d.kind == "mtp":
+            # the folder and the capacity are known once the device answers: the scan
+            # fills both in, after waiting for file transfer if it has to
+            self.dir_label.setText("Device folder: reading…")
+            self.space.setRange(0, 1)
+            self.space.setValue(0)
+            self.space.setFormat("Reading the device…")
+            self._request_scan()
+            return
+        root = self._default_dir()
+        self._set_ready(d.id, True)
+        self._update_header(root, self.backend.free_space())
+        try:
+            listing = self.backend.walk_files(root)
+        except OSError as e:
+            self._set_ready(d.id, False)
+            self.music = []
+            self.info.setText(f"{d.name}: {e}")
+            self._album_focus = None
+            self.album_bar.hide()
+            self._fill_views()
+            return
+        self._apply_listing(listing, root)
+
+    def _update_header(self, root, capacity=None):
+        """Say which folder is shown and how full the device is."""
+        if not self.backend:
+            return
+        self.dir_label.setText("Device folder: " + ("/" + root if root else "whole device"))
+        self.dir_label.show()
+        self.space.show()
+        # No capacity is better than a capacity probed here: free_space() on an MTP
+        # mount is a device request, and this runs on the GUI thread.
+        fs = capacity
+        if fs and fs[1]:
+            free, total = fs
+            self.space.setRange(0, 1000)
+            self.space.setValue(int(1000 * (total - free) / total))
+            self.space.setFormat(f"{fmt_human_size(total - free)} used of {fmt_human_size(total)}"
+                                 f"  ·  {fmt_human_size(free)} free")
+        else:
+            self.space.setRange(0, 1)
+            self.space.setValue(0)
+            self.space.setFormat("Capacity unknown")
+
+    def _apply_listing(self, listing, root):
+        """Turn a device directory listing into the rows the views show."""
+        prefix = (root + "/") if root else ""
+        synced = self._sync_rows(listing, prefix)
+        entries = []
+        profiles = []
+        if self.backend is not None:
+            try:
+                profiles = [p for p in load_profiles()
+                            if p.device_id == self.backend.device.id]
+            except Exception:
+                profiles = []
+        for path, size in listing.items():
+            # .m4b is an audiobook container the music library intentionally skips;
+            # this browser must still show it, and the category tabs sort it out.
+            if not is_audiobook(path):
+                continue
+            rel = path[len(prefix):] if path.startswith(prefix) else path
+            entry = self._entry(rel, size, synced.get(path))
+            # what the device calls this file, folder prefix included: what playback
+            # and the sync manifest both need, unlike the shortened name shown here
+            entry["dev"] = path
+            entry["kind"] = self._category_for_path(path, profiles)
+            entries.append(entry)
+        entries.sort(key=lambda e: (e["artist"].lower(), e["album"].lower(),
+                                    e["track"], e["title"].lower()))
+        self._cover_index = None
+        signature = tuple((e.get("dev"), e.get("size")) for e in entries)
+        if signature != self._book_signature:
+            self._book_signature = signature
+            self._book_generation += 1
+            self._book_cache = {}
+            self._book_icons = {}
+            self._book_loading = set()
+            self._stop_book_loader()
+        self.music = entries
+        self._prune_album_focus()
+        self._fill_views()
+
+    # ---------- reading the device library on a worker ----------
+    def _busy_reason(self):
+        """What owns the device this tab shows right now, in words; "" when it is free.
+
+        The answer comes from the whole app, not from a profile: a compare, a sync, a
+        verification, a copy, or an autosync about to start all own the device. Until
+        that task is done nothing here may read it, so this tab shows the task instead
+        of the music.
+        """
+        if self.backend is None:
+            return ""
+        if self._sync_hold_id and self._sync_hold_id == self.backend.device.id:
+            name = self._sync_hold_name or self._device_label(self._sync_hold_id)
+            return f"Syncing {name}\u2026"
+        reason = DEVICE_CLAIMS.reason(self.backend.device.root)
+        if reason:
+            return reason
+        return self._autosync_reason(self.backend.device.id)
+
+    def _autosync_reason(self, device_id):
+        """Is this device about to be synced automatically? Then it is not browsed."""
+        sync_tab = getattr(self.window(), "sync_tab", None)
+        if sync_tab is None:
+            return ""
+        for prof in list(getattr(sync_tab, "autosync_queue", None) or []):
+            if prof.device_id == device_id:
+                return f"Autosync is starting on {self._device_label(device_id)}\u2026"
+        return ""
+
+    def _device_label(self, device_id):
+        """The name the device shows in this tab, for a message about it."""
+        if self.backend is not None and self.backend.device.id == device_id:
+            return configured_device_name(self.config, device_id, self.backend.device.name)
+        for d in self.devices:
+            if d.id == device_id:
+                return configured_device_name(self.config, device_id, d.name)
+        return "this device"
+
+    def _request_scan(self):
+        """Start (or restart) the device scan; a task that owns the device goes first."""
+        if not self.backend or self._busy_reason():
+            self._scan_retry.stop()
+            return
+        self._scan_retry.stop()
+        self._maybe_scan()
+
+    def _sync_uses(self, device_id):
+        """Is any task reading or writing this device right now?"""
+        if self.backend is None or self.backend.device.id != device_id:
+            return False
+        return bool(DEVICE_CLAIMS.reason(self.backend.device.root))
+
+    def _sync_running(self):
+        return self.backend is not None and self._sync_uses(self.backend.device.id)
+
+    def _maybe_scan(self):
+        if not self.backend:
+            self._scan_retry.stop()
+            return
+        reason = self._busy_reason()
+        if reason:
+            self._scan_retry.stop()
+            self._show_busy_page(reason)
+            return
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            return
+        self._scan_retry.stop()
+        self._start_scan()
+
+    def _start_scan(self):
+        """Walk the device on a worker and report through the status bar, not a bar."""
+        backend = self.backend
+        device = backend.device
+        known = device.id in (self.config.get("device_dirs") or {})
+        stored = (self.config.get("device_dirs") or {}).get(device.id, "")
+
+        def sync_running():
+            # A task claimed the device while this walk was running: stop the walk
+            # rather than queue a second reader behind it.
+            return DEVICE_CLAIMS.held(device.root)
+
+        def job(_prog, log, cancel):
+            if device.kind == "mtp":
+                deadline = None
+                while True:
+                    if cancel() or sync_running():
+                        return None
+                    if not os.path.isdir(device.root):
+                        return ("gone", None, None, None)
+                    try:
+                        os.listdir(device.root)
+                    except OSError:
+                        # a mount that is still listed but has gone away
+                        return ("gone", None, None, None)
+                    if mtp_storage_ready(device):
+                        break
+                    if deadline is None:
+                        deadline = time.time() + 90
+                        log("Loading device library — waiting for file transfer…")
+                    elif time.time() > deadline:
+                        return ("error", "The device is not answering. Set it to "
+                                "'File transfer' and press Refresh.", None, None)
+                    time.sleep(0.4)
+            if cancel() or sync_running():
+                return None
+            chosen = stored
+            if not known:
+                try:
+                    names = [n for n, is_dir, _s in backend.listdir("") if is_dir]
+                except OSError:
+                    names = []
+                chosen = next((n for n in names
+                               if n.lower() == DEVICE_DIR_DEFAULT.lower()), "")
+            listing = backend.walk_files(chosen, cancel)
+            if cancel() or sync_running():
+                return None
+            return ("ok", listing, chosen, backend.free_space())
+
+        token = self._scan_token + 1
+        self._scan_token = token
+        self._set_load_status("Loading device library…")
+        worker = Worker(job, self)
+        worker.log.connect(lambda message: self._scan_status(message, token))
+        worker.done.connect(lambda result: self._scan_done(result, token, backend,
+                                                           sync_running))
+        worker.failed.connect(lambda trace: self._scan_failed(trace, token))
+        self._scan_worker = worker
+        worker.start()
+
+    def _scan_status(self, message, token):
+        if token == self._scan_token:
+            self._set_load_status(message)
+
+    def _scan_done(self, result, token, backend, sync_running):
+        if token != self._scan_token:
+            return
+        self._scan_worker = None
+        if self._busy_reason():
+            # The task that took the device reloads this tab when it is done; the page
+            # says so, so no read is queued behind the running one.
+            return
+        if result is None:
+            return
+        kind = result[0]
+        if kind == "gone":
+            # The mount went away mid-read: nothing from it may stay on screen, and
+            # nothing queued from it may stay waiting to play. The row's dot is what
+            # says whether the device is really gone — the watcher decides that, so no
+            # "disconnected" message is painted here (a phone that is merely busy can
+            # still be mounted and connected).
+            self._set_load_status("")
+            self.player.drop_device_entries(backend.device.id)
+            self._forget_music()
+            self.space.hide()
+            # Keep Refresh in reach: a mount that blinks while the device stays listed
+            # is not a disconnect, and the next poll decides whether the row is greyed.
+            self.dir_label.setText("Device folder: unknown")
+            poll = getattr(self.window(), "poll_devices", None)
+            if poll is not None:
+                QTimer.singleShot(0, poll)
+            return
+        if kind == "error":
+            self._set_ready(backend.device.id, False)
+            self._set_load_status("")
+            self._forget_music()
+            self.space.setRange(0, 1)
+            self.space.setValue(0)
+            self.space.setFormat("Device not answering")
+            self.dir_label.setText("Device folder: unknown")
+            self.summary.setText(result[1])
+            return
+        if self.backend is not backend or not self.backend \
+                or self.backend.device.id != backend.device.id:
+            self._set_load_status("")
+            return
+        _kind, listing, root, capacity = result
+        self._set_ready(backend.device.id, bool(listing))
+        self._set_load_status("")
+        self.config.setdefault("device_dirs", {})[backend.device.id] = root or ""
+        save_config(self.config)
+        self._update_header(root, capacity)
+        self._apply_listing(listing, root)
+        # The dot said "reading" while this ran: let the sync tab follow the device
+        # again now that the walk is over, instead of waiting for the next poll.
+        sync_tab = getattr(self.window(), "sync_tab", None)
+        if sync_tab is not None and hasattr(sync_tab, "refresh_status"):
+            sync_tab.refresh_status()
+
+    def _forget_music(self):
+        """Drop the rows of a device that is no longer answering, so none can be clicked."""
+        self.music = []
+        self._album_focus = None
+        self.album_bar.hide()
+        self._cover_jobs = {}
+        self._stop_cover_loader()
+        self.tree.clear()
+        self.covers.clear()
+        self._forget_books()
+        self._invalidate_books()
+        self._show_current_view()
+        self.summary.clear()
+
+    def _scan_failed(self, trace, token):
+        if token != self._scan_token:
+            return
+        self._scan_worker = None
+        self._set_load_status("")
+        self._forget_music()
+        self.space.setRange(0, 1)
+        self.space.setValue(0)
+        self.space.setFormat("Device not answering")
+        self.dir_label.setText("Device folder: unknown")
+        last = trace.strip().splitlines()[-1] if trace.strip() else "unknown error"
+        self.summary.setText(f"Could not read the device: {last}")
+
+    def _cancel_scan(self):
+        self._scan_token += 1
+        self._scan_retry.stop()
+        worker, self._scan_worker = self._scan_worker, None
+        if worker is not None:
+            try:
+                running = worker.isRunning()
+            except RuntimeError:
+                running = False
+            if running:
+                # A cancelled walk can spend a while finishing its current folder: keep
+                # it in sight so anything waiting for the device waits for it too.
+                self._retired_scans = [w for w in self._retired_scans if w is not worker]
+                self._retired_scans.append(worker)
+                worker.cancel()
+        self._set_load_status("")
+
+    def _set_load_status(self, text):
+        """Say in the status bar what the device is doing, without a progress bar."""
+        previous, self._load_status = self._load_status, text
+        win = self.window()
+        bar = win.statusBar() if win is not None and hasattr(win, "statusBar") else None
+        if bar is None:
+            return
+        if text:
+            bar.showMessage(text)
+        elif previous and bar.currentMessage() == previous:
+            bar.clearMessage()
+
+    def _set_ready(self, device_id, ready):
+        """Remember whether the device answered its last read, for the connected dot."""
+        if device_id:
+            self._device_ready[device_id] = bool(ready)
+
+    def ready_state(self, device_id):
+        """Did this device answer its last read? False when it did not, None if unread."""
+        return self._device_ready.get(device_id)
+
+    def forget_ready(self, device_id):
+        """Forget the last readiness answer: a re-plugged device starts unasked."""
+        self._device_ready.pop(device_id, None)
+
+    def _is_held(self, device_id):
+        """Is a task using this device, so nothing here may read it?"""
+        if self.backend is None or self.backend.device.id != device_id:
+            return False
+        return bool(self._busy_reason())
+
+    def is_busy(self):
+        """Is this tab itself reading, copying or writing the device right now?"""
+        worker = getattr(self, "_worker", None)
+        try:
+            return bool(worker is not None and worker.isRunning())
+        except RuntimeError:
+            return False
+
+    def is_loading(self):
+        """Is this tab walking the device's folders on a worker right now?
+
+        A cancelled walk counts until its thread has really stopped: it still holds the
+        mount, so a sync that starts now would sit in line behind it.
+        """
+        live = []
+        for worker in [self._scan_worker] + list(self._retired_scans):
+            try:
+                if worker is not None and worker.isRunning():
+                    live.append(worker)
+            except RuntimeError:
+                continue
+        if self._scan_worker in live:
+            self._retired_scans = [w for w in live if w is not self._scan_worker]
+        else:
+            self._retired_scans = live
+        return bool(live)
+
+    def wait_for_scan(self, timeout=90.0, cancel=lambda: False):
+        """Block (on a worker) until no walk of this device is left running."""
+        deadline = time.monotonic() + timeout
+        while self.is_loading() and not cancel() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return not self.is_loading()
+
+    def _set_controls(self, enabled):
+        """The search box, view switch and toolbar act on the device: off during a hold."""
+        self.category_tabs.setEnabled(bool(enabled and self.backend is not None))
+        self.search_box.setEnabled(enabled)
+        self.view_row.setEnabled(enabled)
+        self.toolbar.setEnabled(enabled)
+
+    def _show_busy_page(self, reason):
+        """Replace the music with the task that owns the device, in words.
+
+        The rows are not greyed, they are gone: there is nothing to click that could
+        turn into a device read, and the page says which process has the device.
+        """
+        self._stop_cover_loader()
+        self._cover_jobs = {}
+        self._cover_click_timer.stop()
+        self._cover_pending = None
+        self.album_bar.hide()
+        self._busy_text = reason
+        self.sync_title.setText(reason)
+        self.sync_detail.setText(
+            "The device is being read or written, so its music cannot be browsed, "
+            "played or copied until that finishes.\n\n"
+            "A phone answers one request at a time: a second reader waits in line and "
+            "the window stops answering, so this tab is out of the way while the task "
+            "runs.\n\n"
+            "The device library is read again automatically afterwards.")
+        self.views.setCurrentWidget(self.sync_page)
+        self._set_controls(False)
+        self.space.hide()
+        self.summary.clear()
+        self._stop_book_loader()
+        self._book_loading = set()
+        self._set_load_status(reason)
+
+    def busy_changed(self):
+        """A task took or gave back the device: show the task, or read the music again."""
+        if self.backend is None:
+            return
+        reason = self._busy_reason()
+        if reason:
+            self._cancel_scan()
+            self._show_busy_page(reason)
+            return
+        self._busy_text = ""
+        self.reload()
+
+    def sync_hold(self, profile=None):
+        """A compare/sync/verify is starting: give it the device, and only it.
+
+        The task itself claims the device before it starts; this also lets a caller
+        name the task for the page. Whatever this tab was doing is cancelled first: a
+        device library still being read, a retry, or a cover loader.
+        """
+        self._sync_hold_id = getattr(profile, "device_id", "") or ""
+        self._sync_hold_name = getattr(profile, "name", "") or ""
+        self.busy_changed()
+
+    def sync_release(self, reload=True):
+        """The sync is over: let this tab read the device again, now that it is free."""
+        held = self._sync_hold_id
+        self._sync_hold_id = ""
+        self._sync_hold_name = ""
+        self._busy_text = ""
+        self._set_controls(True)
+        if self.backend is None or self.backend.device.id != held:
+            return False
+        self._set_load_status("")
+        self._show_current_view()
+        if reload:
+            self.reload()
+        return True
+
+    def sync_finished(self):
+        """A sync is over: read the device again, since the sync may have changed it."""
+        self.sync_release()
+
+    def _prune_album_focus(self):
+        """A refresh keeps an opened album open, minus anything that is no longer there."""
+        if self._album_focus is None:
+            return
+        present = {e["rel"] for e in self.music}
+        kept = self._album_focus[1] & present
+        if not kept:
+            self._album_focus = None
+            self.album_bar.hide()
+            return
+        self._album_focus = (self._album_focus[0], kept)
+
+    def _book_identity(self, rel):
+        """A device path's book folder, title and whether it is a loose file.
+
+        Synced books live in a folder of chapters below the audiobook destination, so
+        the folder is the title. A file dropped straight into that destination is a
+        title of its own, exactly as the Audiobooks tab treats it.
+        """
+        clean = str(rel or "").replace("\\", "/").strip("/")
+        parts = clean.split("/") if clean else []
+        dirs = parts[:-1]
+        root = None
+        for index, part in enumerate(dirs):
+            low = part.casefold()
+            if low in ("audiobook", "audiobooks", "books") or "audiobook" in low:
+                root = index
+        inner = dirs[root + 1:] if root is not None else dirs
+        if inner:
+            return "/".join(parts[:-1]), inner[-1], False
+        stem = os.path.splitext(parts[-1])[0] if parts else ""
+        return clean or stem, stem, True
+
+    @staticmethod
+    def _book_artist(group):
+        generic = {"audiobook", "audiobooks", "book", "books", "music", "podcasts"}
+        for _index, entry in group["entries"]:
+            name = (entry.get("albumartist") or entry.get("artist") or "").strip()
+            if name and name.casefold() not in generic:
+                return name
+        return ""
+
+    def _book_groups(self):
+        """The device's audiobooks, one group per book folder, in title order."""
+        groups = {}
+        focus = self._album_focus[1] if self._album_focus else None
+        for index, entry in enumerate(self.music):
+            if entry.get("kind", "music") != "audiobook":
+                continue
+            if focus is not None and entry["rel"] not in focus:
+                continue
+            key, title, loose = self._book_identity(entry["rel"])
+            group = groups.setdefault(key, {"key": key, "title": title, "loose": loose,
+                                            "entries": []})
+            group["entries"].append((index, entry))
+        for group in groups.values():
+            group["entries"].sort(
+                key=lambda pair: natural_sort_key(os.path.basename(pair[1]["rel"])))
+            group["artist"] = self._book_artist(group)
+        return [groups[key] for key in sorted(groups,
+                                              key=lambda k: natural_sort_key(groups[k]["title"]))]
+
+    def _book_matches(self, group):
+        """Does this book match the search? A book is kept whole when one file matches."""
+        if not self._query_text:
+            return True
+        if any(self._query(entry) for _index, entry in group["entries"]):
+            return True
+        text = self._query_text.strip().casefold()
+        if ":" in text or text.startswith("-"):
+            return False
+        details = self._book_cache.get(group["key"])
+        author = details[0] if details else group["artist"]
+        haystack = " ".join([group["title"], author] +
+                            [os.path.basename(entry["rel"])
+                             for _index, entry in group["entries"]])
+        return text in haystack.casefold()
+
+    def _book_sort_key(self, group, column):
+        details = self._book_cache.get(group["key"])
+        if column == 2:
+            return natural_sort_key((details[0] if details else group["artist"]) or "")
+        if column == 3:
+            return (details[1] if details else len(group["entries"])) or 0
+        if column == 4:
+            return (details[2] if details else
+                    sum(float(entry.get("length") or 0)
+                        for _index, entry in group["entries"]))
+        return natural_sort_key(group["title"])
+
+    def _book_icon(self, key):
+        if key in self._book_icons:
+            return self._book_icons[key]
+        details = self._book_cache.get(key)
+        if not details or len(details) < 5 or not details[4]:
+            return None
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(details[4]):
+            self._book_icons[key] = None
+            return None
+        pixmap = pixmap.scaled(52, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        icon = QIcon(pixmap)
+        self._book_icons[key] = icon
+        return icon
+
+    def _fill_book_children(self, item, group, details=None):
+        item.takeChildren()
+        lengths = list(details[3]) if details and len(details) > 3 else []
+        indexes = [index for index, _entry in group["entries"]]
+        for number, (index, entry) in enumerate(group["entries"]):
+            length = (lengths[number] if number < len(lengths)
+                      else entry.get("length") or 0)
+            child = QTreeWidgetItem(item, [
+                "", os.path.basename(entry["rel"]), "", "",
+                fmt_time(length) if length else ""])
+            child.setData(0, INDEX_ROLE, index)
+            child.setData(0, GROUP_ROLE, indexes)
+            child.setToolTip(0, entry["rel"])
+
+    def _populate_book_item(self, item, group):
+        key = group["key"]
+        details = self._book_cache.get(key)
+        title = group["title"]
+        if details and len(details) > 5 and details[5] and group["loose"]:
+            title = details[5]
+        artist = details[0] if details else group["artist"]
+        chapters = (details[1] if details else len(group["entries"])) or len(group["entries"])
+        if details:
+            total = details[2]
+        else:
+            total = sum(float(entry.get("length") or 0)
+                        for _index, entry in group["entries"])
+        item.setText(0, "")
+        item.setText(1, title)
+        item.setText(2, artist or "")
+        item.setText(3, str(chapters))
+        item.setText(4, fmt_time(total) if total else "")
+        item.setSizeHint(0, QSize(64, 60))
+        item.setData(0, GROUP_ROLE,
+                     [index for index, _entry in group["entries"]])
+        item.setData(0, COVER_ROLE, key)
+        icon = self._book_icon(key)
+        if icon is not None:
+            item.setIcon(0, icon)
+        item.setToolTip(0, f"{title}" + (f" — {artist}" if artist else "") +
+                        f"\n{chapters} chapter" + ("s" if chapters != 1 else "") +
+                        "\nDouble-click to play or queue the book")
+        self._fill_book_children(item, group, details)
+        self._book_items[key] = item
+        self._book_groups_by_key[key] = group
+
+    def _fill_books(self):
+        """Draw the device's books the way the Audiobooks tab draws them."""
+        self.books.clear()
+        self._book_items = {}
+        self._book_groups_by_key = {}
+        every = self._book_groups()
+        shown = [group for group in every if self._book_matches(group)]
+        if self._book_sort_column is not None:
+            shown.sort(key=lambda group: self._book_sort_key(group, self._book_sort_column),
+                       reverse=self._book_sort_desc)
+        for group in shown:
+            item = QTreeWidgetItem(self.books)
+            self._populate_book_item(item, group)
+        self._maybe_load_books(every)
+        return shown, every
+
+    def _update_book_summary(self, shown, every):
+        if not shown:
+            if self._query_text:
+                self.summary.setText("No audiobooks match the search")
+            else:
+                self.summary.setText("No audiobooks in this folder" if self.backend else "")
+            return
+        chapters = sum(len(group["entries"]) for group in shown)
+        size = sum(entry["size"] for group in shown
+                   for _index, entry in group["entries"])
+        parts = [f"{len(shown)} title" + ("s" if len(shown) != 1 else ""),
+                 f"{chapters} chapter" + ("s" if chapters != 1 else ""),
+                 fmt_human_size(size)]
+        if len(shown) != len(every):
+            parts.append(f"{len(every)} on the device")
+        self.summary.setText("  ·  ".join(parts))
+
+    def _book_ready(self, key, details, generation):
+        """One book's tags arrived from the worker: fill its row in place."""
+        if generation != self._book_generation:
+            return
+        self._book_loading.discard(key)
+        if details is None:
+            return
+        self._book_cache[key] = details
+        self._book_icons.pop(key, None)
+        item = self._book_items.get(key)
+        group = self._book_groups_by_key.get(key)
+        if item is not None and group is not None and self.category == "audiobook":
+            self._populate_book_item(item, group)
+        if self.category == "audiobook" and (
+                (self._query_text and item is None) or
+                self._book_sort_column in (2, 3, 4)):
+            # An author may be what the search is waiting for, and a sort by author,
+            # chapters or length has to move the row now that its details are here.
+            self._fill_views()
+
+    def _stop_book_loader(self, wait_ms=0):
+        loader, self._book_loader = self._book_loader, None
+        if loader is not None:
+            loader.cancel()
+            if wait_ms:
+                loader.wait(wait_ms)
+        self._book_loading = set()
+
+    def _maybe_load_books(self, groups):
+        """Read the visible books' tags off the GUI thread, once each."""
+        if self.category != "audiobook" or self.backend is None:
+            return
+        if self._busy_reason():
+            return
+        loader = self._book_loader
+        try:
+            if loader is not None and loader.isRunning():
+                return
+        except RuntimeError:
+            self._book_loader = None
+        jobs = []
+        for group in groups:
+            key = group["key"]
+            if key in self._book_cache or key in self._book_loading:
+                continue
+            paths = []
+            for _index, entry in group["entries"]:
+                try:
+                    path = self.backend.local(entry.get("dev") or entry["rel"])
+                except (OSError, ValueError):
+                    path = ""
+                if path:
+                    paths.append(path)
+            if not paths:
+                continue
+            jobs.append((key, paths, group["title"] if group["loose"] else "",
+                         self._book_generation))
+            self._book_loading.add(key)
+        if not jobs:
+            return
+        loader = DeviceBookReader(jobs, self)
+        loader.details.connect(self._book_ready)
+        self._book_loader = loader
+        loader.start()
+
+    def _forget_books(self):
+        self.books.clear()
+        self._book_items = {}
+        self._book_groups_by_key = {}
+        self._stop_book_loader()
+
+    def _invalidate_books(self):
+        self._book_generation += 1
+        self._book_cache.clear()
+        self._book_icons.clear()
+        self._book_loading = set()
+        self._book_signature = None
+        self._stop_book_loader()
+
+    def _book_double(self, item, _column=0):
+        if item is None:
+            return
+        index = item.data(0, INDEX_ROLE)
+        if index is not None:
+            indexes = [index]
+        else:
+            indexes = list(item.data(0, GROUP_ROLE) or [])
+        if not indexes:
+            return
+        if self.config.get("lib_double_click") == "play":
+            self.play_indexes(indexes)
+        else:
+            self.queue_indexes(indexes)
+
+    def _book_menu_indexes(self, item):
+        if item is None:
+            return []
+        selected = self.books.selectedItems()
+        rows = selected if item in selected and len(selected) > 1 else [item]
+        indexes = []
+        for row in rows:
+            index = row.data(0, INDEX_ROLE)
+            indexes.extend([index] if index is not None
+                           else list(row.data(0, GROUP_ROLE) or []))
+        return sorted(set(indexes))
+
+    def book_menu_actions(self, indexes, label=""):
+        count = f"{len(indexes)} chapter" + ("s" if len(indexes) != 1 else "")
+        name = label or count
+        return [(f"Play {name}", lambda: self.play_indexes(indexes)),
+                (f"Add {name} to queue", lambda: self.queue_indexes(indexes)),
+                (f"Copy {name} to library",
+                 lambda: self.copy_to_library_indexes(indexes)),
+                (None, None),
+                ("Select device folder…", self.pick_dir),
+                ("Refresh", self.reload)]
+
+    def _book_menu(self, pos):
+        item = self.books.itemAt(pos)
+        if item is None:
+            self._show_menu(self.empty_menu_actions(), self.books, pos)
+            return
+        indexes = self._book_menu_indexes(item)
+        label = item.text(1) if item.data(0, INDEX_ROLE) is None else ""
+        self._show_menu(self.book_menu_actions(indexes, label), self.books, pos)
+
+    def _sort_books(self, column):
+        if column not in (1, 2, 3, 4):
+            return
+        if self._book_sort_column == column:
+            self._book_sort_desc = not self._book_sort_desc
+        else:
+            self._book_sort_column = column
+            self._book_sort_desc = False
+        self.books.header().setSortIndicator(
+            column, Qt.DescendingOrder if self._book_sort_desc else Qt.AscendingOrder)
+        self.books.header().setSortIndicatorShown(True)
+        if self.category == "audiobook":
+            self._fill_views()
+
+    def _fill_views(self):
+        if self.backend is not None and self._busy_reason():
+            return
+        self._sync_view_controls()
+        if self.category == "audiobook":
+            shown, every = self._fill_books()
+            self._update_hint(len(shown))
+            self._update_book_summary(shown, every)
+            self._show_current_view()
+            return
+        shown = self._visible()
+        self._fill_list(shown)
+        self._fill_covers(shown)
+        albums = {(e["albumartist"] or e["artist"], e["album"]) for _i, e in shown
+                  if e["album"]}
+        size = sum(e["size"] for _i, e in shown)
+        self._update_hint(len(shown))
+        if not shown:
+            if self._album_focus is not None:
+                self.summary.setText("No tracks left in this album")
+            else:
+                label = dict(DEVICE_CATEGORY_LABELS).get(self.category, "music")
+                self.summary.setText(f"No {label.lower()} in this folder"
+                                     if self.backend else "")
+            self._show_current_view()
+            return
+        parts = [f"{len(shown)} track" + ("s" if len(shown) != 1 else ""),
+                 f"{len(albums)} album" + ("s" if len(albums) != 1 else ""),
+                 fmt_human_size(size)]
+        if len(shown) != len(self.music):
+            parts.append(f"{len(self.music)} on the device")
+        self.summary.setText("  ·  ".join(parts))
+        self._show_current_view()
+
+    def _fill_list(self, shown=None):
+        self.tree.clear()
+        artists = {}
+        for index, entry in (self._visible() if shown is None else shown):
+            artist = entry["albumartist"] or entry["artist"] or "Unknown artist"
+            artists.setdefault(artist, {}).setdefault(entry["album"] or "Unknown album",
+                                                      []).append((index, entry))
+        for artist in sorted(artists, key=str.lower):
+            albums = artists[artist]
+            every = [entry for tracks in albums.values() for _i, entry in tracks]
+            artist_item = QTreeWidgetItem(self.tree, [
+                artist, fmt_human_size(sum(e["size"] for e in every))])
+            artist_item.setData(0, GROUP_ROLE,
+                                [i for tracks in albums.values() for i, _e in tracks])
+            font = QFont(artist_item.font(0))
+            font.setBold(True)
+            artist_item.setFont(0, font)
+            for album in sorted(albums, key=str.lower):
+                tracks = albums[album]
+                album_item = QTreeWidgetItem(artist_item, [
+                    album, fmt_human_size(sum(e["size"] for _i, e in tracks))])
+                album_item.setData(0, GROUP_ROLE, [i for i, _e in tracks])
+                for index, entry in tracks:
+                    label = (f"{entry['track']:02d}. {entry['title']}" if entry["track"]
+                             else entry["title"])
+                    item = QTreeWidgetItem(album_item, [
+                        label, fmt_human_size(entry["size"])])
+                    item.setData(0, INDEX_ROLE, index)
+                    if entry.get("library") is None:
+                        item.setForeground(0, QBrush(QColor(MUTED)))
+        if self._album_focus is not None or self._query_text:
+            # an opened album or search result shows its tracks at once
+            self.tree.expandAll()
+        elif self.config.get("dev_fold") in DEV_FOLD_MODES:
+            # the tree comes back the way it was left, next launch included
+            self._apply_fold(self.config["dev_fold"])
+        else:
+            self.tree.expandToDepth(1)
+
+    def _placeholder_icon(self):
+        if self._placeholder_cache is None:
+            self._placeholder_cache = QIcon(self._placeholder(120))
+        return self._placeholder_cache
+
+    def _library_cover_index(self):
+        """(album artist, album) -> a PC file in that album, for artwork.
+
+        The sync manifest is the first answer (it says exactly which PC file a device
+        path came from); this is the fallback for a device that was filled by something
+        else, or whose manifest was removed.
+        """
+        if self._cover_index is not None:
+            return self._cover_index
+        index = {}
+        for row in self._library_rows().values():
+            album = (row.get("album") or "").strip().casefold()
+            if not album:
+                continue
+            artist = (row.get("albumartist") or row.get("artist") or "").strip().casefold()
+            index.setdefault((artist, album), row.get("path") or "")
+        self._cover_index = index
+        return index
+
+    @staticmethod
+    def _cover_key(path, album):
+        folder = os.path.dirname(path) if path else ""
+        return folder or ("rel:" + (album or ""))
+
+    def _cover_ready(self, key, data):
+        """One album's art arrived: cache it and redraw the tiles that use it."""
+        if key in self._cover_cache:
+            return
+        icon = None
+        pm = QPixmap()
+        if data and pm.loadFromData(data):
+            pm = pm.scaled(120, 120, Qt.KeepAspectRatioByExpanding,
+                           Qt.SmoothTransformation)
+            x = max(0, (pm.width() - 120) // 2)
+            y = max(0, (pm.height() - 120) // 2)
+            icon = QIcon(pm.copy(x, y, 120, 120))
+        self._cover_cache[key] = icon
+        shown = icon or self._placeholder_icon()
+        for i in range(self.covers.count()):
+            item = self.covers.item(i)
+            if item.data(COVER_ROLE) == key:
+                item.setIcon(shown)
+
+    def _stop_cover_loader(self, wait_ms=0):
+        loader, self._cover_loader = self._cover_loader, None
+        if loader is not None:
+            loader.cancel()
+            if wait_ms:
+                loader.wait(wait_ms)
+
+    def _maybe_load_covers(self):
+        """Read the covers the covers view is showing, on a worker, a few at a time."""
+        if self.covers_btn is None or not self.covers_btn.isChecked():
+            return
+        if self.backend is not None and self._busy_reason():
+            return
+        jobs = [(key, path) for key, path in self._cover_jobs.items()
+                if key not in self._cover_cache]
+        if not jobs:
+            return
+        self._stop_cover_loader()
+        loader = CoverReader(jobs, self)
+        loader.cover.connect(self._cover_ready)
+        self._cover_loader = loader
+        loader.start()
+
+    def _placeholder(self, size):
+        pm = QPixmap(size, size)
+        pm.fill(QColor(PANEL_ALT))
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(MUTED)))
+        painter.drawEllipse(QRectF(size * 0.62, size * 0.44, size * 0.11, size * 0.11))
+        painter.drawEllipse(QRectF(size * 0.30, size * 0.56, size * 0.11, size * 0.11))
+        pen = QPen(QColor(MUTED))
+        pen.setWidth(3)
+        painter.setPen(pen)
+        painter.drawLine(int(size * 0.68), int(size * 0.48), int(size * 0.68), int(size * 0.26))
+        painter.drawLine(int(size * 0.36), int(size * 0.60), int(size * 0.36), int(size * 0.34))
+        painter.drawLine(int(size * 0.36), int(size * 0.34), int(size * 0.68), int(size * 0.26))
+        painter.end()
+        return pm
+
+    def _fill_covers(self, shown=None):
+        self.covers.blockSignals(True)
+        try:
+            self.covers.clear()
+            self._cover_jobs = {}
+            library = None
+            albums = {}
+            for index, entry in (self._visible() if shown is None else shown):
+                key = (entry["albumartist"] or entry["artist"], entry["album"])
+                albums.setdefault(key, []).append((index, entry))
+            for (artist, album) in sorted(albums, key=lambda k: (k[0].lower(), k[1].lower())):
+                tracks = albums[(artist, album)]
+                label = (album or os.path.basename(os.path.dirname(tracks[0][1]["rel"]))
+                         or "Music")
+                lines = [label] + ([artist] if artist else [])
+                lines.append(f"{len(tracks)} track" + ("s" if len(tracks) != 1 else ""))
+                first = tracks[0][1]
+                path = (first.get("library") or {}).get("path") or ""
+                if not path:
+                    if library is None:
+                        library = self._library_cover_index()
+                    match = ((first["albumartist"] or first["artist"] or "").strip().casefold(),
+                             (first["album"] or "").strip().casefold())
+                    path = library.get(match, "")
+                if not path and self.backend is not None:
+                    # A book that was synced, or copied to the device by another app, is
+                    # not in the music library index. Its own file (or the cover.jpg in
+                    # its device folder) is the artwork source that actually exists.
+                    dev_path = first.get("dev") or first.get("rel") or ""
+                    if dev_path:
+                        try:
+                            candidate = self.backend.local(dev_path)
+                        except (OSError, ValueError):
+                            candidate = ""
+                        if candidate and os.path.isfile(candidate):
+                            path = candidate
+                cover_key = self._cover_key(path, album)
+                if cover_key in self._cover_cache:
+                    icon = self._cover_cache[cover_key] or self._placeholder_icon()
+                else:
+                    icon = self._placeholder_icon()
+                    if path:
+                        self._cover_jobs.setdefault(cover_key, path)
+                item = QListWidgetItem(icon, "\n".join(lines))
+                item.setTextAlignment(Qt.AlignHCenter)
+                item.setSizeHint(QSize(168, 252))
+                item.setData(GROUP_ROLE, [i for i, _e in tracks])
+                item.setData(COVER_ROLE, cover_key)
+                item.setToolTip(f"{label}" + (f" — {artist}" if artist else "") +
+                                f"\nClick to open the album"
+                                f"\nDouble-click to queue {len(tracks)} track(s)")
+                self.covers.addItem(item)
+        finally:
+            self.covers.blockSignals(False)
+        self._maybe_load_covers()
+
+    # ---------- playing from the device ----------
+    def _paths(self, indexes):
+        """The device paths behind these rows, with the folder prefix a fetch needs."""
+        out = []
+        for i in indexes:
+            if 0 <= i < len(self.music):
+                entry = self.music[i]
+                out.append(entry.get("dev") or entry["rel"])
+        return out
+
+    def play_indexes(self, indexes):
+        paths = self._paths(indexes)
+        if paths:
+            self.play_paths(paths)
+
+    def queue_indexes(self, indexes):
+        paths = self._paths(indexes)
+        if paths:
+            self.play_paths(paths, queue=True)
+
+    def play_all(self):
+        """Play everything the views show: the search results, or the opened album."""
+        self.play_indexes([i for i, _e in self._visible()])
+
+    def queue_all(self):
+        self.queue_indexes([i for i, _e in self._visible()])
+
+    def play_paths(self, paths, queue=False):
+        """Play the device files, or put them in the queue, as files on the device.
+
+        The queue entry is the path on the device, so the Source column says MTP / iPod /
+        USB and playback can use the device buffer. Queueing never plays by itself, and a
+        file this app synced from the library keeps the library's tags without becoming a
+        PC queue entry.
+        """
+        if not paths or not self.backend:
+            return
+        if self._busy_reason():
+            return
+        b = self.backend
+        device = b.device
+        by_rel = {(e.get("dev") or e["rel"]): e for e in self.music}
+        local = []
+        for rel in paths:
+            path = b.local(rel)
+            row = by_rel.get(rel) or {}
+            library = row.get("library") or {}
+            meta = {
+                "title": row.get("title") or os.path.splitext(os.path.basename(rel))[0],
+                "artist": row.get("artist") or "",
+                "album": row.get("album") or "",
+                "albumartist": row.get("albumartist") or "",
+                "tracknumber": row.get("track") or 0,
+                "length": row.get("length") or 0,
+                "filetype": filetype(path),
+                "size": row.get("size") or 0,
+                "sample_rate": library.get("sample_rate") or 0,
+                "bits_per_sample": library.get("bits_per_sample") or 0,
+                "bitrate": library.get("bitrate") or 0,
+                "cover_path": library.get("path") or "",
+            }
+            if not library and device.kind != "mtp":
+                # A USB drive is quick enough to read the tags now, so a file the library
+                # does not hold still gets a real length and format. On MTP only the
+                # header reads are skipped; the manifest's library tags cover synced music.
+                try:
+                    tags = queue_meta(path)
+                except Exception:
+                    tags = {}
+                for key in ("title", "artist", "album", "albumartist", "tracknumber",
+                            "length", "sample_rate", "bits_per_sample", "bitrate",
+                            "filetype"):
+                    if tags.get(key):
+                        meta[key] = tags[key]
+            register_device_entry(path, device, rel, meta)
+            remember_device_queue_row(path)
+            local.append(path)
+        if not local:
+            return
+        save_queue_meta()
+        if queue:
+            self.player.add_paths(local, play_if_idle=False)
+            self.player.refresh_buffers()
+            notice = getattr(self.window(), "notify", None)
+            if notice:
+                notice(f"Added {len(local)} track(s) from the device "
+                       f"({device_source_label(device)}) to the queue")
+        else:
+            self.player.play_list(local)
+
+    # ---------- copying the device's music into the library ----------
+    def copy_to_library_indexes(self, indexes):
+        paths = self._paths(indexes)
+        if paths:
+            self.copy_to_library(paths)
+
+    def _library_target(self, folders):
+        """Where copies land: the sync profile's source folder, or the first one.
+
+        A profile that syncs this device was pointed at a folder in the library, so that
+        is where the music it put on the device belongs. Otherwise the first music folder
+        is used.
+        """
+        device = self.backend.device.id if self.backend else ""
+        try:
+            profiles = load_profiles()
+        except Exception:
+            profiles = []
+        for profile in profiles:
+            roots = profile_sources(profile)
+            if profile.device_id == device and roots and os.path.isdir(roots[0]):
+                return roots[0]
+        return folders[0]
+
+    @staticmethod
+    def _under(path, folders):
+        path = os.path.abspath(path)
+        for folder in folders:
+            try:
+                if os.path.commonpath([path, os.path.abspath(folder)]) == os.path.abspath(folder):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def copy_to_library(self, paths):
+        """Copy device files into the library, names and folders untouched.
+
+        The folder the device is showing is dropped, so ``Music/Aphex Twin/…/01 - Xtal``
+        arrives as ``Aphex Twin/…/01 - Xtal`` inside the library folder — a synced copy
+        lands where it came from. A track the library already holds is left alone, and a
+        different file already using the name is kept: the copy becomes ``name (2)``.
+        """
+        if not self.backend or not paths:
+            return
+        folders = [f for f in (self.config.get("library_folders") or []) if os.path.isdir(f)]
+        if not folders:
+            QMessageBox.information(
+                self, "Copy to library",
+                "The library has no music folder yet.\n\n"
+                "Add one in the Library tab (Music > Add music folder…) and copy again.")
+            return
+        b = self.backend
+        dest_root = self._library_target(folders)
+        root = self.device_dir()
+        prefix = (root + "/") if root else ""
+        held = {dev: src for dev, src in self._library_map().items()
+                if self._under(src, folders)}
+
+        def job(prog, _log, cancel):
+            self.wait_for_scan(cancel=cancel)
+            copied, held_back, named, failed = [], 0, 0, 0
+            for i, rel in enumerate(paths):
+                if cancel():
+                    break
+                prog(i, len(paths), f"Copying {os.path.basename(rel)}")
+                if held.get(rel):
+                    held_back += 1        # the library already holds this track
+                    continue
+                sub = rel[len(prefix):] if prefix and rel.startswith(prefix) else rel
+                dst = os.path.join(dest_root, sub.replace("/", os.sep))
+                try:
+                    if os.path.isfile(dst):
+                        if os.path.getsize(dst) == os.path.getsize(b.local(rel)):
+                            held_back += 1    # the same file is already in the library
+                            continue
+                        base, ext = os.path.splitext(dst)
+                        n = 2
+                        while os.path.exists(f"{base} ({n}){ext}"):
+                            n += 1
+                        dst = f"{base} ({n}){ext}"
+                        named += 1
+                    folder = os.path.dirname(dst)
+                    if folder:
+                        os.makedirs(folder, exist_ok=True)
+                    b.copy_out(rel, dst)
+                    copied.append(dst)
+                except OSError:
+                    failed += 1
+            return copied, held_back, named, failed
+
+        def done(result):
+            copied, held_back, named, failed = result
+            self._rescan_copies(copied)
+            bits = [f"Copied {len(copied)} track(s) into the library"]
+            if held_back:
+                bits.append(f"{held_back} already in the library")
+            if named:
+                bits.append(f"{named} kept the file already there, numbered")
+            if failed:
+                bits.append(f"{failed} could not be copied")
+            text = " · ".join(bits)
+            notice = getattr(self.window(), "notify", None)
+            if notice:
+                notice(text)
+            else:
+                QMessageBox.information(self, "Copy to library", text)
+
+        self._run(job, done, reason=f"Copying files from "
+                                     f"{self._device_label(self.backend.device.id)}\u2026")
+
+    def _rescan_copies(self, paths):
+        """Show the copies in the library at once, without a full rescan."""
+        if not paths:
+            return
+        self._cover_index = None
+        library_tab = getattr(self.window(), "library_tab", None)
+        if library_tab is not None and hasattr(library_tab, "rescan_paths"):
+            library_tab.rescan_paths(paths)
+            return
+        for path in paths:
+            if self.library is not None:
+                try:
+                    self.library.update_track(path)
+                except (OSError, ValueError):
+                    continue
+
+    def _double_indexes(self, item):
+        """What a double-click on a list row means: the row's tracks.
+
+        A track stands for its album from that track on — the album's order is the order
+        it plays or queues in, not the whole device at once.
+        """
+        index = item.data(0, INDEX_ROLE)
+        if index is not None:
+            parent = item.parent()
+            group = list((parent.data(0, GROUP_ROLE) if parent is not None else None)
+                         or [index])
+            return group[group.index(index):] if index in group else [index]
+        return list(item.data(0, GROUP_ROLE) or [])
+
+    def _tree_double(self, item, _column=0):
+        indexes = self._double_indexes(item)
+        if not indexes:
+            return
+        # the same preference the library's tree follows: queue, or play
+        if self.config.get("lib_double_click") == "play":
+            self.play_indexes(indexes)
+        else:
+            self.queue_indexes(indexes)
+
+    def _covers_click(self, item):
+        """A click on a cover opens the album — after the double-click interval, so a
+        double-click (queue it) never also opens it on the way."""
+        if item is None:
+            return
+        self._cover_pending = (list(item.data(GROUP_ROLE) or []),
+                               item.text().split("\n")[0])
+        self._cover_click_timer.start()
+
+    def _open_pending_cover(self):
+        pending, self._cover_pending = self._cover_pending, None
+        if not pending:
+            return
+        self.open_device_album(pending[0], pending[1])
+
+    def open_device_album(self, indexes, label=""):
+        """Open one album: its tracks in the list, the covers one click away."""
+        rels = {self.music[i]["rel"] for i in (indexes or [])
+                if 0 <= i < len(self.music)}
+        if not rels:
+            return
+        self._album_focus = (label or "", rels)
+        self.album_title.setText(label or "")
+        self.album_title.setToolTip(label or "")
+        self.album_bar.show()
+        self._fill_views()
+        self.views.setCurrentWidget(self.tree)
+        self.list_btn.setChecked(True)
+        self.covers_btn.setChecked(False)
+
+    def close_album(self):
+        """Leave an opened album and go back to the covers."""
+        if self._album_focus is None:
+            return
+        self._album_focus = None
+        self.album_bar.hide()
+        self._fill_views()
+        covers = self.config.get("devices_music_view") == "covers"
+        self.views.setCurrentWidget(self.covers if covers else self.tree)
+        self.list_btn.setChecked(not covers)
+        self.covers_btn.setChecked(covers)
+
+    def _cover_double(self, item):
+        # a double-click means "queue it": cancel the album open the first click armed
+        self._cover_click_timer.stop()
+        self._cover_pending = None
+        group = list(item.data(GROUP_ROLE) or [])
+        if self.config.get("lib_double_click") == "play":
+            self.play_indexes(group)
+        else:
+            self.queue_indexes(group)
+
+    def _menu_indexes(self, item):
+        """What a context-menu action applies to: this row, or the whole selection.
+
+        A row means what a double-click on it means — a track carries its album from
+        that track on — so the menu and the double-click never disagree.
+        """
+        if item is None:
+            return []
+        selected = self.tree.selectedItems()
+        rows = selected if item in selected and len(selected) > 1 else [item]
+        indexes = []
+        for row in rows:
+            indexes.extend(self._double_indexes(row))
+        return sorted(set(indexes))
+
+    # The menus are built as (label, slot) pairs, None meaning a separator, so what they
+    # offer can be read without opening one.
+    def row_menu_actions(self, indexes):
+        count = f"{len(indexes)} track" + ("s" if len(indexes) != 1 else "")
+        return [(f"Play {count}", lambda: self.play_indexes(indexes)),
+                (f"Add {count} to queue", lambda: self.queue_indexes(indexes)),
+                (f"Copy {count} to library",
+                 lambda: self.copy_to_library_indexes(indexes)),
+                (None, None),
+                ("Select device folder…", self.pick_dir),
+                ("Refresh", self.reload)]
+
+    def album_menu_actions(self, group, label):
+        return [("Open album", lambda: self.open_device_album(group, label)),
+                ("Play now", lambda: self.play_indexes(group)),
+                ("Add to queue", lambda: self.queue_indexes(group)),
+                ("Copy album to library", lambda: self.copy_to_library_indexes(group)),
+                (None, None),
+                ("Select device folder…", self.pick_dir),
+                ("Refresh", self.reload)]
+
+    def empty_menu_actions(self):
+        return [("Play everything", self.play_all),
+                ("Add everything to queue", self.queue_all),
+                (None, None),
+                ("Select device folder…", self.pick_dir),
+                ("Refresh", self.reload)]
+
+    def _show_menu(self, actions, widget, pos):
+        menu = QMenu(self)
+        for label, slot in actions:
+            if label is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(label, slot)
+        menu.exec(widget.viewport().mapToGlobal(pos))
+
+    def _menu(self, pos):
+        indexes = self._menu_indexes(self.tree.itemAt(pos))
+        actions = self.row_menu_actions(indexes) if indexes else self.empty_menu_actions()
+        self._show_menu(actions, self.tree, pos)
+
+    def _covers_menu(self, pos):
+        item = self.covers.itemAt(pos)
+        if item is None:
+            actions = self.empty_menu_actions()
+        else:
+            group = list(item.data(GROUP_ROLE) or [])
+            actions = self.album_menu_actions(group, item.text().split("\n")[0])
+        self._show_menu(actions, self.covers, pos)
+
+    def _run(self, fn, done_msg=None, refresh=False, reason=""):
+        """Copy to or from the device on a worker, owning the device until it is done.
+
+        A copy is a device task like a sync: the music view is replaced while it runs,
+        so no second read is queued behind it, and the Sync tab can see the claim.
+        """
+        if getattr(self, "_worker", None) and self._worker.isRunning():
+            return
+        if self.backend is None:
+            return
+        if self._busy_reason():
+            QMessageBox.information(
+                self, "Devices",
+                "A sync is using this device. Wait for it to finish before reading "
+                "or writing the device from here.")
+            return
+        reason = reason or f"Copying files on {self._device_label(self.backend.device.id)}\u2026"
+        self._activity_prefix = reason.rstrip("\u2026").rstrip(".").strip()
+        owner = ("copy", id(self), time.monotonic())
+        DEVICE_CLAIMS.claim(self.backend.device.root, owner, reason)
+        self._cancel_scan()
+        self._show_busy_page(reason)
+        self.busy.show()
+        self.busy.setMaximum(100)
+        self.busy.setValue(0)
+        self.activity.emit(f"{self._activity_prefix} 0%")
+        w = Worker(fn, self)
+        w.progress.connect(self._run_progress)
+        w.log.connect(self._run_log)
+        w.done.connect(lambda r: self._run_done(r, owner, refresh, done_msg))
+        w.failed.connect(lambda e: self._run_failed(e, owner))
+        w.start()
+        self._worker = w
+
+    def _run_progress(self, done, total, _message=""):
+        """Show a copy's percentage, in this tab's bar and in the top-right badge."""
+        total = max(int(total), 1)
+        done = min(max(int(done), 0), total)
+        self.busy.setMaximum(total)
+        self.busy.setValue(done)
+        if self._activity_prefix:
+            self.activity.emit(f"{self._activity_prefix} {done * 100 // total}%")
+
+    def _run_log(self, message):
+        """A copy's own status line, such as waiting for the phone's file transfer.
+
+        It goes in the busy page, the status bar and the top-right badge; the next
+        progress report (or the first byte copied) puts the task back in words.
+        """
+        if not message:
+            return
+        self.sync_title.setText(message)
+        self._set_load_status(message)
+        self.activity.emit(message)
+
+    def _run_done(self, result, owner, refresh, done_msg):
+        self.busy.hide()
+        self.busy.setMaximum(1)
+        self.busy.setValue(0)
+        self._activity_prefix = ""
+        self.activity.emit("")
+        DEVICE_CLAIMS.release(owner)
+        if done_msg:
+            done_msg(result)
+        self.busy_changed()
+
+    def _run_failed(self, message, owner):
+        self.busy.hide()
+        self._activity_prefix = ""
+        self.activity.emit("")
+        DEVICE_CLAIMS.release(owner)
+        self.busy_changed()
+        QMessageBox.warning(self, "Device error", message)
+
+    # ---------- theme ----------
+    def refresh_theme(self):
+        """Redraw the drawn cover placeholder in the palette that is active now."""
+        self._cover_cache.clear()
+        self._book_icons.clear()
+        self._placeholder_cache = None
+        self._stop_cover_loader()
+        self._stop_book_loader()
+        self._fill_views()
+
+    def shutdown(self):
+        """The window is closing: stop reading the device and the covers."""
+        self._cancel_scan()
+        self._stop_cover_loader(wait_ms=1500)
+        self._stop_book_loader(wait_ms=1500)
+
+    # ---------- writing to the device ----------
+    def upload(self, local_paths, dest_dir=None, codec="", mode=None, quality=None):
+        """Copy files to this device, into dest_dir when given and the folder it shows otherwise.
+
+        Each item is (local path, path on the device); a nested path keeps its folders.
+        codec (a TRANSCODE_CODECS key) re-encodes each file on the way, at the mode and
+        quality chosen from TRANSCODE_BITRATES; "" copies the files as they are.
+        """
+        if not self.backend:
+            QMessageBox.information(self, "Devices", "No device selected.")
+            return
+        dest = self.device_dir() if dest_dir is None else (dest_dir or "").strip("/")
+        b = self.backend
+
+        label = self._device_label(b.device.id)
+
+        def job(prog, _log, cancel):
+            self.wait_for_scan(cancel=cancel)
+            target = dest
+            if b.device.kind == "mtp":
+                # A phone in charging mode leaves a mount nothing can be written to:
+                # wait for the storage instead of failing with a permission error.
+                target = wait_for_mtp_target(b, dest, cancel, _log, label)
+                _log(f"Copying files to {label}\u2026")
+            tmp = tempfile.mkdtemp(prefix="nebula-transcode-", dir=TMP_DIR) if codec else None
+            # one unit per percent of each file, so a single large track still moves
+            units = max(len(local_paths) * 100, 1)
+            try:
+                for i, (src, rel) in enumerate(local_paths):
+                    if cancel():
+                        break
+                    prog(i * 100, units, rel)
+                    name = device_rel(rel)
+                    if codec:
+                        name = _transcoded_rel(name, codec)
+                        send = transcode_for_device(src, codec, tmp, mode, quality)
+                    else:
+                        send = src
+                    try:
+                        b.copy_in(send, f"{target}/{name}" if target else name,
+                                  progress=lambda frac, i=i: prog(
+                                      min(i * 100 + int(frac * 100), units), units, rel))
+                    finally:
+                        if send != src and os.path.exists(send):
+                            os.remove(send)
+                if not cancel():
+                    prog(units, units, "")
+            finally:
+                if tmp:
+                    shutil.rmtree(tmp, ignore_errors=True)
+
+        self._run(job, refresh=True, reason=f"Copying files to "
+                                          f"{self._device_label(self.backend.device.id)}\u2026")
+
+
+
+# ======================================================================
+# ui/sync_tab.py
+# ======================================================================
+COLORS = {"new": "#6cc070", "restore": "#6cc070", "changed": AMBER,
+          "delete": "#e05a4f", "equal": "#8a8478"}
+STATUS_GREEN = "#6cc070"
+
+
+def sync_glyph(size=15, color="#ffffff"):
+    """Two circular arrows in one colour, drawn rather than shipped as an image."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(1.5)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    box = QRectF(2.0, 2.0, size - 4.0, size - 4.0)
+    painter.drawArc(box, 30 * 16, 120 * 16)
+    painter.drawArc(box, 210 * 16, 120 * 16)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(color))
+    cx = cy = size / 2.0
+    radius = (size - 4.0) / 2.0
+    head = size * 0.20
+    for angle, direction in ((150, 1), (-30, -1)):
+        x = cx + radius * math.cos(math.radians(angle))
+        y = cy - radius * math.sin(math.radians(angle))
+        painter.drawPolygon(QPolygonF([
+            QPointF(x, y - head), QPointF(x, y + head),
+            QPointF(x + direction * head * 1.5, y)]))
+    painter.end()
+    return pm
+
+
+def tinted_icon(path, color, size=20):
+    """A one-colour glyph from a black-on-transparent PNG, in the theme's text colour."""
+    pm = QPixmap(path)
+    if pm.isNull():
+        return QIcon()
+    pm = pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                   Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(pm.size())
+    out.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(out)
+    painter.drawPixmap(0, 0, pm)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(out.rect(), QColor(color))
+    painter.end()
+    return QIcon(out)
+
+
+class SyncLogDialog(QDialog):
+    """A profile's last compares, syncs and verifications, newest first."""
+
+    KINDS = {"sync": "Sync", "compare": "Compare", "verify": "Verify content"}
+    LABELS = {"new": "new", "restore": "restore", "changed": "update", "delete": "delete"}
+
+    def __init__(self, profile, keep=10, parent=None):
+        super().__init__(parent)
+        self.profile = profile
+        self.keep = keep
+        self.setWindowTitle(f"Sync log — {profile.name}")
+        self.resize(780, 580)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.body = QWidget()
+        self.body_lay = QVBoxLayout(self.body)
+        self.body_lay.setContentsMargins(0, 0, 0, 0)
+        self.body_lay.setSpacing(12)
+        self.scroll.setWidget(self.body)
+        lay.addWidget(self.scroll, 1)
+        buttons = QHBoxLayout()
+        self.count = QLabel("")
+        self.count.setObjectName("Muted")
+        clear = QPushButton("Clear log")
+        clear.clicked.connect(self._clear)
+        close = QPushButton("Close")
+        close.setObjectName("Primary")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(self.count, 1)
+        buttons.addWidget(clear)
+        buttons.addWidget(close)
+        lay.addLayout(buttons)
+        self._fill()
+
+    def _entries(self):
+        entries = load_sync_log().get(self.profile.id)
+        return entries if isinstance(entries, list) else []
+
+    def _fill(self):
+        while self.body_lay.count():
+            item = self.body_lay.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        entries = list(reversed(self._entries()))
+        self.count.setText(f"{len(entries)} of the last {self.keep} run(s) kept · newest first")
+        if not entries:
+            empty = QLabel("No compare, sync or verification has run for this profile yet.")
+            empty.setObjectName("Muted")
+            self.body_lay.addWidget(empty)
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            if index:
+                line = QFrame()
+                line.setFrameShape(QFrame.Shape.HLine)
+                self.body_lay.addWidget(line)
+            when = html.escape(str(entry.get("time") or ""))
+            kind = self.KINDS.get(entry.get("kind"), "Compare")
+            title = QLabel(f"<b>{when}</b> · {kind}")
+            self.body_lay.addWidget(title)
+            detail = str(entry.get("summary") or "")
+            if entry.get("errors"):
+                detail += f" · {entry['errors']} error(s)"
+            method = entry.get("method")
+            if method:
+                detail += (" · read byte for byte" if method == "bytes"
+                           else (" · content verified" if entry.get("verified")
+                                 else " · fast hash, cached"))
+            if detail:
+                sub = QLabel(detail)
+                sub.setObjectName("Muted")
+                sub.setWordWrap(True)
+                self.body_lay.addWidget(sub)
+            files = entry.get("files") or []
+            lines = []
+            for row in files[:200]:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                what, rel = row[0], row[1]
+                size = row[2] if len(row) > 2 else 0
+                color = COLORS.get(what, MUTED)
+                label = self.LABELS.get(what, str(what))
+                lines.append(f'<span style="color:{color}">{html.escape(label)}</span> · '
+                             f'{html.escape(str(rel))}'
+                             f' <span style="color:{MUTED}">'
+                             f'{int(size) / 1048576:.1f} MB</span>')
+            if len(files) > 200:
+                lines.append(f'<span style="color:{MUTED}">… and {len(files) - 200} more</span>')
+            if lines:
+                body = QLabel("<br>".join(lines))
+                body.setTextFormat(Qt.TextFormat.RichText)
+                body.setWordWrap(True)
+                body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                self.body_lay.addWidget(body)
+        self.body_lay.addStretch(1)
+
+    def _clear(self):
+        if QMessageBox.question(self, "Clear log",
+                                f"Clear every entry in {self.profile.name}'s sync log?") \
+                != QMessageBox.Yes:
+            return
+        log = load_sync_log()
+        log[self.profile.id] = []
+        save_sync_log(log)
+        self._fill()
+
+
+class SyncActivity(QWidget):
+    """White sync glyph and "Profile 42%" shown beside the tab bar while running."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SyncActivity")
+        # the tab bar's baseline is drawn by the style; cover it so the badge sits
+        # on its own patch instead of being crossed by a line
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 12, 0)
+        lay.setSpacing(6)
+        self.icon = QLabel()
+        self.icon.setPixmap(sync_glyph(15))
+        self.label = QLabel("")
+        lay.addWidget(self.icon)
+        lay.addWidget(self.label)
+        self.hide()
+
+    def set_text(self, text):
+        self.label.setText(text)
+        self.setVisible(bool(text))
+
+
+class SyncSelectionDialog(QDialog):
+    """Choose individual music and audiobooks to sync.
+
+    Music is a real tree: artist, then album, then its tracks. Audiobooks are a book,
+    then its chapters. Checking a group or a book checks everything under it; Select
+    All checks the lot. Each chosen file keeps the relative path it has inside its
+    library/audiobook folder, so it lands on the device in the same artist/album/book
+    layout as a folder sync. Podcasts are paused, so they are not offered here.
+    """
+
+    def __init__(self, config, library=None, selected=None, parent=None, select_all=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose items to sync")
+        self.resize(920, 620)
+        self.config = config
+        self.library = library
+        self._folders = [f for f in config.get("library_folders") or []
+                         if isinstance(f, str)]
+        self._book_folders = [f for f in config.get("audiobook_folders") or []
+                              if isinstance(f, str)]
+        self._chosen = {e.get("path") for e in (selected or [])
+                        if isinstance(e, dict) and e.get("path")}
+        # An empty list is ambiguous: it means "all" for a profile that has not chosen
+        # anything yet, and "none" after Unselect All. The caller tells us which.
+        self._everything = not self._chosen and select_all is not False
+        self._updating = False
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Title", "Artist", "Album"])
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setColumnWidth(0, 380)
+        self.tree.setColumnWidth(1, 220)
+        self.tree.header().setStretchLastSection(True)
+        self.tree.itemChanged.connect(self._item_changed)
+        self._populate()
+
+        self.summary = QLabel("")
+        self.summary.setObjectName("Muted")
+        all_btn = QPushButton("Select All")
+        none_btn = QPushButton("Unselect All")
+        cancel = QPushButton("Cancel")
+        ok = QPushButton("Sync Selected")
+        ok.setObjectName("Primary")
+        all_btn.clicked.connect(self._select_all)
+        none_btn.clicked.connect(self._select_none)
+        cancel.clicked.connect(self.reject)
+        ok.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addWidget(self.summary, 1)
+        row.addWidget(all_btn)
+        row.addWidget(none_btn)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.addWidget(QLabel("Choose what should be copied to the device. Folder sync "
+                                "is on the previous screen."))
+        layout.addWidget(self.tree, 1)
+        layout.addLayout(row)
+        self._update_summary()
+
+    @staticmethod
+    def _under(path, root):
+        try:
+            path, root = os.path.abspath(path), os.path.abspath(root)
+            return os.path.commonpath([path, root]) == root
+        except ValueError:
+            return False
+
+    def _group(self, label):
+        item = QTreeWidgetItem(self.tree, [label, "", ""])
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.Checked)
+        item.setExpanded(False)
+        return item
+
+    def _branch(self, parent, label):
+        """An artist or album row: checkable, but with no entry of its own."""
+        item = QTreeWidgetItem(parent, [label, "", ""])
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.Checked)
+        item.setExpanded(False)
+        return item
+
+    @staticmethod
+    def _number(value):
+        try:
+            return int(str(value).split("/")[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def _add_item(self, parent, entry, title, artist, album):
+        item = QTreeWidgetItem(parent, [title, artist, album])
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setData(0, Qt.UserRole, entry)
+        checked = self._everything or entry["path"] in self._chosen
+        item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+        return item
+
+    def _populate(self):
+        self._updating = True
+        groups = {"music": self._group("Music"),
+                  "audiobooks": self._group("Audiobooks")}
+        book_roots = [os.path.abspath(f) for f in self._book_folders]
+        rows = []
+        if self.library is not None:
+            try:
+                rows = self.library.tracks()
+            except Exception:
+                rows = []
+        counts = {"music": 0, "audiobooks": 0}
+        music = []
+        for row in rows:
+            path = row.get("path") or ""
+            if not path or any(self._under(path, root) for root in book_roots):
+                continue
+            genre = str(row.get("genre") or "").lower()
+            kind = media_kind_for_path(path, {"audiobook_folders": self._book_folders})
+            if "podcast" in genre or kind == "podcast":
+                continue
+            entry = {"path": path, "rel": library_rel(path, self._folders),
+                     "kind": "music"}
+            music.append((row, entry))
+            counts["music"] += 1
+
+        # The catalogue normally arrives artist/album/track sorted, but make the tree
+        # independent of that and keep multi-disc albums in disc-then-track order.
+        music.sort(key=lambda pair: (
+            str(pair[0].get("albumartist") or pair[0].get("artist") or "").casefold(),
+            str(pair[0].get("album") or "").casefold(),
+            self._number(pair[0].get("discnumber")),
+            self._number(pair[0].get("tracknumber")),
+            str(pair[0].get("path") or "").casefold()))
+        artists, albums = {}, {}
+        for row, entry in music:
+            artist_label = str(row.get("albumartist") or row.get("artist") or "").strip() \
+                or "Unknown Artist"
+            album_label = str(row.get("album") or "").strip() or "Unknown Album"
+            artist_key = artist_label.casefold()
+            album_key = (artist_key, album_label.casefold())
+            artist = artists.get(artist_key)
+            if artist is None:
+                artist = self._branch(groups["music"], artist_label)
+                artists[artist_key] = artist
+            album = albums.get(album_key)
+            if album is None:
+                album = self._branch(artist, album_label)
+                albums[album_key] = album
+            self._add_item(album, entry, row.get("title") or os.path.basename(entry["path"]),
+                           row.get("artist") or "", album_label)
+        for title, paths in audiobook_books(self._book_folders):
+            book = QTreeWidgetItem(groups["audiobooks"], [title, "", ""])
+            book.setFlags(book.flags() | Qt.ItemIsUserCheckable)
+            book.setCheckState(0, Qt.Unchecked)
+            for path in paths:
+                entry = {"path": path, "rel": library_rel(path, self._book_folders),
+                         "kind": "audiobook"}
+                self._add_item(book, entry, os.path.basename(path), "", title)
+                counts["audiobooks"] += 1
+            # The book's own tick must agree with the chapters just loaded. Otherwise
+            # a book whose tracks are all unselected would reopen marked as selected.
+            self._sync_parent(book)
+            book.setExpanded(False)
+        for key, label in (("music", "Music"), ("audiobooks", "Audiobooks")):
+            groups[key].setText(0, f"{label} ({counts[key]})")
+            self._sync_tree(groups[key])
+        self._updating = False
+        self.tree.collapseAll()
+
+    def _set_children(self, item, state):
+        wanted = Qt.Checked if state == Qt.PartiallyChecked else state
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(0, wanted)
+            if child.childCount():
+                self._set_children(child, wanted)
+
+    def _sync_parent(self, item):
+        if not item.childCount():
+            return
+        states = [item.child(i).checkState(0) for i in range(item.childCount())]
+        if all(s == Qt.Checked for s in states):
+            item.setCheckState(0, Qt.Checked)
+        elif all(s == Qt.Unchecked for s in states):
+            item.setCheckState(0, Qt.Unchecked)
+        else:
+            item.setCheckState(0, Qt.PartiallyChecked)
+
+    def _sync_tree(self, item):
+        """Recompute every branch below item from its leaves, bottom up."""
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.childCount():
+                self._sync_tree(child)
+        self._sync_parent(item)
+
+    def _item_changed(self, item, column):
+        if self._updating or column != 0:
+            return
+        self._updating = True
+        state = item.checkState(0)
+        if item.childCount():
+            self._set_children(item, state)
+        parent = item.parent()
+        while parent is not None:
+            self._sync_parent(parent)
+            parent = parent.parent()
+        self._updating = False
+        self._update_summary()
+
+    def _leaves(self, item=None):
+        item = self.tree.invisibleRootItem() if item is None else item
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.childCount():
+                yield from self._leaves(child)
+            elif child.data(0, Qt.UserRole):
+                yield child
+
+    def _select_all(self):
+        self._updating = True
+        for leaf in self._leaves():
+            leaf.setCheckState(0, Qt.Checked)
+        for i in range(self.tree.topLevelItemCount()):
+            self._sync_tree(self.tree.topLevelItem(i))
+        self._updating = False
+        self._update_summary()
+
+    def _select_none(self):
+        self._updating = True
+        for leaf in self._leaves():
+            leaf.setCheckState(0, Qt.Unchecked)
+        for i in range(self.tree.topLevelItemCount()):
+            self._sync_tree(self.tree.topLevelItem(i))
+        self._updating = False
+        self._update_summary()
+
+    def _update_summary(self):
+        count = sum(1 for leaf in self._leaves() if leaf.checkState(0) == Qt.Checked)
+        self.summary.setText(f"{count} item{'s' if count != 1 else ''} selected")
+
+    def all_selected(self):
+        leaves = list(self._leaves())
+        return bool(leaves) and all(leaf.checkState(0) == Qt.Checked for leaf in leaves)
+
+    def entries(self):
+        return [leaf.data(0, Qt.UserRole) for leaf in self._leaves()
+                if leaf.checkState(0) == Qt.Checked]
+
+
+class SyncTargetsDialog(QDialog):
+    """Choose the one device folder each kind of audio is copied into.
+
+    The selected folder is the common destination. Music and audiobooks each get a
+    subfolder below it, which is what the sync planner actually writes to. Podcasts
+    are paused and keep their stored folder untouched.
+    """
+
+    def __init__(self, profile, device_root="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose Target Folders")
+        self.resize(720, 340)
+        self._root = os.path.abspath(device_root) if device_root else ""
+        self.base = QLineEdit(profile.target or "")
+        self.music = QLineEdit(profile.music_folder or "Artists")
+        self.audiobooks = QLineEdit(profile.audiobook_folder or "Audiobooks")
+        self._browse = []
+
+        intro = QLabel("Pick the folder on the device, then the two folders below it. "
+                       "The actual paths are shown at the bottom.")
+        intro.setWordWrap(True)
+        form = QFormLayout()
+        form.setSpacing(8)
+        self._row(form, "Selected folder on device", self.base, self._choose_base)
+        self._row(form, "Music", self.music,
+                  lambda: self._choose_sub(self.music, "Music"))
+        self._row(form, "Audiobooks", self.audiobooks,
+                  lambda: self._choose_sub(self.audiobooks, "Audiobooks"))
+        self.preview = QLabel()
+        self.preview.setObjectName("Muted")
+        self.preview.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        defaults = buttons.addButton("Use defaults", QDialogButtonBox.ButtonRole.ActionRole)
+        defaults.clicked.connect(self._defaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.addWidget(intro)
+        lay.addLayout(form)
+        lay.addWidget(self.preview)
+        lay.addStretch(1)
+        lay.addWidget(buttons)
+        for edit in (self.base, self.music, self.audiobooks):
+            edit.textChanged.connect(self._update_preview)
+        self._update_preview()
+
+    def _row(self, form, label, edit, chooser):
+        row = QHBoxLayout()
+        row.addWidget(edit, 1)
+        button = QPushButton("Choose…")
+        button.clicked.connect(chooser)
+        button.setEnabled(bool(self._root and os.path.isdir(self._root)))
+        self._browse.append(button)
+        row.addWidget(button)
+        form.addRow(label, row)
+
+    @staticmethod
+    def _inside(path, root):
+        try:
+            return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) \
+                == os.path.abspath(root)
+        except (OSError, ValueError):
+            return False
+
+    def _choose_base(self):
+        if not self._root:
+            return
+        start = os.path.join(self._root, self.base.text().strip("/"))
+        if not os.path.isdir(start):
+            start = self._root
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Selected folder on device", start, options=DIRECTORY_DIALOG_OPTIONS)
+        if not chosen:
+            return
+        if not self._inside(chosen, self._root):
+            QMessageBox.warning(self, "Target folders", "Choose a folder on this device.")
+            return
+        rel = os.path.relpath(chosen, self._root).replace(os.sep, "/")
+        self.base.setText("" if rel == "." else rel)
+
+    def _choose_sub(self, edit, label):
+        if not self._root:
+            return
+        base = os.path.join(self._root, self.base.text().strip("/"))
+        if not os.path.isdir(base):
+            QMessageBox.information(self, "Target folders",
+                                    "Choose the selected folder on the device first.")
+            return
+        start = os.path.join(base, edit.text().strip("/"))
+        if not os.path.isdir(start):
+            start = base
+        chosen = QFileDialog.getExistingDirectory(
+            self, f"{label} folder", start, options=DIRECTORY_DIALOG_OPTIONS)
+        if not chosen:
+            return
+        if not self._inside(chosen, base):
+            QMessageBox.warning(self, "Target folders",
+                                f"Choose the {label} folder inside "
+                                f"{self.base.text() or 'the device root'}.")
+            return
+        rel = os.path.relpath(chosen, base).replace(os.sep, "/")
+        edit.setText("" if rel == "." else rel)
+
+    def _defaults(self):
+        self.base.setText("Music")
+        self.music.setText("Artists")
+        self.audiobooks.setText("Audiobooks")
+
+    def _full(self, folder):
+        return "/".join(part for part in (self.base.text().strip("/"),
+                                         folder.text().strip("/")) if part) or "device root"
+
+    def _update_preview(self, *_args):
+        self.preview.setText(f"Music: {self._full(self.music)}\n"
+                             f"Audiobooks: {self._full(self.audiobooks)}")
+
+    def values(self):
+        return (self.base.text().strip().strip("/"),
+                self.music.text().strip().strip("/"),
+                self.audiobooks.text().strip().strip("/"))
+
+
+class SyncTab(QWidget):
+    activity = Signal(str)          # "Profile 42%" while a task runs, "" when idle
+
+    def __init__(self, config, library=None, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.library = library
+        self.profiles = load_profiles()
+        self.presets = load_presets()
+        self.devices = []
+        self.plan = None
+        self.worker = None
+        self.autosync_queue = []
+        self._autosync_waiting = set()
+        self._active = None
+        self.plan_profile = None  # id of the profile the reviewed plan belongs to
+        self.plan_verify = False  # whether the reviewed plan read the device copies
+        self._verify_used = False  # whether the last compare read the device copies
+        self._verify_stats = {}    # how many files that verification actually read
+        self._sync_device_id = ""  # the device the running worker owns, "" when idle
+        self._claim_owner = None    # what this tab's device claim is called
+        self._claim_root = ""      # the path that claim covers
+        # whether a device answered its last probe, and when: filled on a worker so the
+        # GUI thread never lists a phone's mount
+        self._ready_cache = {}
+        self._ready_probe = None
+        self._ready_in_flight = ""
+        self._autosync_timer = QTimer(self, interval=4000, timeout=self._next_autosync)
+
+        # profiles list
+        self.plist = QListWidget()
+        self.plist.setMaximumWidth(240)
+        self.plist.currentRowChanged.connect(self._show_profile)
+        add, rem = QPushButton("New profile"), QPushButton("Delete")
+        add.clicked.connect(self.new_profile)
+        rem.clicked.connect(self.delete_profile)
+        lc = QVBoxLayout()
+        h = QLabel("Profiles")
+        h.setObjectName("Heading")
+        lc.addWidget(h)
+        lc.addWidget(self.plist, 1)
+        row = QHBoxLayout()
+        row.addWidget(add)
+        row.addWidget(rem)
+        lc.addLayout(row)
+        left = QWidget()
+        left.setLayout(lc)
+
+        # profile form
+        self.name = QLineEdit()
+        self.device = QComboBox()
+        self.device_status = QLabel()
+        self.device_status.setObjectName("Muted")
+        self.sources_list = QListWidget()
+        self.sources_list.setMaximumHeight(76)
+        self.sources_list.setToolTip("Every folder this profile copies from, merged into "
+                                     "one library on the device.")
+        self.source_add = QPushButton("Add…")
+        self.source_add.clicked.connect(self._add_source)
+        self.source_remove = QPushButton("Remove")
+        self.source_remove.clicked.connect(self._remove_source)
+        self.source_box = QWidget()
+        source_lay = QVBoxLayout(self.source_box)
+        source_lay.setContentsMargins(0, 0, 0, 0)
+        source_lay.setSpacing(4)
+        source_lay.addWidget(self.sources_list)
+        source_btns = QHBoxLayout()
+        source_btns.addWidget(self.source_add)
+        source_btns.addWidget(self.source_remove)
+        source_btns.addStretch(1)
+        source_lay.addLayout(source_btns)
+        # iTunes calls this "Entire library" vs "Selected playlists, artists, albums…".
+        self.selection_mode = QComboBox()
+        self.selection_mode.addItem("Folder(s) — sync these folders", "folders")
+        self.selection_mode.addItem("Selected items — choose what to sync", "selected")
+        self.selection_mode.setToolTip("Sync every file below the folders, or only the "
+                                       "music and audiobooks you tick. Mirror deletes "
+                                       "the copies it wrote for items you untick; "
+                                       "Update never deletes.")
+        self.select_btn = QPushButton("Choose items…")
+        self.select_btn.clicked.connect(self.choose_sync_items)
+        self.selection_summary = QLabel("")
+        self.selection_summary.setObjectName("Muted")
+        self.source_label = QLabel("Folder(s) to sync")
+        selection_row = QHBoxLayout()
+        selection_row.addWidget(self.selection_summary, 1)
+        selection_row.addWidget(self.select_btn)
+        self.target_button = QPushButton("Choose Target Folders")
+        self.target_button.clicked.connect(self._choose_target_folders)
+        self.target_summary = QLabel("")
+        self.target_summary.setObjectName("Muted")
+        self.target_summary.setWordWrap(True)
+        self.target_summary.setToolTip("The actual device paths for music and audiobooks, "
+                                       "below the folder selected on the device.")
+        self.mode = QComboBox()
+        for k, v in MODES.items():
+            self.mode.addItem(v, k)
+        self.method = QComboBox()
+        for k, v in COMPARE_METHODS.items():
+            self.method.addItem(v, k)
+        self.method.setToolTip("Bit-by-bit reads every file on the device. Fast hash trusts the "
+                               "sync manifest; Verify content reads and hashes the device folder "
+                               "in full.")
+        # The device's filesystem decides whether a file name may be altered on the way
+        # over: exFAT and MTP store UTF-16 names unchanged, FAT32 cannot.
+        self.filesystem = QComboBox()
+        for k, v in FILESYSTEMS.items():
+            self.filesystem.addItem(v, k)
+        self.filesystem_note = QLabel()
+        self.filesystem_note.setObjectName("Muted")
+        # Force transcode: re-encode every file on its way to the device ("" is off).
+        self.transcode = QComboBox()
+        for k, (label, _ext) in TRANSCODE_CODECS.items():
+            self.transcode.addItem(label, k)
+        self.transcode.setToolTip("Re-encode every file on its way to this device. Off copies "
+                                  "each file as it is.")
+        # The bitrate choices belong to the codec above; this is the same list Copy to
+        # device uses, so a profile and a one-off copy encode identically.
+        self.transcode_bitrate = QComboBox()
+        self.transcode_bitrate.setToolTip("The codec's bitrate, or its VBR quality where it "
+                                          "has one. Changing this re-encodes a device copy "
+                                          "on the next compare or sync.")
+        self.audio_only = QCheckBox("Only audio files")
+        self.include_lrc = QCheckBox("Include LRC files")
+        self.include_lrc.setToolTip("Also copy the matching .lrc lyric file beside a "
+                                    "selected audio file.")
+        self.autosync = QCheckBox("Autosync when connected")
+        form = QFormLayout()
+        form.addRow("Name", self.name)
+        dv = QHBoxLayout()
+        dv.addWidget(self.device, 1)
+        dv.addWidget(self.device_status)
+        form.addRow("Device", dv)
+        # Presets are shared: choosing one fills in the settings below, and Save stores
+        # them for every device. They describe how a device should look, not which one.
+        self.preset = QComboBox()
+        self.preset.setToolTip("Saved settings shared by every device: the folder on it, "
+                               "the variant, the compare method, the filesystem and any "
+                               "transcode codec and bitrate.")
+        self.preset.currentIndexChanged.connect(self._preset_chosen)
+        self.preset_save = QPushButton("Save…")
+        self.preset_save.setToolTip("Save this profile's settings as a preset shared by "
+                                    "every device")
+        self.preset_save.clicked.connect(self.save_preset_dialog)
+        self.preset_delete = QPushButton("Delete")
+        self.preset_delete.setToolTip("Delete the chosen preset")
+        self.preset_delete.clicked.connect(self._delete_preset)
+        pr = QHBoxLayout()
+        pr.addWidget(self.preset, 1)
+        pr.addWidget(self.preset_save)
+        pr.addWidget(self.preset_delete)
+        form.addRow("Preset", pr)
+        form.addRow("What to sync", self.selection_mode)
+        form.addRow(self.source_label, self.source_box)
+        form.addRow("", selection_row)
+        form.addRow("Target folders", self.target_button)
+        form.addRow("", self.target_summary)
+        form.addRow("Device filesystem", self.filesystem)
+        form.addRow("", self.filesystem_note)
+        form.addRow("Force transcode", self.transcode)
+        self.bitrate_label = QLabel("Bitrate")
+        form.addRow(self.bitrate_label, self.transcode_bitrate)
+        form.addRow("Variant", self.mode)
+        form.addRow("Compare by", self.method)
+        form.addRow("", self.audio_only)
+        form.addRow("", self.include_lrc)
+        form.addRow("", self.autosync)
+        box = QGroupBox("Profile")
+        box.setLayout(form)
+        self.name.editingFinished.connect(self._store)
+        for w in (self.device, self.mode, self.method, self.filesystem):
+            w.currentIndexChanged.connect(self._store)
+        self.selection_mode.currentIndexChanged.connect(self._selection_mode_changed)
+        self.transcode.currentIndexChanged.connect(self._transcode_changed)
+        self.transcode_bitrate.currentIndexChanged.connect(self._store)
+        self.method.currentIndexChanged.connect(self._method_changed)
+        self.filesystem.currentIndexChanged.connect(self._filesystem_changed)
+        for w in (self.audio_only, self.include_lrc, self.autosync):
+            w.toggled.connect(self._store)
+
+        self.compare_btn = QPushButton("Compare")
+        self.sync_btn = QPushButton("Sync")
+        self.both_btn = QPushButton("Compare+Sync")
+        # Verify content belongs to Fast hash only: Bit-by-bit already read both copies.
+        # It is an ordinary button like the other three, and it highlights while it runs.
+        self.verify_btn = QPushButton("Verify content")
+        self.verify_btn.setToolTip("Read and hash every file in the device folder (only audio "
+                                   "files when this profile is audio only) and rebuild the sync "
+                                   "manifest from those hashes, so it lists exactly what the "
+                                   "device holds. Timestamps are ignored, so a device that "
+                                   "rewrites them changes nothing. Exact, but slow on a phone.")
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.compare_btn.clicked.connect(lambda: self.run(sync=False))
+        self.sync_btn.clicked.connect(lambda: self.run(sync=True, reuse_plan=True))
+        self.both_btn.clicked.connect(lambda: self.run(sync=True))
+        self.verify_btn.clicked.connect(lambda: self.run(sync=False, force_verify=True))
+        self.cancel_btn.clicked.connect(lambda: self.worker and self.worker.cancel())
+        actions = QHBoxLayout()
+        actions.addWidget(self.compare_btn)
+        actions.addWidget(self.sync_btn)
+        actions.addWidget(self.both_btn)
+        actions.addWidget(self.verify_btn)
+        actions.addWidget(self.cancel_btn)
+        actions.addStretch()
+
+        self.progress = QProgressBar()
+        self.status = QLabel("")
+        self.status.setObjectName("Muted")
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Action", "File", "Size"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.verticalHeader().hide()
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setColumnWidth(0, 230)
+        self.table.setColumnWidth(2, 90)
+        self.log = QPlainTextEdit(readOnly=True)
+        self.log.setMaximumHeight(140)
+        # The running task's lines still come here, but it stays out of the way: what
+        # happened is kept per profile and read through the log button instead.
+        self.log.setVisible(False)
+
+        self.summary = QLabel("")
+        self.summary.setObjectName("Summary")
+        self.log_btn = QToolButton()
+        self.log_btn.setObjectName("LogButton")
+        self.log_btn.setAutoRaise(True)
+        self.log_btn.setCursor(Qt.PointingHandCursor)
+        self.log_btn.setIconSize(QSize(20, 20))
+        self.log_btn.setIcon(tinted_icon(
+            LOG_ICON_FILE, theme_settings(config)["palette"].get("text", "#ffffff")))
+        self.log_btn.setToolTip("Sync log — every compare, sync and verification this profile "
+                                "ran, newest first")
+        self.log_btn.clicked.connect(self.show_log)
+        summary_row = QHBoxLayout()
+        summary_row.setSpacing(8)
+        summary_row.addWidget(self.summary, 1)
+        summary_row.addWidget(self.log_btn)
+
+        rc = QVBoxLayout()
+        rc.addWidget(box)
+        rc.addLayout(actions)
+        rc.addWidget(self.progress)
+        rc.addWidget(self.status)
+        rc.addLayout(summary_row)
+        rc.addWidget(self.table, 1)
+        rc.addWidget(self.log)
+        right = QWidget()
+        right.setLayout(rc)
+
+        split = QSplitter()
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setSizes([240, 1000])
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.addWidget(split)
+        self._reload_list()  # selects the first profile, which sets Verify content up
+
+    # ---------- profiles ----------
+    def _reload_list(self, select=0):
+        self.plist.blockSignals(True)
+        self.plist.clear()
+        for p in self.profiles:
+            self.plist.addItem(("⟳ " if p.autosync else "") + p.name)
+        self.plist.blockSignals(False)
+        if self.profiles:
+            self.plist.setCurrentRow(min(select, len(self.profiles) - 1))
+        else:
+            self._show_profile(-1)
+
+    def current(self):
+        r = self.plist.currentRow()
+        return self.profiles[r] if 0 <= r < len(self.profiles) else None
+
+    def _fill_devices(self, selected_id):
+        self.device.blockSignals(True)
+        self.device.clear()
+        ids = []
+        for d in self.devices:
+            self.device.addItem(("MTP · " if d.kind == "mtp" else "USB · ") + d.name, d.id)
+            ids.append(d.id)
+        if not selected_id:
+            # Not the same thing as choosing "Any folder…": an empty profile must not
+            # make the next settings change pop a folder picker.
+            self.device.addItem("No device", "")
+        elif selected_id.startswith("folder:"):
+            path = selected_id[len("folder:"):]
+            self.device.addItem("Folder · " + (os.path.basename(path.rstrip(os.sep)) or path),
+                                selected_id)
+        elif selected_id not in ids:
+            label = selected_id.split(":", 1)[-1].split("=", 1)[-1]
+            self.device.addItem(f"{label} (not connected)", selected_id)
+        self.device.addItem("Any folder…", "__folder__")
+        idx = self.device.findData(selected_id)
+        self.device.setCurrentIndex(max(idx, 0))
+        self.device.blockSignals(False)
+        self._adopt_visible_device()
+        self._refresh_device_status()
+        self._fill_presets()
+
+    def _fill_presets(self, select=None):
+        """List every preset: they are shared, so any device can use any of them."""
+        p = self.current()
+        if select is None:
+            select = getattr(p, "preset_id", "") if p else ""
+        self.preset.blockSignals(True)
+        self.preset.clear()
+        self.preset.addItem("No preset", "")
+        for preset in self.presets:
+            self.preset.addItem(preset.name, preset.id)
+        index = self.preset.findData(select) if select else 0
+        if select and index < 0:
+            # The saved preset was deleted or is missing from this install.
+            index = 0
+            if p is not None and getattr(p, "preset_id", "") == select:
+                p.preset_id = ""
+                save_profiles(self.profiles)
+        self.preset.setCurrentIndex(max(index, 0))
+        self.preset.blockSignals(False)
+        has_presets = self.preset.count() > 1
+        self.preset.setEnabled(bool(p) and has_presets)
+        self.preset_save.setEnabled(bool(p))
+        self.preset_delete.setEnabled(has_presets and bool(self.preset.currentData()))
+
+    def device_label(self, device_id):
+        """A device's name, including one that is not plugged in right now."""
+        for d in self.devices:
+            if d.id == device_id:
+                return d.name
+        if device_id.startswith("mass:"):
+            return os.path.basename(device_id[len("mass:"):].rstrip("/")) or device_id
+        if device_id.startswith("mtp:host="):
+            return device_id[len("mtp:host="):].replace("_", " ").replace("%20", " ")
+        if device_id.startswith("folder:"):
+            return os.path.basename(device_id[len("folder:"):].rstrip("/")) or "Folder"
+        return device_id or "Device"
+
+    @staticmethod
+    def _preset_from_profile(preset, profile):
+        preset.sources = list(profile_sources(profile))
+        preset.source = preset.sources[0] if preset.sources else ""
+        preset.target = profile.target
+        preset.music_folder = profile.music_folder
+        preset.audiobook_folder = profile.audiobook_folder
+        preset.podcast_folder = profile.podcast_folder
+        preset.audiobook_roots = list(profile.audiobook_roots)
+        preset.mode = profile.mode
+        preset.method = profile.method
+        preset.filesystem = profile.filesystem
+        preset.transcode = profile.transcode
+        preset.transcode_mode = profile.transcode_mode
+        preset.transcode_quality = profile.transcode_quality
+        preset.audio_only = profile.audio_only
+        preset.include_lrc = profile.include_lrc
+
+    def _preset_chosen(self, _index=0):
+        preset_id = self.preset.currentData()
+        profile = self.current()
+        if not profile:
+            return
+        if not preset_id:
+            if getattr(profile, "preset_id", ""):
+                profile.preset_id = ""
+                save_profiles(self.profiles)
+                self._fill_presets()
+            return
+        preset = next((x for x in self.presets if x.id == preset_id), None)
+        if preset is None:
+            return
+        preset.apply_to(profile)
+        profile.preset_id = preset.id
+        save_profiles(self.profiles)
+        self.plan = None
+        self._show_profile(self.plist.currentRow())
+        self._fill_presets(preset.id)
+        self.log.appendPlainText(f"\u2014 Preset '{preset.name}' applied to {profile.name} \u2014")
+
+    def save_preset_dialog(self):
+        profile = self.current()
+        if not profile:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Save preset",
+            "Save these settings as a preset shared by every device:",
+            text=profile.name or "Preset")
+        name = name.strip() if ok else ""
+        if not name:
+            return
+        preset = next((x for x in self.presets if x.name == name), None)
+        if preset is None:
+            preset = DevicePreset(name=name)
+            self.presets.append(preset)
+        self._preset_from_profile(preset, profile)
+        profile.preset_id = preset.id
+        save_presets(self.presets)
+        save_profiles(self.profiles)
+        self._fill_presets(preset.id)
+        self.log.appendPlainText(f"\u2014 Preset '{name}' saved for every device \u2014")
+        self._notify(f"Preset '{name}' saved")
+
+    def _delete_preset(self):
+        preset_id = self.preset.currentData()
+        preset = next((x for x in self.presets if x.id == preset_id), None)
+        if preset is None:
+            return
+        if QMessageBox.question(self, "Delete preset",
+                                f"Delete the preset '{preset.name}'?") != QMessageBox.Yes:
+            return
+        self.presets.remove(preset)
+        save_presets(self.presets)
+        cleared = False
+        for profile in self.profiles:
+            if getattr(profile, "preset_id", "") == preset.id:
+                profile.preset_id = ""
+                cleared = True
+        if cleared:
+            save_profiles(self.profiles)
+        self._fill_presets()
+        self._notify(f"Preset '{preset.name}' deleted")
+
+    def apply_preset(self, preset, device_id=""):
+        """Load a shared preset into a profile, for the given or current device."""
+        target = device_id or preset.device_id
+        profile = next((p for p in self.profiles if p.device_id == target), None)
+        if profile is None:
+            profile = self.current()
+        if profile is None:
+            profile = Profile(name=preset.name, device_id=target)
+            self.profiles.append(profile)
+        preset.apply_to(profile)
+        profile.preset_id = preset.id
+        save_profiles(self.profiles)
+        self.plan = None
+        self._reload_list(self.profiles.index(profile))
+        self._fill_presets(preset.id)
+        self.log.appendPlainText(f"\u2014 Preset '{preset.name}' loaded \u2014")
+        window = self.window()
+        if hasattr(window, "show_sync_tab"):
+            window.show_sync_tab()
+        self._notify(f"Preset '{preset.name}' loaded \u2014 press Sync")
+
+    def _log_keep(self):
+        return sync_log_keep_entries(self.config.get("sync_log_keep", 10))
+
+    def trim_logs(self):
+        trim_sync_log(self._log_keep())
+
+    def show_log(self):
+        profile = self.current()
+        if profile is None:
+            QMessageBox.information(self, "Sync log", "Choose a profile first.")
+            return
+        SyncLogDialog(profile, self._log_keep(), self).exec()
+
+    def refresh_log_icon(self):
+        """Keep the log glyph in the theme's text colour after a theme change."""
+        self.log_btn.setIcon(tinted_icon(
+            LOG_ICON_FILE, theme_settings(self.config)["palette"].get("text", "#ffffff")))
+
+    def _adopt_visible_device(self):
+        """Point the profile at the device the combo actually shows.
+
+        A profile starts with an empty device id; the combo then falls back to
+        its first entry, so Compare used to fail while the row looked filled in.
+        """
+        p = self.current()
+        data = self.device.currentData()
+        if p and data and data != "__folder__" and data != p.device_id:
+            p.device_id = data
+            save_profiles(self.profiles)
+
+    def refresh_status(self):
+        """Called on every device poll: a phone can become readable without being re-plugged."""
+        self._refresh_device_status()
+
+    def _refresh_device_status(self):
+        """Green dot when the profile's device can be read now, gray otherwise.
+
+        Nothing here lists the device: the dot shows the last answer (read by the
+        Devices tab or by a probe on a worker), so a phone that is busy with a sync can
+        never block the window through its status line.
+        """
+        p = self.current()
+        if not p:
+            self.device_status.clear()
+            self.device_status.setToolTip("")
+            return
+        data = self.device.currentData() or ""
+        live = {d.id: d for d in self.devices}
+        ok = False
+        color = None
+        if data.startswith("folder:"):
+            ok = os.path.isdir(data[len("folder:"):])
+            text, tip = "folder", data[len("folder:"):]
+        elif data == "__folder__":
+            text, tip = "choose a folder", "Pick the destination folder for this profile."
+        elif data in live:
+            devices = getattr(self.window(), "devices_tab", None)
+            claim = DEVICE_CLAIMS.reason(live[data].root)
+            if claim:
+                # A compare/sync/verify/copy owns the device: no listing, and say which
+                # task has it rather than a state that would need one.
+                color = AMBER
+                text, tip = "syncing", claim + " The device library is read again when it " \
+                                            "finishes."
+            else:
+                # Three states, and only three for a plugged-in device: the device is
+                # detected but its storage has not answered ("waiting for File transfer",
+                # including the first moments before any answer), or it has answered and
+                # is connected. The "reading" state is not used here: a phone sitting on
+                # its charging prompt is being walked by the Devices tab and must still
+                # show that it is waiting, not that it is reading.
+                cached = self._ready_cache.get(data)
+                state = cached[0] if cached is not None else None
+                if state is None and devices is not None:
+                    state = devices.ready_state(data)
+                # A phone can change mode without being re-plugged, so an answer older
+                # than a few seconds is asked again on a worker; the dot shows the last
+                # answer until the new one arrives.
+                if cached is None or time.monotonic() - cached[1] >= 6:
+                    self._probe_ready(data)
+                if state:
+                    ok = True
+                    text, tip = "connected", (f"{self.device.currentText()} is plugged in "
+                                               f"and in File transfer mode.")
+                else:
+                    text, tip = "waiting for File transfer", ("Plugged in, but the phone's "
+                                                             "storage cannot be read yet. "
+                                                             "Choose File transfer on the phone.")
+                    color = MUTED
+        elif data:
+            text, tip = "not connected", ("This profile's device is not plugged in. "
+                                          "Connect it, then press Compare.")
+        else:
+            text, tip = "no device chosen", "Pick the phone or player this profile syncs to."
+        if color is None:
+            color = STATUS_GREEN if ok else MUTED
+        last = f"last sync {p.last_sync}" if p.last_sync else "never synced"
+        # A bit-by-bit compare reads both copies, so its result is exact and needs no
+        # note. Only a Fast hash profile has to say when the device was read in full.
+        verified = ""
+        if p.method == "hash" and p.last_sync and p.last_sync_method != "bytes":
+            if p.last_verified:
+                verified = f"last verified {p.last_verified}"
+                tip += (" Fast hash trusts the sync manifest; the device folder was last "
+                        "read and hashed in full at that time, so the manifest held exactly "
+                        "what the device contains.")
+            else:
+                verified = "not verified in full"
+                tip += (" Fast hash trusts the sync manifest. The device files have not been "
+                        "read in full yet — press Verify content for that.")
+        self.device_status.setTextFormat(Qt.RichText)
+        tail = f" · <span style=\"color:{MUTED}\">{verified}</span>" if verified else ""
+        self.device_status.setText(f'<span style="color:{color}">●</span> {text} · '
+                                   f'<span style="color:{MUTED}">{last}</span>{tail}')
+        self.device_status.setToolTip(tip)
+
+    def _method_changed(self):
+        """Explain the chosen mode, and offer verification only where it adds certainty."""
+        method = self.method.currentData() or "bytes"
+        p = self.current()
+        # Fast hash is the only mode where reading the device adds proof; Bit-by-bit
+        # always reads it, so the button would be redundant there. A forced transcode
+        # makes the device file a lossy encode, so source bytes cannot verify it; the
+        # manifest records the source and encode setting instead.
+        available = method == "hash" and p is not None and not p.transcode
+        self.verify_btn.setVisible(method == "hash")
+        self.verify_btn.setEnabled(available)
+        if p is not None and p.transcode:
+            self.verify_btn.setToolTip("Not used with Force transcode: the device copy is a "
+                                       "lossy encode, so it cannot be compared with the "
+                                       "source bytes. Compare checks the source and encode "
+                                       "setting recorded in the sync manifest.")
+        else:
+            self.verify_btn.setToolTip(
+                "Read and hash every file in the device folder (only audio files when "
+                "this profile is audio only) and rebuild the sync manifest from those "
+                "hashes, so it lists exactly what the device holds. Timestamps are "
+                "ignored, so a device that rewrites them changes nothing. Exact, but "
+                "slow on a phone.")
+
+    def _filesystem_changed(self):
+        """Say what the chosen filesystem does to a file name: one line in the form, the
+        full rule on the picker and the line so it is there when it is wanted."""
+        key = self.filesystem.currentData() or "fat32"
+        full = FILESYSTEM_NOTES.get(key, "")
+        self.filesystem_note.setText(filesystem_hint(key))
+        self.filesystem_note.setToolTip(full)
+        self.filesystem.setToolTip(full)
+
+    def _fill_transcode_rates(self, codec="", mode=None, quality=None):
+        """Fill Bitrate with the choices for codec, keeping the profile's setting."""
+        choices = TRANSCODE_BITRATES.get(codec, [])
+        self.transcode_bitrate.blockSignals(True)
+        self.transcode_bitrate.clear()
+        for m, value, label in choices:
+            self.transcode_bitrate.addItem(label, (m, value))
+        if mode is None:
+            wanted = TRANSCODE_DEFAULTS.get(codec)
+        else:
+            wanted = resolve_transcode_setting(codec, mode, quality)
+        pick = next((i for i, (m, value, _label) in enumerate(choices)
+                     if (m, value) == wanted), 0)
+        self.transcode_bitrate.setCurrentIndex(max(pick, 0))
+        self.transcode_bitrate.setEnabled(bool(codec) and self.current() is not None)
+        self.transcode_bitrate.blockSignals(False)
+
+    def _transcode_changed(self):
+        """A codec change resets Bitrate to that codec's default (or its saved value)."""
+        p = self.current()
+        codec = self.transcode.currentData() or ""
+        if p and p.transcode == codec:
+            mode, quality = p.transcode_choice()
+        else:
+            mode = quality = None
+        self._fill_transcode_rates(codec, mode, quality)
+        self._update_transcode_rows()
+        self._store()
+        self._method_changed()
+
+    def _update_transcode_rows(self):
+        """Bitrate is meaningless while files are copied as they are: hide the row."""
+        show = bool(self.transcode.currentData())
+        self.bitrate_label.setVisible(show)
+        self.transcode_bitrate.setVisible(show)
+        if not show:
+            self.transcode_bitrate.setEnabled(False)
+
+    def _show_profile(self, row):
+        p = self.current()
+        for w in (self.name, self.device, self.mode, self.audio_only, self.include_lrc,
+                  self.autosync, self.method, self.filesystem, self.transcode,
+                  self.transcode_bitrate, self.selection_mode):
+            w.blockSignals(True)
+            w.setEnabled(p is not None)
+        self.target_button.setEnabled(p is not None)
+        self.sources_list.clear()
+        if p:
+            self.name.setText(p.name)
+            for source in profile_sources(p):
+                self.sources_list.addItem(source)
+            self.selection_mode.setCurrentIndex(
+                max(self.selection_mode.findData(p.selection_mode), 0))
+            self.target_summary.setText(self._target_summary(p))
+            self.mode.setCurrentIndex(max(self.mode.findData(p.mode), 0))
+            self.method.setCurrentIndex(max(self.method.findData(p.method), 0))
+            self.filesystem.setCurrentIndex(max(self.filesystem.findData(p.filesystem), 0))
+            self.transcode.setCurrentIndex(max(self.transcode.findData(p.transcode), 0))
+            self._fill_transcode_rates(p.transcode, p.transcode_mode, p.transcode_quality)
+            self.audio_only.setChecked(p.audio_only)
+            self.include_lrc.setChecked(p.include_lrc)
+            self.autosync.setChecked(p.autosync)
+        else:
+            self.selection_mode.setCurrentIndex(0)
+            self.target_summary.clear()
+            self._fill_transcode_rates("")
+        for w in (self.name, self.device, self.mode, self.audio_only, self.include_lrc,
+                  self.autosync, self.method, self.filesystem, self.transcode,
+                  self.transcode_bitrate, self.selection_mode):
+            w.blockSignals(False)
+        for w in (self.sources_list, self.source_add, self.source_remove):
+            w.setEnabled(p is not None)
+        self._update_sync_mode()
+        self._update_transcode_rows()
+        self._method_changed()
+        self._filesystem_changed()
+        if p:
+            self._fill_devices(p.device_id)
+        else:
+            self._refresh_device_status()
+            self._fill_presets()
+        self.table.setRowCount(0)
+        self.plan = None
+
+    def _store(self):
+        p = self.current()
+        if not p:
+            return
+        before = (p.device_id, tuple(profile_sources(p)), p.selection_mode, p.target,
+                  p.music_folder, p.audiobook_folder, p.podcast_folder,
+                  p.mode, p.method, p.audio_only, p.include_lrc, p.filesystem,
+                  p.transcode, p.transcode_mode, p.transcode_quality)
+        was_auto = p.autosync
+        dev = self.device.currentData()
+        if dev == "__folder__":
+            d = QFileDialog.getExistingDirectory(
+                self, "Sync to folder", options=DIRECTORY_DIALOG_OPTIONS)
+            dev = f"folder:{d}" if d else p.device_id
+            self._fill_devices(dev)
+        p.name = self.name.text().strip() or "Profile"
+        p.device_id = dev or ""
+        p.sources = [self.sources_list.item(i).text() for i in range(self.sources_list.count())]
+        p.source = p.sources[0] if p.sources else ""
+        p.selection_mode = self.selection_mode.currentData() or "folders"
+        p.audiobook_roots = list(self.config.get("audiobook_folders") or [])
+        p.mode = self.mode.currentData()
+        p.method = self.method.currentData()
+        p.filesystem = self.filesystem.currentData() or "fat32"
+        p.transcode = self.transcode.currentData() or ""
+        rate = self.transcode_bitrate.currentData() if p.transcode else None
+        if rate:
+            p.transcode_mode, p.transcode_quality = rate
+        else:
+            p.transcode_mode, p.transcode_quality = "", 0
+        p.audio_only = self.audio_only.isChecked()
+        p.include_lrc = self.include_lrc.isChecked()
+        p.autosync = self.autosync.isChecked()
+        if before != (p.device_id, tuple(profile_sources(p)), p.selection_mode, p.target,
+                      p.music_folder, p.audiobook_folder, p.podcast_folder,
+                      p.mode, p.method, p.audio_only, p.include_lrc, p.filesystem,
+                      p.transcode, p.transcode_mode, p.transcode_quality):
+            self.plan = None  # the reviewed list no longer matches these settings
+        save_profiles(self.profiles)
+        item = self.plist.currentItem()
+        if item:
+            item.setText(("⟳ " if p.autosync else "") + p.name)
+        self._refresh_device_status()
+        self._fill_presets()
+        # Autosync is not only a thing that happens when a device arrives: switching it
+        # on while the player is already plugged in is a sync request too, and so is
+        # pointing an autosync profile at the device that is plugged in now.
+        if p.autosync and (not was_auto or before[0] != p.device_id):
+            self._queue_autosync(p)
+        elif was_auto and not p.autosync:
+            self._drop_autosync(p)
+
+    def _queue_autosync(self, profile):
+        """Queue a profile whose autosync was just switched on, or just retargeted.
+
+        Nothing was plugged in, so no "newly connected" event will do it. A device that
+        is plugged in but not answering stays queued: _next_autosync waits for it.
+        """
+        if profile in self.autosync_queue:
+            return
+        if profile.device_id.startswith("folder:"):
+            present = os.path.isdir(profile.device_id[len("folder:"):])
+        else:
+            present = self._device_of(profile) is not None
+        if not present:
+            return
+        self.autosync_queue.insert(0, profile)
+        self._autosync_waiting.discard(profile.id)
+        self.log.appendPlainText(f"— Autosync turned on: {profile.name} —")
+        self._next_autosync()
+
+    def _drop_autosync(self, profile):
+        """Autosync was switched off: a queued run must not start and a wait ends."""
+        while profile in self.autosync_queue:
+            self.autosync_queue.remove(profile)
+        self._autosync_waiting.discard(profile.id)
+        self.log.appendPlainText(f"— Autosync turned off: {profile.name} —")
+        self._next_autosync()
+        devices = getattr(self.window(), "devices_tab", None)
+        if devices is not None:
+            # The page may be showing "Autosync is starting…": with the run dropped,
+            # the device is free and its music can come back.
+            devices.busy_changed()
+
+    def new_profile(self):
+        if self.worker is not None and self.worker.isRunning():
+            return      # don't list a device that a running task owns
+        src = self.config["library_folders"][0] if self.config["library_folders"] \
+            else os.path.expanduser("~/Music")
+        dev = self.devices[0].id if self.devices else ""
+        target = "Music"
+        if self.devices and self.devices[0].kind == "mtp":
+            # MTP root lists storages ("Internal shared storage"); pick the first
+            b = Backend(self.devices[0])
+            st = [n for n, isdir, _ in b.listdir("") if isdir]
+            if st:
+                target = f"{st[0]}/{target}" if target else st[0]
+        self.profiles.append(Profile(name=self.devices[0].name if self.devices else "New profile",
+                                     device_id=dev, source=src, sources=[src], target=target,
+                                     audiobook_roots=list(
+                                         self.config.get("audiobook_folders") or [])))
+        save_profiles(self.profiles)
+        self._reload_list(len(self.profiles) - 1)
+
+    def delete_profile(self):
+        p = self.current()
+        if p and QMessageBox.question(self, "Delete",
+                                      f"Delete profile '{p.name}'?") == QMessageBox.Yes:
+            self.profiles.remove(p)
+            save_profiles(self.profiles)
+            delete_sync_log(p.id)
+            self._reload_list()
+
+    def _add_source(self):
+        p = self.current()
+        if not p:
+            return
+        roots = profile_sources(p)
+        d = QFileDialog.getExistingDirectory(
+            self, "Folder to sync", roots[-1] if roots else os.path.expanduser("~"),
+            options=DIRECTORY_DIALOG_OPTIONS)
+        if d and d not in [self.sources_list.item(i).text()
+                           for i in range(self.sources_list.count())]:
+            self.sources_list.addItem(d)
+            self._store()
+
+    def _remove_source(self):
+        row = self.sources_list.currentRow()
+        if row >= 0:
+            self.sources_list.takeItem(row)
+            self._store()
+
+    def _selection_mode_changed(self, _index=0):
+        self._update_sync_mode()
+        self._store()
+
+    def _update_sync_mode(self):
+        selected = (self.selection_mode.currentData() or "folders") == "selected"
+        self.source_label.setVisible(not selected)
+        self.source_box.setVisible(not selected)
+        self.select_btn.setVisible(selected)
+        self.selection_summary.setVisible(selected)
+        self._update_selection_summary()
+
+    def _update_selection_summary(self):
+        p = self.current()
+        count = len(p.selection or []) if p else 0
+        self.selection_summary.setText(
+            f"{count} item{'s' if count != 1 else ''} selected" if count
+            else "No items selected yet")
+        self.select_btn.setEnabled(p is not None)
+
+    def choose_sync_items(self):
+        p = self.current()
+        if not p:
+            return
+        dlg = SyncSelectionDialog(self.config, self.library, p.selection, self,
+                                  select_all=getattr(p, "selection_all", True))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        p.selection = dlg.entries()
+        p.selection_all = dlg.all_selected()
+        p.selection_mode = "selected"
+        save_profiles(self.profiles)
+        self.selection_mode.blockSignals(True)
+        self.selection_mode.setCurrentIndex(
+            max(self.selection_mode.findData("selected"), 0))
+        self.selection_mode.blockSignals(False)
+        self._update_sync_mode()
+        self.plan = None
+        self._notify(f"{len(p.selection)} item(s) chosen for syncing")
+
+    @staticmethod
+    def _target_summary(profile):
+        def full(folder):
+            return "/".join(part for part in (profile.target, folder) if part) or "device root"
+        return (f"Music: {full(profile.music_folder)}  ·  "
+                f"Audiobooks: {full(profile.audiobook_folder)}")
+
+    def _choose_target_folders(self):
+        p = self.current()
+        if not p:
+            return
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Sync", "A task is using this device. Choose the "
+                                    "folders when it finishes.")
+            return
+        b = self._backend(p)
+        root = b.device.root if b else ""
+        dlg = SyncTargetsDialog(p, root, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        p.target, p.music_folder, p.audiobook_folder = dlg.values()
+        p.audiobook_roots = list(self.config.get("audiobook_folders") or [])
+        save_profiles(self.profiles)
+        self.plan = None
+        self._show_profile(self.plist.currentRow())
+        self._notify("Target folders updated")
+
+    # ---------- devices / autosync ----------
+    def _backend(self, p):
+        if not p:
+            return None
+        if p.device_id.startswith("folder:"):
+            path = p.device_id[len("folder:"):]
+            return LocalFolderBackend(path) if os.path.isdir(path) else None
+        for d in self.devices:
+            if d.id == p.device_id:
+                return Backend(d)
+        return None
+
+    def set_devices(self, devices, newly_connected=()):
+        previous = {d.id for d in self.devices}
+        present = {d.id for d in devices}
+        for device_id in previous - present:
+            self._ready_cache.pop(device_id, None)
+            if self._ready_in_flight == device_id:
+                self._ready_in_flight = ""
+        self.devices = devices
+        p = self.current()
+        if p:
+            self._fill_devices(p.device_id)
+        new_ids = {d.id for d in newly_connected}
+        devices_tab = getattr(self.window(), "devices_tab", None)
+        for device_id in new_ids:
+            # The phone has just been plugged in: its last "ready" described the
+            # previous connection, so autosync must ask the storage again and wait.
+            self._ready_cache.pop(device_id, None)
+            if devices_tab is not None:
+                devices_tab.forget_ready(device_id)
+        for prof in self.profiles:
+            if prof.autosync and prof.device_id in new_ids and prof not in self.autosync_queue:
+                self.autosync_queue.append(prof)
+        if self.autosync_queue:
+            # a phone that was unplugged while waiting is not coming back on its own
+            gone = [prof for prof in self.autosync_queue
+                    if not prof.device_id.startswith("folder:") and not self._device_of(prof)]
+            for prof in gone:
+                self.autosync_queue.remove(prof)
+                self._autosync_waiting.discard(prof.id)
+                self.log.appendPlainText(f"— {prof.name}: device went away, autosync skipped —")
+        self._next_autosync()
+
+    def _device_of(self, profile):
+        for d in self.devices:
+            if d.id == profile.device_id:
+                return d
+        return None
+
+    def _autosync_ready(self, profile):
+        """Is the profile's target readable right now? The device is asked off-thread."""
+        if profile.device_id.startswith("folder:"):
+            return os.path.isdir(profile.device_id[len("folder:"):])
+        if self._device_of(profile) is None:
+            return False
+        return self._ready(profile.device_id)
+
+    def _ready(self, device_id):
+        """The last answer about a device, or False while a fresh one is on its way."""
+        cached = self._ready_cache.get(device_id)
+        if cached is not None and time.monotonic() - cached[1] < 6:
+            return cached[0]
+        devices = getattr(self.window(), "devices_tab", None)
+        if devices is not None:
+            state = devices.ready_state(device_id)
+            if state is not None:
+                self._ready_cache[device_id] = (state, time.monotonic())
+                return state
+        self._probe_ready(device_id)
+        return False
+
+    def _probe_ready(self, device_id):
+        """Ask a device whether it answers, on a worker: listing a mount blocks for as
+        long as a file transfer, so the GUI thread never does it."""
+        if not device_id:
+            return
+        if self._ready_in_flight:
+            return
+        if self.worker is not None and self.worker.isRunning():
+            return      # a task owns the device: it has no time for a second reader
+        cached = self._ready_cache.get(device_id)
+        if cached is not None and time.monotonic() - cached[1] < 6:
+            return
+        devices = getattr(self.window(), "devices_tab", None)
+        if devices is not None:
+            if devices.backend is not None and devices.backend.device.id == device_id:
+                # this tab is already reading it: that read answers the question
+                if devices.is_loading() or DEVICE_CLAIMS.held(devices.backend.device.root):
+                    return
+        device = next((d for d in self.devices if d.id == device_id), None)
+        if device is None:
+            return
+        self._ready_in_flight = device_id
+        worker = Worker(lambda _p, _l, _c: (device_id, device_ready(device)), self)
+        worker.done.connect(self._ready_probed)
+        worker.failed.connect(lambda _trace, d=device_id: self._ready_probed((d, False)))
+        self._ready_probe = worker
+        worker.start()
+
+    def _ready_probed(self, result):
+        device_id, ok = result
+        if self._ready_in_flight == device_id:
+            self._ready_in_flight = ""
+        self._ready_cache[device_id] = (bool(ok), time.monotonic())
+        self._refresh_device_status()
+        self._next_autosync()
+
+    def _notify(self, message):
+        win = self.window()
+        if win is not None and hasattr(win, "notify"):
+            win.notify(message)
+
+    def _next_autosync(self):
+        if self.worker and self.worker.isRunning():
+            return
+        waiting = False
+        while self.autosync_queue:
+            prof = self.autosync_queue[0]
+            if not self._autosync_ready(prof):
+                dev = self._device_of(prof)
+                waiting = True
+                if prof.id not in self._autosync_waiting:
+                    self._autosync_waiting.add(prof.id)
+                    name = dev.name if dev else "the device"
+                    self.log.appendPlainText(
+                        f"— Waiting for {name}: switch the phone to file transfer —")
+                    self._notify(f"Autosync {prof.name}: waiting for {name}")
+                    self.activity.emit(f"Waiting for {name}")
+                break
+            devices = getattr(self.window(), "devices_tab", None)
+            if devices is not None and devices.is_busy():
+                # The device tab is still copying from or to it: that read comes first,
+                # and this timer calls again when it has finished.
+                waiting = True
+                break
+            self.autosync_queue.pop(0)
+            self._autosync_waiting.discard(prof.id)
+            self.log.appendPlainText(f"— Autosync: {prof.name} —")
+            self._notify(f"Autosyncing {prof.name}…")
+            self.run(sync=True, profile=prof, auto=True)
+            return
+        if waiting:
+            if not self._autosync_timer.isActive():
+                self._autosync_timer.start()
+        else:
+            self._autosync_timer.stop()
+            self._autosync_waiting.clear()
+            self.activity.emit("")
+
+    # ---------- running ----------
+    def run(self, sync, profile=None, auto=False, reuse_plan=False, force_verify=False):
+        """Compare: build the list. Sync (reuse_plan): execute the list the user reviewed.
+        Compare+Sync (sync only): compare now, then execute. force_verify is the Verify
+        content button: a Fast hash compare that reads the device files instead of
+        trusting the manifest."""
+        p = profile or self.current()
+        if not p:
+            return
+        if self.worker and self.worker.isRunning():
+            return
+        p.audiobook_roots = list(self.config.get("audiobook_folders") or [])
+        devices = getattr(self.window(), "devices_tab", None)
+        if devices is not None and devices.is_busy():
+            if auto:
+                return      # the autosync timer tries again once the tab is free
+            QMessageBox.information(self, "Sync", "The device is busy reading or copying "
+                                    "files. Wait for that to finish, then start again.")
+            return
+        reviewed = None
+        if reuse_plan:
+            if self.plan is None or self.plan_profile != p.id:
+                QMessageBox.information(self, "Sync", "Press Compare first, review the list, "
+                                        "then press Sync. Compare+Sync does both in one step.")
+                return
+            reviewed = self.plan
+        if auto and not self._autosync_ready(p):
+            # the phone is mounted but not answering yet: retry from the queue
+            if p not in self.autosync_queue:
+                self.autosync_queue.insert(0, p)
+            self._next_autosync()
+            return
+        b = self._backend(p)
+        if not b:
+            QMessageBox.information(self, "Sync", "The device for this profile is not connected.")
+            return
+        if p.selection_mode == "selected":
+            if not profile_files(p, False):
+                QMessageBox.warning(self, "Sync", "No items are selected to sync. Choose "
+                                    "items, or switch back to Folder(s).")
+                return
+        else:
+            folders = profile_sources(p)
+            if not folders:
+                QMessageBox.warning(self, "Sync", "Add at least one folder to sync.")
+                return
+            missing = [f for f in folders if not os.path.isdir(f)]
+            if missing:
+                QMessageBox.warning(self, "Sync", "Folder not found:\n\n"
+                                    + "\n".join(missing))
+                return
+        if sync and not auto and p.mode == "mirror":
+            if p.selection_mode == "selected":
+                prompt = ("Mirror copies the selected items to the device and deletes "
+                          "items that are no longer selected that it synced before. "
+                          "Files this profile never wrote are left alone. Continue?")
+            else:
+                prompt = ("Mirror copies new or changed files to the device and deletes "
+                          "files that exist only there. Files whose content matches your "
+                          "library are kept where they are. Continue?")
+            if QMessageBox.question(self, "Mirror", prompt) != QMessageBox.Yes:
+                return
+        verify = self._verify_choice(p, auto, reuse_plan, force_verify)
+        self._verify_used = verify
+        if not reuse_plan:
+            self._verify_stats = {}
+        if p.method == "bytes" and getattr(b.device, "kind", "") == "mtp":
+            self.log.appendPlainText("— Bit-by-bit reads every file on the phone in full; "
+                                     "this can take a while —")
+
+        def job(prog, log, cancel):
+            # The device has one reader: wait for the library read the Devices tab had
+            # started to stop, instead of both of them queueing at the mount.
+            if devices is not None:
+                if devices.is_loading():
+                    log("Waiting for the device library read to stop…")
+                devices.wait_for_scan(cancel=cancel)
+            if reviewed is not None:
+                plan = reviewed  # Sync: execute exactly the list the user reviewed
+            else:
+                stats = {}
+                plan = compare(p, b, prog, cancel, verify, log, stats)
+                self._verify_stats = stats
+            if not sync or cancel():
+                return plan, None
+            return plan, execute(p, b, plan, prog, log, cancel)
+
+        # The device is this task's alone before the worker starts: the Devices tab
+        # stops reading it now and stays locked out until this run is done, failed or
+        # cancelled. A claim is on the path, so a profile pointed inside the mount locks
+        # the device row too.
+        reason = self._task_reason(p, sync, reuse_plan, force_verify, auto)
+        owner = ("sync", p.id, time.monotonic())
+        DEVICE_CLAIMS.claim(b.device.root, owner, reason)
+        self._claim_owner = owner
+        self._claim_root = b.device.root
+        self._sync_device_id = p.device_id
+        if devices is not None:
+            devices.busy_changed()
+        self.progress.setFormat("%p%")
+        self.progress.setMaximum(1)
+        self.progress.setValue(0)
+        self.worker = Worker(job, self)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.log.connect(self.log.appendPlainText)
+        self.worker.done.connect(lambda r: self._done(r, sync, p))
+        self.worker.failed.connect(lambda e: self._failed(e, sync, p))
+        for w in (self.compare_btn, self.sync_btn, self.both_btn, self.verify_btn):
+            w.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self._running_name = p.name
+        if force_verify:
+            self._set_busy("verify")
+        else:
+            self._set_busy("compare" if not sync else ("sync" if reuse_plan else "both"))
+        self.activity.emit(f"{p.name} 0%")
+        self.worker.start()
+
+    def _set_busy(self, kind):
+        """Blue for the task that is running, plain grey for everything else."""
+        self._active = kind
+        for key, button in (("compare", self.compare_btn), ("sync", self.sync_btn),
+                            ("both", self.both_btn), ("verify", self.verify_btn)):
+            button.setObjectName("Primary" if key == kind else "")
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def _on_progress(self, d, t, m):
+        sender = self.sender()
+        if sender is not None and sender is not self.worker:
+            return      # a finished worker's last ticks must not reset a finished bar
+        self.progress.setMaximum(max(t, 1))
+        self.progress.setValue(d)
+        self.status.setText(m)
+        pct = int(round(100 * d / t)) if t else 0
+        self.activity.emit(f"{getattr(self, '_running_name', 'Sync')} {pct}%")
+
+    def _idle(self):
+        self._sync_device_id = ""
+        for w in (self.compare_btn, self.sync_btn, self.both_btn):
+            w.setEnabled(True)
+        self._method_changed()  # re-enables Verify content only for a hash profile
+        self.cancel_btn.setEnabled(False)
+        self._set_busy(None)
+        self.activity.emit("")
+
+    def _done(self, result, sync, p):
+        stopped = bool(self.worker is not None and getattr(self.worker, "_cancel", False))
+        self._idle()
+        self._finish_progress(stopped)
+        plan, errors = result
+        verify = getattr(self, "_verify_used", False)
+        stats = getattr(self, "_verify_stats", {}) if verify else {}
+        files = int(stats.get("device_files") or 0)
+        read = int(stats.get("device_read") or 0)
+        unreadable = int(stats.get("device_unreadable") or 0)
+        matches = int(stats.get("matches") or 0)
+        self._show_plan(plan, p.method, verify)
+        # Say plainly how much the equal results were checked, never more than was done.
+        if p.method == "bytes":
+            self.status.setText("Bit-by-bit: every matched file was compared byte for byte.")
+        elif verify:
+            if files == 0:
+                self.status.setText(
+                    "Verify content: the device folder is empty — no file was read or "
+                    "hashed, so nothing was verified and the manifest was not rebuilt.")
+            elif unreadable:
+                self.status.setText(
+                    f"Verify content: read and hashed {read} of {files} file(s) from the "
+                    f"device; {unreadable} could not be read. The manifest records only "
+                    f"what was read.")
+            else:
+                self.status.setText(
+                    f"Verify content: read and hashed {files} file(s) from the device; "
+                    f"{matches} match the library exactly. The manifest now records "
+                    f"those hashes.")
+        else:
+            self.status.setText("Fast hash: equal files matched the cached manifest — not "
+                                "verified byte for byte.")
+        self._record_log(plan, p, sync, verify, errors)
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        for q in self.profiles:
+            if q.id == p.id:
+                if sync:
+                    q.last_sync = stamp
+                    q.last_sync_method = p.method
+                if not stopped and (p.method == "bytes"
+                                    or (verify and files and not unreadable)):
+                    # every device copy this pass looked at was read and checked
+                    q.last_verified = stamp
+        save_profiles(self.profiles)
+        if sync:
+            self.plan = None
+            msg = f"{p.name}: sync finished" + (f" with {errors} error(s)" if errors else "")
+            self.log.appendPlainText(msg)
+            self._notify(msg)
+        else:
+            self.plan = plan
+            self.plan_profile = p.id
+            self.plan_verify = verify
+            if verify:
+                if files == 0:
+                    detail = "the device folder is empty; nothing was read or hashed"
+                elif unreadable:
+                    detail = (f"read and hashed {read} of {files} file(s); "
+                              f"{unreadable} could not be read")
+                else:
+                    detail = (f"read and hashed {files} file(s); "
+                              f"{matches} match the library exactly")
+                self.log.appendPlainText(f"— Verify content: {detail}; "
+                                         f"the manifest records what was read —")
+        devices = getattr(self.window(), "devices_tab", None)
+        self._release_device()
+        self._refresh_device_status()
+        self._next_autosync()   # a queued autosync claims the device again in run()
+        if devices is not None:
+            devices.busy_changed()
+
+    def _failed(self, trace, sync, p):
+        self._idle()
+        self._finish_progress(failed=True)
+        self.log.appendPlainText(trace)
+        devices = getattr(self.window(), "devices_tab", None)
+        self._release_device()
+        self._refresh_device_status()
+        self._next_autosync()
+        if devices is not None:
+            devices.busy_changed()
+        last = trace.strip().splitlines()[-1] if trace.strip() else "unknown error"
+        QMessageBox.warning(self, "Sync failed", last)
+
+    def _task_reason(self, p, sync, reuse_plan, force_verify, auto):
+        """What to say while this task owns the device, in the Devices tab and here."""
+        name = p.name or p.device_id
+        if force_verify:
+            return f"Verifying content on {name}\u2026"
+        if auto:
+            return f"Autosyncing {name}\u2026"
+        if sync:
+            return f"Syncing {name}\u2026"
+        return f"Comparing {name}\u2026"
+
+    def _release_device(self):
+        """Give the device back: the Devices tab reads it again from its own claim check."""
+        if self._claim_owner is not None:
+            DEVICE_CLAIMS.release(self._claim_owner)
+        self._claim_owner = None
+        self._claim_root = ""
+        self._sync_device_id = ""
+
+    def _finish_progress(self, stopped=False, failed=False):
+        """End the bar on a word, not on 0% when every file was already equal."""
+        if failed:
+            self.progress.setMaximum(100)
+            self.progress.setValue(100)
+            self.progress.setFormat("Failed")
+            return
+        if stopped:
+            self.progress.setFormat("Stopped")
+            return
+        self.progress.setMaximum(100)
+        self.progress.setValue(100)
+        self.progress.setFormat("Done")
+
+    def _verify_choice(self, p, auto=False, reuse_plan=False, force=False):
+        """Whether this run should read the device copies in full.
+
+        Verification only means something for Fast hash: bit-by-bit already reads both
+        copies, so the button is hidden there. Autosync never forces it, so it stays
+        quick. A plan that is executed again (Sync after Compare) keeps the level it was
+        compared with, so the status line can't claim a verification that never happened.
+        """
+        if reuse_plan:
+            return bool(self.plan_verify)
+        return bool(force) and p.method == "hash" and not p.transcode and not auto
+
+    def _plan_summary(self, plan, method="bytes", verify=False):
+        """One line of counts, for the summary above the list and for the log."""
+        counts = {}
+        extras = 0
+        for a in plan:
+            counts[a.kind] = counts.get(a.kind, 0) + 1
+            if a.extra:
+                extras += 1
+        # A device file the library does not claim is not an "equal" file, even when it
+        # was adopted: it is an extra the scan found.
+        equal = sum(1 for a in plan if a.kind == "equal" and not a.extra)
+        if method == "hash":
+            equal_label = (f"Equal {equal} (content-verified)" if verify
+                           else f"Equal {equal} (cached, unverified)")
+        else:
+            equal_label = f"Equal {equal} (byte-verified)"
+        # Only the counts that are not zero, so the verification wording at the end is
+        # not pushed out of the label by a row of noughts.
+        parts = [f"{label} {counts[k]}" for k, label in (("new", "New"), ("restore", "Restored"),
+                                                         ("changed", "Changed"),
+                                                         ("delete", "Delete")) if counts.get(k)]
+        if extras:
+            parts.append(f"Extra {extras}")
+        parts.append(equal_label)
+        return " · ".join(parts)
+
+    def _record_log(self, plan, profile, sync, verify, errors):
+        """Keep one finished run: when, what it was, the counts and the file lines."""
+        counts = {}
+        files = []
+        for a in plan:
+            counts[a.kind] = counts.get(a.kind, 0) + 1
+            if a.kind != "equal":
+                files.append([a.kind, a.rel, int(a.size or 0)])
+        entry = {
+            "time": time.strftime("%Y-%m-%d %H:%M"),
+            "kind": "sync" if sync else ("verify" if verify else "compare"),
+            "summary": self._plan_summary(plan, profile.method, verify),
+            "counts": counts,
+            "errors": int(errors or 0),
+            "method": profile.method,
+            "verified": bool(verify or profile.method == "bytes"),
+            "files": files[:500],
+        }
+        log_sync_run(profile, entry, self._log_keep())
+
+    def _show_plan(self, plan, method="bytes", verify=False):
+        """Draw the plan in titled groups, so a big list says what changed at a glance."""
+        self.table.setRowCount(0)
+        self.table.clearSpans()
+        groups = (("new", "New files"),
+                  ("restore", "Missing on the device — copied back"),
+                  ("changed", "Changed — updated on the device"),
+                  ("delete", "Only on the device — removed by Mirror"))
+        shown = 0
+        for kind, title in groups:
+            rows = sorted((a for a in plan if a.kind == kind), key=lambda a: a.rel.lower())
+            if not rows:
+                continue
+            size = sum(a.size for a in rows)
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            head = QTableWidgetItem(f"{title}  ·  {len(rows)} file(s)  ·  "
+                                    f"{size / 1048576:.1f} MB")
+            head.setForeground(QBrush(QColor(COLORS[kind])))
+            font = head.font()
+            font.setBold(True)
+            head.setFont(font)
+            head.setBackground(QBrush(QColor(HOVER)))
+            head.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table.setItem(r, 0, head)
+            self.table.setSpan(r, 0, 1, 3)
+            self.table.setRowHeight(r, 30)
+            for a in rows:
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                label = {"new": "＋ copy new", "restore": "↺ restore missing",
+                         "changed": "✎ update", "delete": "✕ delete"}[a.kind]
+                for c, value in enumerate((label, a.rel, f"{a.size / 1048576:.1f} MB")):
+                    item = QTableWidgetItem(value)
+                    if c == 0:
+                        item.setForeground(QBrush(QColor(COLORS[a.kind])))
+                    if c == 2:
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                              | Qt.AlignmentFlag.AlignVCenter)
+                    self.table.setItem(r, c, item)
+                shown += 1
+        if not shown:
+            self.table.insertRow(0)
+            item = QTableWidgetItem("Nothing to change — the device already matches this "
+                                    "profile's library.")
+            item.setForeground(QBrush(QColor(MUTED)))
+            self.table.setItem(0, 0, item)
+            self.table.setSpan(0, 0, 1, 3)
+            self.table.setRowHeight(0, 34)
+        self.summary.setText(self._plan_summary(plan, method, verify))
+# ======================================================================
+# main.py
+# ======================================================================
+
+
+def natural_sort_key(text):
+    """Sort key that puts 'Chapter 2' before 'Chapter 10'."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def audiobook_books(folders):
+    """Group the audio under the audiobook folders: each folder that holds audio is one book.
+
+    Returns (title, [paths]) pairs sorted by title; tracks are in natural order.
+    """
+    found = {}
+    for top in folders:
+        if not os.path.isdir(top):
+            continue
+        for dirpath, _dirs, files in os.walk(top):
+            tracks = [os.path.join(dirpath, name) for name in files if is_audiobook(name)]
+            if tracks:
+                found.setdefault(dirpath, []).extend(tracks)
+    roots = {os.path.normpath(f) for f in folders}
+    books = []
+    loose = []
+    for dirpath, tracks in found.items():
+        tracks.sort(key=lambda p: natural_sort_key(os.path.basename(p)))
+        if os.path.normpath(dirpath) in roots:
+            # a file dropped straight into the audiobook folder is a title of its own
+            loose.extend(tracks)
+        else:
+            books.append((os.path.basename(dirpath) or dirpath, tracks))
+    for path in loose:
+        title = read_tags(path).get("title") or os.path.splitext(os.path.basename(path))[0]
+        books.append((title, [path]))
+    books.sort(key=lambda book: natural_sort_key(book[0]))
+    return books
+
+
+def _mp4_box(f, start, end, wanted):
+    """Find a top-level box in an MP4 file; returns (body start, box end) or None."""
+    pos = start
+    while pos + 8 <= end:
+        f.seek(pos)
+        head = f.read(8)
+        if len(head) < 8:
+            break
+        size = int.from_bytes(head[:4], "big")
+        kind = head[4:8]
+        header = 8
+        if size == 1:
+            size = int.from_bytes(f.read(8), "big")
+            header = 16
+        if size < header:
+            break
+        if kind in wanted:
+            return pos + header, pos + size
+        pos += size
+    return None
+
+
+def _chpl_payload_count(payload):
+    """Count the entries in a chpl atom body.
+
+    The spec puts a reserved 4-byte field before the count, but files written by
+    older tools leave it out, so both layouts are tried.
+    """
+    for start in (9, 5):
+        if len(payload) < start:
+            continue
+        count = payload[start - 1]
+        pos = start
+        for _ in range(count):
+            if pos + 9 > len(payload):
+                pos = -1
+                break
+            pos += 9 + payload[pos + 8]
+        if pos == len(payload):
+            return count
+    return 0
+
+
+def m4b_chapter_count(path):
+    """Chapter count from an .m4b/.m4a chapter atom, or 0 when it has none."""
+    if os.path.splitext(path)[1].lower() not in (".m4b", ".m4a", ".mp4"):
+        return 0
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            moov = _mp4_box(f, 0, size, {b"moov"})
+            if moov is None:
+                return 0
+            udta = _mp4_box(f, moov[0], moov[1], {b"udta"})
+            if udta is None:
+                return 0
+            chpl = _mp4_box(f, udta[0], udta[1], {b"chpl"})
+            if chpl is None:
+                return 0
+            f.seek(chpl[0])
+            return _chpl_payload_count(f.read(max(0, chpl[1] - chpl[0])))
+    except OSError:
+        return 0
+
+
+def audiobook_details(paths, cache=None):
+    """Author, chapter count, length and cover for one book.
+
+    A single .m4b carries its chapters inside the file; otherwise every audio file
+    is one chapter. Returns (artist, chapters, total, lengths, cover) where lengths
+    runs alongside paths, so the caller need not read the tags again. cache is an
+    optional {path: ((size, mtime_ns), details)} mapping: opening the Audiobooks tab
+    again must not read every chapter's tags when none of the files changed.
+    """
+    artist = ""
+    lengths = []
+    chapters = 0
+    cover = None
+    for index, path in enumerate(paths):
+        info = None
+        stamp = None
+        try:
+            st = os.stat(path)
+            stamp = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            pass
+        key = os.path.abspath(path)
+        if cache is not None and stamp is not None:
+            hit = cache.get(key)
+            if hit and hit[0] == stamp:
+                info = hit[1]
+        if index == 0:
+            # Read the cover even when the tag cache already has the track's
+            # details: a folder cover can be added or replaced without changing a
+            # chapter's size or timestamp.
+            cover = read_cover(path)
+        if info is None:
+            tags = read_tags(path)
+            info = {"artist": tags.get("albumartist") or tags.get("artist") or "",
+                    "length": float(tags.get("length") or 0),
+                    "chapters": m4b_chapter_count(path) if len(paths) == 1 else 0}
+            if cache is not None and stamp is not None:
+                cache[key] = (stamp, info)
+        if not artist:
+            artist = info.get("artist") or ""
+        lengths.append(float(info.get("length") or 0))
+        if len(paths) == 1:
+            chapters = int(info.get("chapters") or 0)
+    return artist, chapters or len(paths), sum(lengths), lengths, cover
+
+
+def audiobook_default_folder():
+    return os.path.join(os.path.expanduser("~"), "Music", "Nebula - Audiobooks")
+
+
+def unique_path(path):
+    """A free filename beside path: 'Book.m4b' becomes 'Book (2).m4b'."""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    number = 2
+    while os.path.exists(f"{stem} ({number}){ext}"):
+        number += 1
+    return f"{stem} ({number}){ext}"
+
+
+def _path_is_below(path, folder):
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(folder)]) \
+            == os.path.abspath(folder)
+    except (OSError, ValueError):
+        return False
+
+
+def media_kind_for_path(path, config):
+    """Which device destination a file or folder belongs to."""
+    if os.path.splitext(str(path or ""))[1].lower() == ".m4b":
+        return "audiobook"
+    folders = config.get("audiobook_folders") or []
+    if any(isinstance(folder, str) and _path_is_below(path, folder) for folder in folders):
+        return "audiobook"
+    parts = [part.lower() for part in re.split(r"[/\\]+", str(path or "")) if part]
+    if any("podcast" in part for part in parts):
+        return "podcast"
+    if any("audiobook" in part for part in parts):
+        return "audiobook"
+    return "music"
+
+
+def default_device_folder(config, path=""):
+    """The configured relative folder on a device for this kind of audio."""
+    key = {"audiobook": "device_audiobook_folder",
+           "podcast": "device_podcast_folder",
+           "music": "device_music_folder"}.get(media_kind_for_path(path, config),
+                                               "device_music_folder")
+    defaults = {"device_music_folder": "Music/Artists",
+                "device_audiobook_folder": "Audiobooks",
+                "device_podcast_folder": "Music/Podcasts"}
+    value = str(config.get(key, defaults[key]) or defaults[key]).strip()
+    return value.strip("/")
+
+
+def default_device_folder_for_paths(config, paths):
+    for path in paths or []:
+        if path:
+            return default_device_folder(config, path)
+    return default_device_folder(config, "")
+
+
+def copy_device_rel(path, config):
+    """The relative path to keep when copying one file to a device.
+
+    Audiobooks keep their book/chapter tree under the Audiobooks root. Podcasts keep
+    their show/file tree under Music/Podcasts, without repeating a Podcasts folder
+    that is already in the library path.
+    """
+    kind = media_kind_for_path(path, config)
+    libraries = list(config.get("library_folders") or [])
+    books = list(config.get("audiobook_folders") or [])
+    if kind == "audiobook":
+        folders = books + libraries
+    elif kind == "podcast":
+        folders = libraries + books
+    else:
+        folders = libraries
+    rel = library_rel(path, folders)
+    if kind == "podcast":
+        parts = rel.split("/")
+        if len(parts) > 1 and "podcast" in parts[0].lower():
+            rel = "/".join(parts[1:])
+    return rel
+
+
+def grid_layout(config, key):
+    layouts = config.get("grid_layouts")
+    if not isinstance(layouts, dict):
+        layouts = {}
+        config["grid_layouts"] = layouts
+    layout = layouts.get(key)
+    return layout if isinstance(layout, dict) else {}
+
+
+def apply_grid_order(tree, layout):
+    header = tree.header()
+    count = header.count()
+    order = layout.get("order")
+    if not isinstance(order, list) or len(order) != count:
+        return
+    for visual, logical in enumerate(order):
+        if isinstance(logical, int) and 0 <= logical < count:
+            header.moveSection(header.visualIndex(logical), visual)
+
+
+def bind_grid_layout(tree, config, key, remember_widths=True):
+    """Let a grid's columns be dragged around and keep that layout for next time."""
+    header = tree.header()
+    header.setSectionsMovable(True)
+    header.setSectionsClickable(True)
+    tree._grid_busy = True
+    layout = grid_layout(config, key)
+    apply_grid_order(tree, layout)
+    if remember_widths:
+        for index, width in enumerate(layout.get("widths") or []):
+            try:
+                width = int(width)
+            except (TypeError, ValueError):
+                continue
+            if index < header.count() and width > 30:
+                tree.setColumnWidth(index, width)
+    tree._grid_busy = False
+
+    timer = QTimer(tree)
+    timer.setSingleShot(True)
+    timer.setInterval(400)
+
+    def store():
+        layouts = config.get("grid_layouts")
+        if not isinstance(layouts, dict):
+            layouts = {}
+            config["grid_layouts"] = layouts
+        layouts[key] = {"order": [header.logicalIndex(v) for v in range(header.count())],
+                        "widths": [tree.columnWidth(i) for i in range(header.count())]}
+        save_config(config)
+
+    def schedule(*_args):
+        if not getattr(tree, "_grid_busy", False):
+            timer.start()
+
+    timer.timeout.connect(store)
+    tree._grid_store = store
+    tree._grid_reapply = lambda: apply_grid_order(tree, grid_layout(config, key))
+    header.sectionMoved.connect(schedule)
+    header.sectionResized.connect(schedule)
+
+
+class AudiobooksTab(QWidget):
+    """Audiobooks, kept apart from the music library.
+
+    Each folder that holds audio is one title, with its chapters in natural order; a
+    file dropped straight into an audiobook folder is a title of its own. Double-click
+    a title or a chapter to play. Import moves files in from anywhere.
+    """
+
+    def __init__(self, player, config, parent=None):
+        super().__init__(parent)
+        self.player = player
+        self.config = config
+        self._book_paths = {}
+        self.setObjectName("Panel")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+        head = QHBoxLayout()
+        title = QLabel("Audiobooks")
+        title.setObjectName("Heading")
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("Muted")
+        self.import_btn = QPushButton("Import…")
+        self.import_btn.setToolTip("Move audiobooks into your audiobook folder")
+        self.import_btn.clicked.connect(
+            lambda _checked=False: self.import_audio(background=True))
+        self.folder_btn = QPushButton("Import folder…")
+        self.folder_btn.setToolTip("Move a whole book folder, or a folder of book folders, "
+                                   "into your audiobook folder")
+        self.folder_btn.clicked.connect(
+            lambda _checked=False: self.import_folder(background=True))
+        self.import_progress = QProgressBar()
+        self.import_progress.setRange(0, 100)
+        self.import_progress.setValue(0)
+        self.import_progress.setFixedWidth(190)
+        self.import_progress.setTextVisible(True)
+        self.import_progress.setFormat("Importing audiobook %p%")
+        self.import_progress.setToolTip("The import runs in the background; this shows its progress")
+        self.import_progress.hide()
+        self._import_worker = None
+        self._refresh_worker = None
+        self._refresh_again = False
+        self._shutting_down = False
+        self._progress_prefix = "Importing audiobook"
+        head.addWidget(title)
+        head.addWidget(self.count_label)
+        head.addWidget(self.import_progress)
+        head.addStretch(1)
+        head.addWidget(self.import_btn)
+        head.addWidget(self.folder_btn)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["", "Title", "Author", "Chapters", "Length"])
+        self.tree.setColumnWidth(0, 64)
+        self.tree.setColumnWidth(1, 320)
+        self.tree.setColumnWidth(2, 220)
+        self.tree.setColumnWidth(3, 90)
+        self.tree.setColumnWidth(4, 110)
+        self.tree.setIconSize(QSize(52, 52))
+        self.tree.setAlternatingRowColors(True)
+        self.tree.itemDoubleClicked.connect(self._play_item)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
+        self.tree.setToolTip("Click a column heading to sort by it; double-click a title "
+                             "or chapter to play; right-click to play or add to queue")
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search titles, authors or chapters")
+        self.search.setClearButtonEnabled(True)
+        self.search.setToolTip("Type part of a title, author or chapter name")
+        self.search.textChanged.connect(self._search_changed)
+        self._books = []
+        self._books_signature = None
+        self._detail_cache = {}
+        self._cover_pix_cache = {}
+        self._sort_column = None
+        self._sort_desc = False
+        self.tree.header().setSortIndicatorShown(False)
+        self.tree.header().sectionClicked.connect(self._sort_by)
+        self._migrate_grid_layout(config)
+        bind_grid_layout(self.tree, config, "audiobooks")
+        lay.addLayout(head)
+        search_row = QHBoxLayout()
+        search_row.addWidget(self.search)
+        lay.addLayout(search_row)
+        lay.addWidget(self.tree, 1)
+        self.refresh()
+
+    @staticmethod
+    def _migrate_grid_layout(config):
+        """A 1.16 layout had four columns; put the new cover column in front."""
+        layouts = config.get("grid_layouts")
+        if not isinstance(layouts, dict):
+            return
+        layout = layouts.get("audiobooks")
+        if not isinstance(layout, dict):
+            return
+        order = layout.get("order")
+        if (not isinstance(order, list) or len(order) != 4
+                or not all(isinstance(index, int) and 0 <= index < 4 for index in order)):
+            return
+        layout = dict(layout)
+        layout["order"] = [0] + [index + 1 for index in order]
+        widths = layout.get("widths")
+        if isinstance(widths, list) and len(widths) == 4:
+            layout["widths"] = [64] + widths
+        layouts["audiobooks"] = layout
+
+    def _search_changed(self, _text):
+        self._render_books()
+
+    def showEvent(self, event):
+        # pick up files added or removed in the folders since the tab was last shown.
+        # refresh() skips unchanged books, so this is cheap once the tab is warm.
+        self.refresh()
+        super().showEvent(event)
+
+    def _folders(self):
+        return [f for f in self.config.get("audiobook_folders") or [] if isinstance(f, str)]
+
+    def _target_folder(self):
+        target = str(self.config.get("audiobook_import_target") or "").strip()
+        if target:
+            return target
+        folders = self._folders()
+        return folders[0] if folders else audiobook_default_folder()
+
+    def _prepare_target(self):
+        """The import folder, created and registered as an audiobook folder if new."""
+        target = self._target_folder()
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "Import", f"Could not use {target}:\n{exc}")
+            return ""
+        folders = self._folders()
+        if target not in folders:
+            folders.append(target)
+            self.config["audiobook_folders"] = folders
+        self.config["audiobook_import_target"] = target
+        save_config(self.config)
+        return target
+
+    @staticmethod
+    def _scan_signature(folders, books):
+        """What the tab needs to know before re-reading any tags: paths and file stamps."""
+        rows = []
+        for name, paths in books:
+            stamps = []
+            for path in paths:
+                try:
+                    st = os.stat(path)
+                    stamps.append((path, st.st_size, st.st_mtime_ns))
+                except OSError:
+                    stamps.append((path, -1, -1))
+            rows.append((name, tuple(stamps)))
+        return (tuple(folders), tuple(rows))
+
+    def refresh(self, force=False):
+        """Rebuild the list, but do not re-read tags for an unchanged scan.
+
+        showEvent calls this every time the tab is opened. Walking the folders and
+        stat-ing the chapter files is cheap; pulling artwork and audio properties out of
+        every file is not, so that work is skipped until a path or its stamp changes.
+        """
+        folders = self._folders()
+        books = list(audiobook_books(folders))
+        signature = self._scan_signature(folders, books)
+        if not force and signature == self._books_signature:
+            return
+        self._books = []
+        self._cover_pix_cache = {}
+        for name, paths in books:
+            artist, chapters, total, lengths, cover = audiobook_details(
+                paths, self._detail_cache)
+            self._books.append((name, paths, artist, chapters, total, lengths, cover))
+        self._render_books()
+        self._books_signature = signature
+
+    @staticmethod
+    def _book_sort_key(book, column):
+        name, _paths, artist, chapters, total, _lengths, _cover = book
+        if column == 2:
+            return natural_sort_key(artist or "")
+        if column == 3:
+            return chapters
+        if column == 4:
+            return total
+        return natural_sort_key(name)
+
+    def _cover_pixmap(self, paths, cover):
+        if not cover:
+            return None
+        key = paths[0] if paths else ""
+        if key in self._cover_pix_cache:
+            return self._cover_pix_cache[key]
+        pixmap = QPixmap()
+        if pixmap.loadFromData(cover):
+            pixmap = pixmap.scaled(52, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        else:
+            pixmap = None
+        self._cover_pix_cache[key] = pixmap
+        return pixmap
+
+    def _render_books(self):
+        self.tree.clear()
+        self._book_paths = {}
+        books = list(self._books)
+        if self._sort_column is not None:
+            books.sort(key=lambda book: self._book_sort_key(book, self._sort_column),
+                       reverse=self._sort_desc)
+        query = self.search.text().strip().casefold()
+        shown = 0
+        for number, (name, paths, artist, chapters, total, lengths, cover) in enumerate(books):
+            haystack = " ".join([name, artist] + [os.path.basename(path) for path in paths])
+            if query and query not in haystack.casefold():
+                continue
+            item = QTreeWidgetItem(self.tree, ["", name, artist, str(chapters),
+                                               fmt_time(total)])
+            item.setData(0, Qt.UserRole, number)
+            item.setSizeHint(0, QSize(64, 60))
+            pixmap = self._cover_pixmap(paths, cover)
+            if pixmap is not None:
+                item.setIcon(0, QIcon(pixmap))
+            self._book_paths[number] = paths
+            for path, length in zip(paths, lengths):
+                QTreeWidgetItem(item, ["", os.path.basename(path), "", "",
+                                       fmt_time(length)])
+            shown += 1
+        count = len(self._books)
+        if query:
+            self.count_label.setText(
+                f"{shown} of {count} title{'s' if count != 1 else ''}")
+        else:
+            self.count_label.setText(f"{count} title{'s' if count != 1 else ''}")
+
+    def _sort_by(self, column):
+        """Sort the titles by the clicked heading, the way the library grid does."""
+        if column not in (1, 2, 3, 4):
+            return
+        if self._sort_column == column:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_column = column
+            self._sort_desc = False
+        order = Qt.DescendingOrder if self._sort_desc else Qt.AscendingOrder
+        self.tree.header().setSortIndicator(column, order)
+        self.tree.header().setSortIndicatorShown(True)
+        self._render_books()
+
+    def add_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Add audiobook folder", os.path.expanduser("~"),
+            options=DIRECTORY_DIALOG_OPTIONS)
+        folders = self._folders()
+        if folder and folder not in folders:
+            folders.append(folder)
+            self.config["audiobook_folders"] = folders
+            save_config(self.config)
+            self.refresh_async(force=True)
+
+    def remove_folder(self):
+        folders = self._folders()
+        if not folders:
+            return
+        folder, ok = QInputDialog.getItem(self, "Remove audiobook folder",
+                                          "Folder (its files stay on disk):", folders, 0, False)
+        if not ok or folder not in folders:
+            return
+        folders.remove(folder)
+        self.config["audiobook_folders"] = folders
+        if self.config.get("audiobook_import_target") == folder:
+            self.config["audiobook_import_target"] = folders[0] if folders else ""
+        save_config(self.config)
+        self.refresh_async(force=True)
+
+    def import_audio(self, background=True):
+        target = self._prepare_target()
+        if not target:
+            return
+        start = self.config.get("audiobook_import_last") or os.path.dirname(target)
+        files, _selected = QFileDialog.getOpenFileNames(
+            self, f"Import into {os.path.basename(target) or target}", start,
+            AUDIOBOOK_IMPORT_FILTER, options=FILE_DIALOG_OPTIONS)
+        if not files:
+            return
+        self.config["audiobook_import_last"] = os.path.dirname(files[0])
+        save_config(self.config)
+
+        def job(progress, _log, cancel):
+            failed, moved = [], 0
+            total = max(1, len(files))
+            for index, src in enumerate(files, 1):
+                if cancel():
+                    failed.append("Import cancelled")
+                    break
+                progress(index - 1, total, os.path.basename(src))
+                try:
+                    shutil.move(src, unique_path(os.path.join(target,
+                                                              os.path.basename(src))))
+                    moved += 1
+                except OSError as exc:
+                    failed.append(f"{os.path.basename(src)}: {exc}")
+            progress(total, total, "")
+            return {"moved": moved, "failed": failed}
+
+        if not background:
+            result = job(lambda *_args: None, None, lambda: False)
+            self._audio_result(result, refresh_sync=True)
+            return result
+        return self._start_import(job, self._audio_result, "Importing audiobooks")
+
+    def import_folder(self, background=True):
+        """Move a book folder, or a folder of book folders, into the import target."""
+        target = self._prepare_target()
+        if not target:
+            return
+        start = self.config.get("audiobook_import_last") or os.path.dirname(target)
+        folder = QFileDialog.getExistingDirectory(
+            self, f"Import into {os.path.basename(target) or target}", start,
+            options=DIRECTORY_DIALOG_OPTIONS)
+        if not folder:
+            return
+        try:
+            inside = os.path.commonpath([os.path.abspath(folder), os.path.abspath(target)])
+        except ValueError:
+            inside = ""
+        if inside == os.path.abspath(folder):
+            QMessageBox.warning(self, "Import folder",
+                                "Choose a folder outside the audiobook folder it is being "
+                                "imported into.")
+            return
+        self.config["audiobook_import_last"] = os.path.dirname(folder)
+        save_config(self.config)
+
+        def job(progress, _log, cancel):
+            direct = any(os.path.isfile(os.path.join(folder, name)) and is_audiobook(name)
+                         for name in os.listdir(folder))
+            if direct:
+                books = [folder]
+            else:
+                books = []
+                for name in sorted(os.listdir(folder)):
+                    child = os.path.join(folder, name)
+                    if not os.path.isdir(child):
+                        continue
+                    if any(is_audiobook(f) for _root, _dirs, files in os.walk(child)
+                           for f in files):
+                        books.append(child)
+                if not books:
+                    books = [folder]
+            failed, moved = [], 0
+            total = max(1, len(books))
+            for index, src in enumerate(books, 1):
+                if cancel():
+                    failed.append("Import cancelled")
+                    break
+                progress(index - 1, total, os.path.basename(src))
+                dest = unique_path(os.path.join(target, os.path.basename(src)))
+                if os.path.abspath(dest) == os.path.abspath(src):
+                    continue
+                try:
+                    shutil.move(src, dest)
+                    moved += 1
+                except OSError as exc:
+                    failed.append(f"{os.path.basename(src)}: {exc}")
+            progress(total, total, "")
+            return {"moved": moved, "failed": failed}
+
+        if not background:
+            result = job(lambda *_args: None, None, lambda: False)
+            self._folder_result(result, refresh_sync=True)
+            return result
+        return self._start_import(job, self._folder_result, "Moving audiobooks")
+
+    def _audio_result(self, result, refresh_sync=False):
+        result = result if isinstance(result, dict) else {}
+        if refresh_sync:
+            self.refresh()
+        else:
+            self.refresh_async(force=True)
+        failed = result.get("failed") or []
+        if failed:
+            QMessageBox.warning(self, "Import", "These files could not be imported:\n\n"
+                                + "\n".join(failed))
+        elif result.get("moved"):
+            notice = getattr(self.window(), "notify", None)
+            if notice:
+                notice(f"Imported {result['moved']} audiobook "
+                       f"file{'s' if result['moved'] != 1 else ''}")
+
+    def _folder_result(self, result, refresh_sync=False):
+        result = result if isinstance(result, dict) else {}
+        if refresh_sync:
+            self.refresh()
+        else:
+            self.refresh_async(force=True)
+        failed = result.get("failed") or []
+        if failed:
+            QMessageBox.warning(self, "Import folder", "These folders could not be imported:\n\n"
+                                + "\n".join(failed))
+        elif result.get("moved"):
+            notice = getattr(self.window(), "notify", None)
+            if notice:
+                notice(f"Imported {result['moved']} audiobook "
+                       f"folder{'s' if result['moved'] != 1 else ''}")
+
+    def _start_import(self, job, on_done, prefix):
+        """Run one audiobook import in a worker; the window stays live."""
+        if self._import_worker is not None and self._import_worker.isRunning():
+            self.window().notify("An import is already running")
+            return False
+        self._progress_prefix = prefix
+        self.import_progress.setRange(0, 100)
+        self.import_progress.setValue(0)
+        self.import_progress.setFormat(f"{prefix} %p%")
+        self.import_progress.show()
+        for button in (self.import_btn, self.folder_btn):
+            button.setEnabled(False)
+        worker = Worker(job, self)
+        self._import_worker = worker
+        worker.progress.connect(self._import_progress)
+        worker.done.connect(on_done)
+        worker.failed.connect(self._import_failed)
+        worker.finished.connect(self._import_finished)
+        worker.start()
+        return True
+
+    def _import_progress(self, done, total, _message):
+        total = max(1, int(total))
+        self.import_progress.setRange(0, total)
+        self.import_progress.setValue(min(max(0, int(done)), total))
+        self.import_progress.setFormat(f"{self._progress_prefix} %p%")
+
+    def _import_failed(self, trace):
+        last = trace.strip().splitlines()[-1] if trace.strip() else "unknown error"
+        QMessageBox.warning(self, "Import", f"The import failed:\n{last}")
+
+    def _import_finished(self):
+        worker, self._import_worker = self._import_worker, None
+        for button in (self.import_btn, self.folder_btn):
+            button.setEnabled(True)
+        self.import_progress.hide()
+        if worker is not None:
+            worker.deleteLater()
+
+    def refresh_async(self, force=False):
+        """Walk the audiobook folders and read tags in a worker, then redraw."""
+        if self._shutting_down:
+            return
+        if self._refresh_worker is not None and self._refresh_worker.isRunning():
+            self._refresh_again = True
+            return
+        folders = self._folders()
+        cache = dict(self._detail_cache)
+
+        def job(progress, _log, cancel):
+            books = list(audiobook_books(folders))
+            signature = self._scan_signature(folders, books)
+            details = []
+            total = max(1, len(books))
+            for index, (name, paths) in enumerate(books):
+                if cancel():
+                    return None
+                details.append((name, paths, audiobook_details(paths, cache)))
+                progress(index + 1, total, name)
+            return {"books": books, "signature": signature,
+                    "details": details, "cache": cache}
+
+        worker = Worker(job, self)
+        self._refresh_worker = worker
+        worker.done.connect(lambda result, f=force: self._refresh_async_done(result, f))
+        worker.failed.connect(self._refresh_async_failed)
+        worker.finished.connect(self._refresh_async_finished)
+        worker.start()
+
+    def _refresh_async_done(self, result, force=False):
+        if not isinstance(result, dict):
+            return
+        if not force and result.get("signature") == self._books_signature:
+            return
+        self._detail_cache.update(result.get("cache") or {})
+        self._books = []
+        for name, paths, details in result.get("details") or []:
+            artist, chapters, total, lengths, cover = details
+            self._books.append((name, paths, artist, chapters, total, lengths, cover))
+        self._books_signature = result.get("signature")
+        self._cover_pix_cache = {}
+        self._render_books()
+
+    def _refresh_async_failed(self, _trace):
+        # a background refresh must never take over the window
+        pass
+
+    def _refresh_async_finished(self):
+        worker, self._refresh_worker = self._refresh_worker, None
+        if worker is not None:
+            worker.deleteLater()
+        if self._refresh_again and not self._shutting_down:
+            self._refresh_again = False
+            self.refresh_async(force=True)
+
+    def shutdown(self):
+        """Stop background reads before the window and its QThreads go away."""
+        self._shutting_down = True
+        for worker in (self._import_worker, self._refresh_worker):
+            if worker is None or not worker.isRunning():
+                continue
+            worker.cancel()
+            worker.wait(15000)
+
+    def _play_item(self, item, _column=0):
+        """A book plays from its first track; a track plays its book from that track on."""
+        book = item.parent() or item
+        start = book.indexOfChild(item) if item.parent() else 0
+        paths = self._book_paths.get(book.data(0, Qt.UserRole))
+        if paths:
+            self.player.set_queue(paths, start=start, play=True)
+
+    def _queue_item(self, item):
+        """Queue a whole book, or the chapter that was right-clicked."""
+        if item is None:
+            return
+        book = item.parent() or item
+        paths = self._book_paths.get(book.data(0, Qt.UserRole))
+        if not paths:
+            return
+        if item.parent() is None:
+            chosen = list(paths)
+        else:
+            index = book.indexOfChild(item)
+            chosen = [paths[index]] if 0 <= index < len(paths) else []
+        if not chosen:
+            return
+        self.player.add_paths(chosen, play_if_idle=False)
+        notice = getattr(self.window(), "notify", None)
+        if notice:
+            notice(f"Added {len(chosen)} chapter{'s' if len(chosen) != 1 else ''} to the queue")
+
+    def _tree_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("Play", lambda: self._play_item(item))
+        menu.addAction("Add to queue", lambda: self._queue_item(item))
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_SHORT} {VERSION}")
+        self.setWindowIcon(QIcon(ICON_FILE))
+        self.config = load_config()
+        migrate_collections(self.config)
+        apply_theme(QApplication.instance(), self.config)
+        w, h = self.config.get("window") or [1360, 860]
+        self.resize(int(w), int(h))
+        self.library = Library(active_collection(self.config)["db"])
+        self.playlists = PlaylistStore(lambda: self.config["library_folders"])
+        self.smart = SmartStore(self.library)
+        self.player = PlayerBar(self.config, on_play=self.library.play_count)
+        self.player.on_skip = self.library.increment_skip
+        self.player.error.connect(self.notify)
+        self.player.buffer_status.connect(self._show_buffer_status)
+        self._last_buffer_text = ""
+        self.disc_tab = None      # the CD tab while an audio CD is in a drive
+        self._burn_job = None     # the disc burn in progress, if any
+        self._burn_worker = None
+        self._cd_device = None
+        self._cd_lookup = None
+        self._cd_eject = None     # the worker opening the tray
+        self._cd_watcher = CdWatcher(self)
+        self._cd_watcher.reading.connect(self._disc_reading)
+        self._cd_watcher.found.connect(self._disc_found)
+        self._cd_watcher.failed.connect(self._disc_failed)
+        self._cd_watcher.gone.connect(self._disc_gone)
+        self._cd_watcher.lost.connect(self._disc_lost)
+
+        self.library_tab = LibraryTab(self.library, self.config, self.player,
+                                      self.playlists, self.smart)
+        self.audiobooks_tab = AudiobooksTab(self.player, self.config)
+        self.tagger_tab = TaggerTab(self.library)
+        self.devices_tab = DevicesTab(self.player, self.config, self.library)
+        self.sync_tab = SyncTab(self.config, self.library)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.addTab(self.library_tab, "Music")
+        self.tabs.addTab(self.audiobooks_tab, "Audiobooks")
+        self.tabs.addTab(self.tagger_tab, "Tags")
+        self.tabs.addTab(self.devices_tab, "Devices")
+        self.tabs.addTab(self.sync_tab, "Syncing")
+        self.sync_activity = SyncActivity(self.tabs)
+        self.tabs.setCornerWidget(self.sync_activity, Qt.Corner.TopRightCorner)
+        logo = QLabel()
+        logo_pm = QPixmap(ICON_FILE)
+        self.tabs.tabBar().setMinimumHeight(max(self.tabs.tabBar().minimumHeight(), 36))
+        tab_height = max(36, self.tabs.tabBar().sizeHint().height())
+        if not logo_pm.isNull():
+            logo.setPixmap(logo_pm.scaledToHeight(tab_height, Qt.SmoothTransformation))
+        logo.setFixedSize(tab_height + 12, tab_height)
+        logo.setContentsMargins(6, 0, 0, 0)
+        logo.setToolTip(f"{APP_SHORT} \u2014 {APP_NAME}")
+        self.tabs.setCornerWidget(logo, Qt.Corner.TopLeftCorner)
+        self.sync_tab.activity.connect(self.sync_activity.set_text)
+        self.devices_tab.activity.connect(self.sync_activity.set_text)
+        self.tabs.setCurrentIndex(min(max(int(self.config.get("tab", 0)), 0), 4))
+
+        central = QWidget()
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.tabs, 1)
+        lay.addWidget(self.player)
+        self.setCentralWidget(central)
+
+        self._build_menus()
+        self._build_shortcuts()
+        self._build_tray()
+        self.statusBar().showMessage("Ready")
+
+        # restore the last queue (without starting playback)
+        queue = [p for p in (self.config.get("queue") or []) if os.path.exists(p)]
+        if queue:
+            restore_device_queue_entries(queue)
+            idx = int(self.config.get("queue_index", -1))
+            self.player.set_queue(queue, idx if 0 <= idx < len(queue) else None)
+
+        # device watcher: poll every second (cheap: just lists gvfs + /media)
+        self._known = {}
+        self._polled = False
+        self._missing_polls = {}
+        self.poll_devices()
+        self._timer = QTimer(self, interval=1000, timeout=self.poll_devices)
+        self._timer.start()
+        # the drives are watched on their own thread: probing a drive can block for seconds
+        self._cd_watcher.start()
+
+        if not self.config["library_folders"]:
+            QTimer.singleShot(400, self._first_run)
+
+    # ---------------- menus ----------------
+    def _build_menus(self):
+        """Build the menu bars: the player menus (with the audiobook set) and mp3tag's tag-editor menus.
+
+        The active set follows the current tab, just like mp3tag's
+        File/Edit/View/Convert/Actions/Tag Sources bar.
+        """
+        bar = self.menuBar()
+        self._menu_sets = {"library": [], "audiobooks": [], "tags": []}
+        self._menu_mode = None
+        self._menu_shortcuts = {"library": [], "audiobooks": [], "tags": []}
+
+        music = QMenu("&Music", bar)
+        music.addAction("Add music folder…", self.library_tab.add_folder, "Ctrl+O")
+        music.addAction("Rescan library", self.library_tab.rescan, "F5")
+        music.addSeparator()
+        music.addAction("Search library", self._focus_library_search, "Ctrl+F")
+        music.addAction("Add files to queue…", self.library_tab.add_files_dialog)
+        as_menu = music.addMenu("Play selection as")
+        for key, label, hint in SHUFFLE_MODES:
+            action = as_menu.addAction(label, lambda _c=False, m=key:
+                                       self.library_tab.play_selection_as(m))
+            action.setStatusTip(hint)
+        music.addAction("Clear queue", self.library_tab.clear_queue)
+        music.addSeparator()
+        music.addAction("Quit", self.close, "Ctrl+Q")
+        self._menu_sets["library"].append(music)
+
+        audiobooks = QMenu("&Audiobooks", bar)
+        audiobooks.addAction("Select folder…", self.audiobooks_tab.add_folder)
+        audiobooks.addAction("Remove folder…", self.audiobooks_tab.remove_folder)
+        audiobooks.addAction("Refresh", self.audiobooks_tab.refresh, "F5")
+
+        playlist = QMenu("&Playlist", bar)
+        playlist.addAction("Save queue as playlist…", self.library_tab.save_playlist, "Ctrl+S")
+        playlist.addAction("Import playlist…", self.library_tab.import_playlist)
+        playlist.addAction("Export playlist…", self.library_tab.export_m3u)
+        playlist.addSeparator()
+        playlist.addAction("Undo queue edit", self.library_tab.undo, "Ctrl+Z")
+        playlist.addAction("Redo queue edit", self.library_tab.redo, "Ctrl+Shift+Z")
+        playlist.addSeparator()
+        playlist.addAction("New smart playlist…", self.library_tab.new_smart)
+        playlist.addAction("Open playlists folder", self._open_playlist_dir)
+        self._menu_sets["library"].append(playlist)
+
+        tools = QMenu("&Tools", bar)
+        tools.addAction("Tag editor", lambda: self.tabs.setCurrentWidget(self.tagger_tab))
+        tools.addAction("Devices", lambda: self.tabs.setCurrentWidget(self.devices_tab))
+        tools.addAction("Syncing", lambda: self.tabs.setCurrentWidget(self.sync_tab))
+        tools.addAction("Audio CD", self.show_disc_tab)
+        tools.addAction("Eject CD", self.eject_disc)
+        tools.addSeparator()
+        tools.addAction("Preferences…", self._open_preferences, "Ctrl+P")
+        tools.addSeparator()
+        tools.addAction("Reset play counts", self.library_tab.reset_play_counts)
+        tools.addAction("Rescan library", self.library_tab.rescan)
+        self._menu_sets["library"].append(tools)
+
+        help_menu = QMenu("&Help", bar)
+        help_menu.addAction("Keyboard shortcuts", self._show_shortcuts)
+        help_menu.addAction(f"About {APP_SHORT}", self._about)
+        self._menu_sets["library"].append(help_menu)
+
+        # On the Audiobooks tab this replaces the Music menu, so it sits next to Playlist.
+        self._menu_sets["audiobooks"] = [audiobooks, playlist, tools, help_menu]
+
+        # ---- mp3tag's tag-editor menu bar (shown while the Tags tab is active)
+        file_menu = QMenu("&File", bar)
+        file_menu.addAction("Open folder…", self.tagger_tab.open_folder, "Ctrl+O")
+        file_menu.addAction("Add files…", self.tagger_tab.add_files, "Ctrl+Shift+O")
+        file_menu.addSeparator()
+        file_menu.addAction("Remove selected files", self.tagger_tab.remove_selected, "Del")
+        file_menu.addAction("Save tag", self.tagger_tab.save, "Ctrl+S")
+        file_menu.addAction("Revert changes", self.tagger_tab.revert, "Ctrl+R")
+        file_menu.addSeparator()
+        file_menu.addAction("Close list", self.tagger_tab.clear, "Ctrl+W")
+        file_menu.addAction("Exit", self.close, "Ctrl+Q")
+        self._menu_sets["tags"].append(file_menu)
+
+        edit_menu = QMenu("&Edit", bar)
+        edit_menu.addAction("Undo", self.tagger_tab.undo, "Ctrl+Z")
+        edit_menu.addAction("Redo", self.tagger_tab.redo, "Ctrl+Y")
+        edit_menu.addSeparator()
+        edit_menu.addAction("Cut", self.tagger_tab.cut_selection, "Ctrl+X")
+        edit_menu.addAction("Copy", self.tagger_tab.copy_selection, "Ctrl+C")
+        edit_menu.addAction("Paste", self.tagger_tab.paste_selection, "Ctrl+V")
+        edit_menu.addSeparator()
+        edit_menu.addAction("Select all", self.tagger_tab.select_all, "Ctrl+A")
+        edit_menu.addAction("Deselect all", self.tagger_tab.deselect_all)
+        edit_menu.addAction("Invert selection", self.tagger_tab.invert_selection)
+        edit_menu.addSeparator()
+        edit_menu.addAction("Filter", self.tagger_tab.focus_filter, "Ctrl+F")
+        edit_menu.addAction("Find and replace…", self.tagger_tab.replace_text, "Ctrl+H")
+        self._menu_sets["tags"].append(edit_menu)
+
+        view = QMenu("&View", bar)
+        for text, slot in (("Toolbar", self.tagger_tab.set_toolbar_visible),
+                           ("Tag panel", self.tagger_tab.set_panel_visible),
+                           ("File list", self.tagger_tab.set_file_list_visible),
+                           ("Filter", self.tagger_tab.set_filter_visible)):
+            action = QAction(text, view)
+            action.setCheckable(True)
+            action.setChecked(True)
+            action.toggled.connect(slot)
+            view.addAction(action)
+        view.addSeparator()
+        columns = view.addMenu("Columns")
+        for key in COLS:
+            action = QAction(LABELS[key], columns)
+            action.setCheckable(True)
+            action.setChecked(True)
+            action.toggled.connect(lambda on, k=key: self.tagger_tab.set_column_visible(k, on))
+            columns.addAction(action)
+        view.addSeparator()
+        view.addAction("Refresh", self.tagger_tab.revert, "F5")
+        self._menu_sets["tags"].append(view)
+
+        convert = QMenu("&Convert", bar)
+        convert.addAction("Filename → Tag…", self.tagger_tab.tag_from_name, "Alt+1")
+        convert.addAction("Tag → Filename…", self.tagger_tab.name_from_tag, "Alt+2")
+        convert.addAction("Tag → Tag…", self.tagger_tab.tag_to_tag)
+        convert.addSeparator()
+        convert.addAction("Auto-numbering wizard…", self.tagger_tab.auto_number)
+        self._menu_sets["tags"].append(convert)
+
+        actions = QMenu("&Actions", bar)
+        actions.addAction("Replace…", self.tagger_tab.replace_text)
+        case_menu = actions.addMenu("Case conversion")
+        for label in ("Title Case", "lower case", "UPPER CASE"):
+            case_menu.addAction(label, lambda _c=False, m=label:
+                                self.tagger_tab.case_convert(m))
+        actions.addSeparator()
+        actions.addAction("Save changes", self.tagger_tab.save)
+        self._menu_sets["tags"].append(actions)
+
+        sources = QMenu("Tag &Sources", bar)
+        sources.addAction("MusicBrainz…", self.tagger_tab.lookup_online, "Ctrl+M")
+        sources.addAction("Cover Art Archive…", self.tagger_tab.lookup_online)
+        self._menu_sets["tags"].append(sources)
+
+        help_tags = QMenu("&Help", bar)
+        help_tags.addAction("Keyboard shortcuts", self._show_shortcuts)
+        help_tags.addAction(f"About {APP_SHORT}", self._about)
+        self._menu_sets["tags"].append(help_tags)
+
+        # remember shortcuts so only the visible menu set registers them
+        for mode, menus in self._menu_sets.items():
+            for menu in menus:
+                for action in menu.actions():
+                    seq = action.shortcut()
+                    if not seq.isEmpty():
+                        self._menu_shortcuts[mode].append((action, seq))
+                        action.setShortcut(QKeySequence())
+
+        self.tabs.currentChanged.connect(self._apply_menu_mode)
+        self._apply_menu_mode(self.tabs.currentIndex())
+
+    def _apply_menu_mode(self, index=None):
+        """Swap the menu bar between the player set and the tag-editor set."""
+        if index is None:
+            index = self.tabs.currentIndex()
+        widget = self.tabs.widget(index)
+        if widget is self.tagger_tab:
+            mode = "tags"
+        elif widget is self.audiobooks_tab:
+            mode = "audiobooks"
+        else:
+            mode = "library"
+        if self._menu_mode == mode:
+            return
+        bar = self.menuBar()
+        if self._menu_mode:
+            for action, _seq in self._menu_shortcuts[self._menu_mode]:
+                action.setShortcut(QKeySequence())
+            for menu in self._menu_sets[self._menu_mode]:
+                bar.removeAction(menu.menuAction())
+        for menu in self._menu_sets[mode]:
+            bar.addAction(menu.menuAction())
+        for action, seq in self._menu_shortcuts[mode]:
+            action.setShortcut(seq)
+        self._menu_mode = mode
+
+    def _focus_library_search(self):
+        self.tabs.setCurrentWidget(self.library_tab)
+        self.library_tab.set_view("collection")
+        self.library_tab.search.setFocus()
+
+    def _build_shortcuts(self):
+        for seq, fn in ((QKeySequence("Space"), self.player.toggle),
+                        (QKeySequence("Ctrl+Right"), lambda: self.player.next()),
+                        (QKeySequence("Ctrl+Left"), self.player.prev)):
+            QShortcut(seq, self, activated=fn)
+
+    def _open_preferences(self):
+        PreferencesDialog(self.library_tab, self).exec()
+
+    def _open_playlist_dir(self):
+        try:
+            subprocess.Popen(["xdg-open", PLAYLIST_DIR])
+        except OSError as e:
+            QMessageBox.information(self, "Playlists", f"{PLAYLIST_DIR}\n\n{e}")
+
+    def _show_shortcuts(self):
+        QMessageBox.information(
+            self, "Keyboard shortcuts",
+            "Space — play / pause\nCtrl+← / Ctrl+→ — previous / next track\n"
+            "Ctrl+O — add a music folder / open a folder in the tag editor\n"
+            "Ctrl+F — search the library / filter the tag list\n"
+            "Ctrl+S — save the queue as a playlist / save tags\n"
+            "Ctrl+Z / Ctrl+Y — undo / redo\nCtrl+Q — quit\n\n"
+            "Tags tab: Del removes files from the list, Ctrl+C / Ctrl+V copy and paste tags "
+            "between files, Alt+1 / Alt+2 convert between filename and tags, Ctrl+M looks "
+            "up MusicBrainz, Ctrl+R reverts, F5 reloads them from disk.\n\n"
+            "Double-click a track in the library to add it to the queue; "
+            "drag rows in the queue to reorder; drop files on the queue to add them.")
+
+    def _about(self):
+        QMessageBox.about(
+            self, f"About {APP_SHORT}",
+            f"<h3>{APP_SHORT} {VERSION}</h3>"
+            f"<p>{APP_NAME}</p>"
+            "<p>Library, player, batch tagger, device browser (MTP/USB) and sync for Linux, "
+            "in a single Python file.</p>"
+            "<p>Music: collection tree with grouping, playlists and smart playlists, queue with "
+            "drag reorder. Tags: batch tag editor with a whole-tag window for every tag on a "
+            "file. Devices: the collection's music folders, plus phones and USB storage. "
+            "Syncing: compare by content and mirror or update.</p>"
+            f"<p>Copyright (C) 2026 Roger Barthares.</p>"
+            "<p>Licensed under the GNU General Public License, version 3 only. "
+            "This program comes with ABSOLUTELY NO WARRANTY. See LICENSE for the "
+            "full text.</p>"
+            f"<p>Source: {SOURCE_URL}</p>"
+            f"<p>Contact: {CONTACT_EMAIL}</p>")
+
+    def _first_run(self):
+        if QMessageBox.question(self, f"Welcome to {APP_SHORT}", "Choose your music folder now?") \
+                == QMessageBox.Yes:
+            self.library_tab.add_folder()
+
+    # ---------------- devices ----------------
+    def poll_devices(self):
+        devices = detect_devices()
+        ids = {d.id: d for d in devices}
+        # A phone that switches modes can drop out of the gvfs listing for a moment. It
+        # counts as gone only once it has been missing on two polls in a row, so the
+        # sync tab does not flash "not connected" while the phone comes back.
+        missing = {i: self._missing_polls.get(i, 0) + 1 for i in self._known if i not in ids}
+        self._missing_polls = missing
+        kept = {i: self._known[i] for i, n in missing.items() if n < 2}
+        if kept:
+            ids = {**kept, **ids}
+        if ids.keys() == self._known.keys():
+            self.sync_tab.refresh_status()
+            return
+        new = [d for i, d in ids.items() if i not in self._known]
+        first = not self._polled
+        self._polled = True
+        self._known = ids
+        # The sync tab first: an autosync that starts now claims its device before the
+        # Devices tab looks at it, so the library is not even loaded for a device the
+        # sync is about to use.
+        # on app start treat already-plugged devices as "connected" too
+        # The merged list, not the raw poll: a phone kept through a one-poll gap must stay
+        # in the lists the sync and Devices tabs read, or they still flash it as gone.
+        listed = list(ids.values())
+        self.sync_tab.set_devices(listed, new if (new or first) else ())
+        self.devices_tab.set_devices(listed)
+        for d in new:
+            self.notify(f"Connected: {d.name}")
+
+    def notify(self, msg):
+        self.statusBar().showMessage(msg, 6000)
+        tray = getattr(self, "_tray", None)
+        if tray is not None and tray.isVisible() and not self.isActiveWindow():
+            tray.showMessage(APP_SHORT, msg, QSystemTrayIcon.MessageIcon.Information, 3500)
+
+    # ---------------- tray ----------------
+    def _build_tray(self):
+        """The tray icon and its Steam-shaped menu: transport, then mute and quit."""
+        self._tray = None
+        # Created even where Qt's probe says no tray: a Wayland session can host the
+        # icon through StatusNotifier while the probe is still false, and a session
+        # without a tray simply never shows it.
+        tray = QSystemTrayIcon(QIcon(ICON_FILE), self)
+        tray.setToolTip(f"{APP_NAME} {VERSION}")
+        menu = QMenu(self)
+        self._tray_prev = menu.addAction("Previous track", self.player.prev)
+        self._tray_play = menu.addAction("Play", self.player.toggle)
+        self._tray_stop = menu.addAction("Stop", self.player.stop)
+        self._tray_after = menu.addAction("Stop after this track")
+        self._tray_after.setCheckable(True)
+        self._tray_after.toggled.connect(self._tray_stop_after)
+        self._tray_next = menu.addAction("Next track", lambda: self.player.next())
+        menu.addSeparator()
+        self._tray_mute = menu.addAction("Mute")
+        self._tray_mute.setCheckable(True)
+        self._tray_mute.toggled.connect(self._tray_mute_toggled)
+        menu.addSeparator()
+        menu.addAction(f"Show {APP_SHORT}", self._show_from_tray)
+        menu.addAction("Quit", self.close)
+        menu.aboutToShow.connect(self._sync_tray_state)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._tray_activated)
+        tray.show()
+        self._tray = tray
+
+    def _sync_tray_state(self):
+        if getattr(self, "_tray", None) is None:
+            return
+        playing = self.player.player.playbackState() == QMediaPlayer.PlayingState
+        self._tray_play.setText("Pause" if playing else "Play")
+        for action, checked in ((self._tray_after, self.player.stop_after_btn.isChecked()),
+                                (self._tray_mute, self.player.audio.isMuted())):
+            action.blockSignals(True)
+            action.setChecked(checked)
+            action.blockSignals(False)
+
+    def _tray_stop_after(self, checked):
+        self.player.stop_after_btn.setChecked(bool(checked))
+
+    def _tray_mute_toggled(self, checked):
+        self.player.audio.setMuted(bool(checked))
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._show_from_tray()
+
+    def show_sync_tab(self):
+        self.tabs.setCurrentWidget(self.sync_tab)
+        self._show_from_tray()
+
+    # ---------------- audio CD ----------------
+    def rip_folder(self):
+        saved = (self.config.get("rip") or {}).get("folder")
+        if saved:
+            return saved
+        folders = self.config.get("library_folders") or []
+        return folders[0] if folders else os.path.expanduser("~/Music")
+
+    def poll_cd(self):
+        """Look at the drives now, on the watcher thread, instead of waiting for its next tick."""
+        self._cd_watcher.poke()
+
+    def _disc_reading(self, device):
+        self.notify("Reading the disc\u2026")
+
+    def _disc_found(self, disc):
+        """Show the CD tab once the watcher has read the disc's table of contents.
+
+        A table of contents is read again whenever a drive stops answering and then reports
+        a disc, so a disc swapped for another one is noticed even when the drive never went
+        quiet in between. Reading the same disc again changes nothing: the tab stays as it
+        was rather than being rebuilt and looked up afresh.
+        """
+        known = self.disc_tab.disc if self.disc_tab is not None else None
+        self._cd_device = disc.device
+        # Another disc in this drive means the one that was here has gone, whoever took it
+        # out: what was buffered from it is deleted before this disc's tracks are read.
+        CD_BUFFER.set_disc(disc.device, disc.disc_id)
+        # A disc that replaced an earlier one in this drive: its predecessor's tracks
+        # can't play any more, so they leave the queue. The same disc back in the drive
+        # (same disc ID) keeps its tracks.
+        self.player.drop_cd_entries(disc.device, disc.disc_id)
+        if known is not None and known.device == disc.device and known.disc_id == disc.disc_id:
+            return                      # the same disc: there is nothing new to show
+        self._show_disc_tab(disc)
+        self.sync_disc_buffer()
+
+    def _disc_gone(self, device):
+        """A drive that was buffered from says it is empty: that disc's buffer is deleted.
+
+        The disc in this drive has left it by some means the app did not perform, and the
+        drive said so itself, so what was read from it goes at once - whether or not this
+        is the drive the app is showing.
+        """
+        if self._cd_device == device:
+            self._cd_device = None
+            self._remove_disc_tab()
+            self.player.set_buffer_disc(None)
+        CD_BUFFER.forget(device)
+        removed = self.player.drop_cd_entries(device)
+        if removed:
+            self.notify("Disc removed: %d CD track%s left the queue"
+                        % (removed, "" if removed == 1 else "s"))
+
+    def _disc_failed(self, message):
+        """A data disc, or one still spinning up: it is retried, and this is said once."""
+        self.notify(f"Disc: {message}")
+
+    def sync_disc_buffer(self):
+        """Keep the inserted disc's tracks ready when Preferences asks for that."""
+        tab = self.disc_tab
+        early = bool(self.config.get("cd_buffer_early", False))
+        self.player.set_buffer_disc(tab.disc if (early and tab is not None) else None)
+
+    def _disc_lost(self):
+        """Every drive says it is empty: the disc's buffer goes with it, at once.
+
+        The watcher says this on every tick while the drives are empty, so a disc that was
+        already accounted for is not torn down twice. The buffer is deleted on every one of
+        those ticks, whether or not the app still thinks a disc was in a drive: nothing
+        that was read from a disc may outlive it.
+        """
+        known = self._cd_device is not None or self.disc_tab is not None
+        if known:
+            self._cd_device = None
+            self._remove_disc_tab()
+            self.player.set_buffer_disc(None)
+        CD_BUFFER.forget()          # the drives are empty, so nothing buffered may stay behind
+        removed = self.player.drop_cd_entries()
+        if removed:
+            self.notify("Disc removed: %d CD track%s left the queue"
+                        % (removed, "" if removed == 1 else "s"))
+        elif known:
+            self.notify("Disc removed: its buffer was deleted")
+
+
+    def _show_disc_tab(self, disc):
+        self._remove_disc_tab()
+        tab = DiscTab(self, disc)
+        self.disc_tab = tab
+        self.tabs.addTab(tab, disc_icon(), "CD")
+        count = len(disc.audio_tracks)
+        self.notify(f"Audio CD inserted: {count} tracks")
+        if self.config.get("online_lookup", True):
+            sources = [ID_SOURCES[key] for key in id_order(self.config) if key in DISC_ID_SOURCES]
+            if sources:
+                worker = Worker(lambda p, l, c: identify_disc(disc, self.config), self)
+                worker.done.connect(lambda result, tab=tab, sources=sources: tab.lookup_finished(
+                    bool(result[0]), "; ".join(result[1]), ID_SOURCES.get(result[0], ""),
+                    " or ".join(sources), bool(result[2])))
+                worker.failed.connect(lambda msg, tab=tab: tab.lookup_finished(
+                    False, msg.strip().splitlines()[-1] if msg.strip() else "unknown error"))
+                self._cd_lookup = worker
+                tab.status.setText(f"{count} tracks \u00b7 looking up on {' or '.join(sources)}\u2026")
+                worker.start()
+
+    def _remove_disc_tab(self):
+        tab = self.disc_tab
+        if tab is None:
+            return
+        index = self.tabs.indexOf(tab)
+        if index >= 0:
+            self.tabs.removeTab(index)
+        self.disc_tab = None
+
+    def show_disc_tab(self):
+        if self.disc_tab is None:
+            self.notify("No audio CD in a drive")
+            return
+        self.tabs.setCurrentWidget(self.disc_tab)
+
+    def eject_disc(self):
+        """Open the tray without blocking the window: some drives take 15 seconds or more."""
+        if not self._cd_device:
+            self.notify("No audio CD in a drive")
+            return
+        if self._cd_eject is not None and self._cd_eject.isRunning():
+            return
+        device = self._cd_device
+        self._cd_watcher.pause()          # the tray moves now, so the drives aren't probed
+        self.notify("Ejecting the disc\u2026")
+        worker = Worker(lambda p, l, c: eject_cd(device), self)
+        worker.done.connect(lambda _result, device=device: self._ejected(device))
+        worker.failed.connect(self._eject_failed)
+        self._cd_eject = worker
+        worker.start()
+
+    def _ejected(self, device):
+        if self._cd_device == device:
+            self._cd_device = None
+            self._remove_disc_tab()
+        self.player.set_buffer_disc(None)
+        CD_BUFFER.forget(device)     # the disc is out: its buffer is deleted with it
+        removed = self.player.drop_cd_entries(device)
+        self._cd_watcher.resume()
+        self.notify("Disc ejected" + (" \u00b7 %d CD tracks left the queue" % removed if removed else ""))
+
+    def _eject_failed(self, trace):
+        last = trace.strip().splitlines()[-1] if trace.strip() else "unknown error"
+        self._cd_watcher.resume()
+        self.notify(f"Eject failed: {last}")
+
+    def burn_paths(self, paths, label=""):
+        """Burn to disc: choose the drive and format, split the tracks across discs, then burn."""
+        if self._burn_worker is not None and self._burn_worker.isRunning():
+            self.notify("A disc is already burning")
+            return
+        if not cd_drive_nodes():
+            self.notify("No optical drive found")
+            return
+        items = []
+        for path in paths:
+            if not path or not os.path.isfile(path):
+                continue
+            tags = read_tags(path)
+            items.append(dict(path=path, title=tags["title"] or os.path.splitext(os.path.basename(path))[0],
+                              artist=tags["artist"], album=tags["album"], seconds=tags["length"]))
+        if not items:
+            self.notify("Nothing to burn")
+            return
+        dialog = BurnDialog(cd_drive_nodes(), sum(i["seconds"] for i in items), self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        settings = dialog.settings()
+        missing = burn_missing_tools(settings["kind"], settings["convert"])
+        if missing:
+            QMessageBox.warning(self, "Burn to disc", "Install these tools first: " + ", ".join(missing))
+            return
+        if settings["kind"] == "audio":
+            items = [i for i in items if i["seconds"] > 0]
+            limit = burn_disc_seconds(settings["minutes"])
+            weight = lambda i: i["seconds"] + BURN_LEADIN
+            album = lambda i: i["album"]
+        else:
+            convert = settings["convert"]
+            if convert:
+                bps = BURN_CONVERT_BPS[convert]
+                weight = lambda i: i["seconds"] * bps / 8
+            else:
+                weight = lambda i: os.path.getsize(i["path"])
+            limit = burn_data_bytes(settings["minutes"])
+            album = lambda i: os.path.dirname(i["path"])
+        if not items:
+            self.notify("Nothing to burn: the tracks have no length")
+            return
+        try:
+            discs = burn_split(items, limit, weight, album)
+        except ValueError as exc:
+            self.notify(str(exc))
+            return
+        answer = QMessageBox.question(
+            self, "Burn to disc",
+            f"Burn {len(items)} file(s) to {len(discs)} disc(s) at {settings['speed']}x in "
+            f"{settings['device']}?\n\nYou will be asked to insert each further blank disc.")
+        if answer != QMessageBox.Yes:
+            return
+        os.makedirs(TMP_DIR, exist_ok=True)
+        self._burn_job = dict(
+            kind=settings["kind"], device=settings["device"], speed=settings["speed"],
+            cdtext=settings["cdtext"], convert=BURN_CONVERT[settings["convert"]] if settings["convert"] else None,
+            label=label, discs=discs, index=0,
+            tmp=tempfile.mkdtemp(prefix="burn-", dir=TMP_DIR))
+        self._burn_start()
+
+    def _burn_start(self):
+        job = self._burn_job
+        index = job["index"]
+        if self._burn_worker is not None:
+            self._burn_worker.wait()    # the previous disc's thread has signalled done; let it exit
+        worker = Worker(lambda progress, log, cancel: burn_one_disc(job, index, progress, log, cancel), self)
+        worker.progress.connect(lambda _d, _t, msg: self.notify(msg))
+        worker.log.connect(self.notify)
+        worker.done.connect(lambda _res: self._burn_disc_finished(index))
+        worker.failed.connect(self._burn_failed)
+        self._burn_worker = worker
+        self.notify(f"Burning disc {index + 1} of {len(job['discs'])}")
+        worker.start()
+
+    def _burn_disc_finished(self, index):
+        job = self._burn_job
+        if job is None:
+            return
+        job["index"] = index + 1
+        total = len(job["discs"])
+        if job["index"] >= total:
+            self._burn_end(f"Burn complete: {total} disc(s)")
+            return
+        answer = QMessageBox.question(
+            self, "Burn to disc",
+            f"Disc {index + 1} of {total} is done and has been ejected. Insert a blank disc for "
+            f"disc {index + 2}, then click OK.",
+            QMessageBox.Ok | QMessageBox.Cancel)
+        if answer == QMessageBox.Ok:
+            self._burn_start()
+        else:
+            self._burn_end(f"Burn stopped after disc {index + 1} of {total}")
+
+    def _burn_failed(self, trace):
+        last = trace.strip().splitlines()[-1] if trace.strip() else "unknown error"
+        self._burn_end(f"Burn failed: {last}")
+
+    def _burn_end(self, message):
+        job, self._burn_job = self._burn_job, None
+        if job is not None:
+            shutil.rmtree(job["tmp"], ignore_errors=True)
+        self.notify(message)
+
+    # ---------------- cross-tab helpers ----------------
+    def apply_theme(self):
+        """Repaint the whole window with the theme in the config."""
+        apply_theme(QApplication.instance(), self.config)
+        self.player.refresh_theme()
+        self.library_tab.refresh_theme()
+        self.devices_tab.refresh_theme()
+        self.sync_tab.refresh_log_icon()
+        self.update()
+
+    def open_in_tagger(self, paths):
+        self.tagger_tab.load_paths(paths)
+        self.tabs.setCurrentWidget(self.tagger_tab)
+
+    def copy_to_device(self, paths):
+        """One window: which device, the folder layout, the folder and any transcode."""
+        devs = self.devices_tab.devices
+        if not devs:
+            QMessageBox.information(self, "Copy to device", "No device connected.")
+            return
+        start = self.devices_tab.backend.device.id if self.devices_tab.backend else ""
+        dlg = CopyToDeviceDialog(devs, self.config, paths, start, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        device = dlg.chosen_device()
+        if device is None:
+            return
+        folder = dlg.folder_dir()
+        # remember where this device was copied to, and whether folders were kept
+        self.config.setdefault("device_dirs", {})[device.id] = folder
+        self.config["copy_keep_folders"] = dlg.keep_folders()
+        save_config(self.config)
+        row = next((i for i, e in enumerate(self.devices_tab.rows) if e["id"] == device.id), -1)
+        if row >= 0:
+            self.devices_tab._select_index(row)
+        mode, quality = dlg.transcode() or (None, None)
+        self.devices_tab.upload([(p, dlg.rel_for(p)) for p in paths], folder,
+                                codec=dlg.codec_key(), mode=mode, quality=quality)
+        self.tabs.setCurrentWidget(self.devices_tab)
+
+    def switch_collection(self, index, force=False):
+        """Point the library, tagger and smart lists at another collection."""
+        cols = migrate_collections(self.config)
+        index = int(index)
+        if not (0 <= index < len(cols)):
+            return
+        if not force and index == int(self.config.get("active_collection", 0)) \
+                and self.library.db_file == cols[index]["db"]:
+            return
+        store_active_collection(self.config)
+        cols = self.config["collections"]
+        self.config["active_collection"] = index
+        self.config["library_folders"] = list(cols[index]["folders"])
+        save_config(self.config)
+        self.library.set_db_file(cols[index]["db"])
+        self.smart.library = self.library
+        self.tagger_tab.library = self.library
+        self.library_tab.library = self.library
+        self.devices_tab.library = self.library
+        self.library_tab.reset_after_collection_change()
+        self.devices_tab.reload()
+        self.notify("Collection: %s" % cols[index]["name"])
+
+    def _show_buffer_status(self, text):
+        """Show what the buffers are reading, without stepping on another status message."""
+        if text:
+            self.statusBar().showMessage(text)
+        elif self.statusBar().currentMessage() == self._last_buffer_text:
+            self.statusBar().clearMessage()
+        self._last_buffer_text = text
+
+    def closeEvent(self, e):
+        if getattr(self, "_tray", None) is not None:
+            self._tray.hide()
+        self._cd_watcher.stop()
+        self._cd_watcher.wait(2000)   # a drive that is slow to answer is left to the process exit
+        CD_BUFFER.stop()          # so a read in progress doesn't leave cdparanoia behind
+        CD_BUFFER.forget()        # and no buffered disc outlives the app either
+        FILE_BUFFER.stop()
+        DEVICE_BUFFER.stop()
+        DEVICE_BUFFER.forget()    # no track copied off a device outlives the app either
+        for owner in (self.library_tab, self.player):
+            worker = getattr(owner, "_rg_worker", None)
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                worker.wait(3000)  # an ffmpeg read cannot be interrupted, only waited out
+        self.library_tab.shutdown()
+        self.devices_tab.shutdown()
+        self.audiobooks_tab.shutdown()
+        store_active_collection(self.config)
+        self.config["tab"] = self.tabs.currentIndex()
+        self.config["window"] = [self.width(), self.height()]
+        save_config(self.config)
+        super().closeEvent(e)
+
+
+def main():
+    shutil.rmtree(CD_BUFFER_DIR, ignore_errors=True)   # buffered tracks only live as long as the queue
+    shutil.rmtree(DEVICE_BUFFER_DIR, ignore_errors=True)   # and device copies only live for the session
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setOrganizationName("Nebula")
+    # The taskbar matches a window to its launcher by this name: it must be the desktop
+    # entry the package installs (nebula-music-center.desktop), or the taskbar shows a
+    # generic icon and no name for the running app.
+    app.setDesktopFileName("nebula-music-center")
+    app.setWindowIcon(QIcon(ICON_FILE))
+    install_app_style(app)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
