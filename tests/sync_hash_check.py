@@ -5,7 +5,7 @@ Run:  QT_QPA_PLATFORM=offscreen python3 -u tests/sync_hash_check.py
 
 Every scenario builds its own source library and device folder inside a throw-away
 home. The suite is deliberately broader than the app's main tests: it walks the
-decisions in SYNC_PART1.md and SYNC_PART2.md one branch at a time, including the
+sync engine's branch decisions one at a time, including the
 target-folder accident that produced two copies of every edited track.
 """
 import atexit

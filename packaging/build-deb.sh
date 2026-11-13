@@ -30,7 +30,7 @@ mkdir -p "$APPDIR" "$STAGE/DEBIAN" \
 # the bundled runtime.  The test suite and the screenshot folder stay in the
 # source tree; they are development material, not part of an installed app.
 cp -a "$SRC/run.sh" "$SRC/nebula.py" "$SRC/nebula.png" "$SRC/sync-log.png" \
-      "$SRC/README.md" "$SRC/SYNC_PART1.md" "$SRC/SYNC_PART2.md" \
+      "$SRC/README.md" \
       "$SRC/THIRD_PARTY_LICENSES.md" "$SRC/requirements.txt" "$SRC/assets" "$APPDIR/"
 find "$APPDIR" -name '__pycache__' -type d -prune -exec rm -rf {} +
 find "$APPDIR" -name '*.pyc' -delete
@@ -66,8 +66,6 @@ DESKTOP
 
 install -m 0644 "$SRC/nebula.png" "$STAGE/usr/share/icons/hicolor/256x256/apps/$PKG.png"
 install -m 0644 "$SRC/README.md" "$STAGE/usr/share/doc/$PKG/README.md"
-install -m 0644 "$SRC/SYNC_PART1.md" "$STAGE/usr/share/doc/$PKG/SYNC_PART1.md"
-install -m 0644 "$SRC/SYNC_PART2.md" "$STAGE/usr/share/doc/$PKG/SYNC_PART2.md"
 install -m 0644 "$SRC/THIRD_PARTY_LICENSES.md" "$STAGE/usr/share/doc/$PKG/THIRD_PARTY_LICENSES.md"
 install -m 0644 "$SRC/LICENSE" "$STAGE/usr/share/doc/$PKG/LICENSE"
 install -m 0644 "$SRC/SOURCE_OFFER.md" "$STAGE/usr/share/doc/$PKG/SOURCE_OFFER.md"
