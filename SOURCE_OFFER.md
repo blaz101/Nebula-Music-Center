@@ -1,10 +1,10 @@
-# Corresponding Source for Nebula Music Center 1.26
+# Corresponding Source for Nebula Music Center 1.27
 
 Nebula Music Center is licensed under **GPL-3.0-only**. The complete source code for
-version 1.26 is distributed with the release as:
+version 1.27 is distributed with the release as:
 
 ```text
-nebula-music-center_1.26.orig.tar.xz
+nebula-music-center_1.27.orig.tar.xz
 ```
 
 It is also available from:
@@ -19,7 +19,7 @@ build and packaging scripts, the artwork and the license/notice files.
 
 ## Written offer
 
-For at least three years from the date Nebula Music Center 1.26 is distributed,
+For at least three years from the date Nebula Music Center 1.27 is distributed,
 Roger Barthares will provide the Corresponding Source for the application and the
 bundled LGPL components to any third party, at no charge beyond the cost of
 physically performing the source distribution.
@@ -33,7 +33,7 @@ roger.barthares@gmail.com
 
 ## Exact third-party source
 
-The versions bundled in 1.26 include the following. These are the upstream source
+The versions bundled in 1.27 include the following. These are the upstream source
 archives used for the corresponding libraries:
 
 ```text
@@ -84,4 +84,4 @@ bash packaging/build-deb.sh
 ```
 
 The build script uses the source tree in this archive and writes the package to
-`release-1.26/`. It does not fetch or relicense any third-party component.
+`release-1.27/`. It does not fetch or relicense any third-party component.

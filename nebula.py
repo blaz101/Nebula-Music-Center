@@ -144,7 +144,7 @@ except ImportError:  # no multimedia module at all
 # ======================================================================
 APP_NAME = "Nebula Music Center"      # the full title, used in About and the desktop entry
 APP_SHORT = "Nebula"                 # what the title bar and menus call it
-VERSION = "1.26"
+VERSION = "1.27"
 SOURCE_URL = "https://github.com/blaz101/Nebula-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
@@ -7903,14 +7903,14 @@ class PreferencesDialog(QDialog):
         self.btn_border_width = QSpinBox()
         self.btn_border_width.setRange(0, 6)
         self.btn_border_width.setSuffix(" px")
-        self.btn_border_width.setToolTip("How thick the line around buttons is — 0 draws none")
+        self.btn_border_width.setToolTip("How thick the line around buttons is - 0 draws none")
         self.btn_border_width.setValue(int(theme["button_border"]["width"]))
         self.btn_border_width.valueChanged.connect(self._button_border_width_changed)
         self.btn_border_color = QPushButton()
         self.btn_border_color.setObjectName("Swatch")
         self.btn_border_color.setFixedSize(52, 20)
         self.btn_border_color.setCursor(Qt.PointingHandCursor)
-        self.btn_border_color.setToolTip("Change the colour of the line around buttons")
+        self.btn_border_color.setToolTip("Change the color of the line around buttons")
         self.btn_border_color.clicked.connect(self._pick_button_border_color)
         border_lay.addWidget(self.btn_border_width)
         border_lay.addWidget(self.btn_border_color)
@@ -8149,8 +8149,7 @@ class PreferencesDialog(QDialog):
         form.addRow("Album order when playing in order", album)
         click_seek = self._checkbox("seek_click", "Click the time bar to jump", cfg, True)
         click_seek.setToolTip("Click anywhere on the time bar to jump to that point. "
-                              "Turn this off to page with a click; dragging the handle "
-                              "still seeks.")
+                              "Turn off to disable, dragging handle still works.")
         form.addRow(click_seek)
         form.addRow("Buffer playing tracks ahead",
                     self._combo("file_buffer_mb", file_buffer_choices(), cfg,
@@ -11329,7 +11328,7 @@ class DiscTab(QWidget):
         self.btn_queue = QPushButton("Add ticked to queue")
         self.btn_queue_all = QPushButton("Add CD to queue")
         self.btn_shuffle = QPushButton("Shuffle CD into queue")
-        self.btn_queue.setToolTip("Add the ticked tracks to the end of the queue; nothing starts playing")
+        self.btn_queue.setToolTip("Add the ticked tracks to the end of the queue.")
         self.btn_queue_all.setToolTip("Add every track on the disc to the end of the queue")
         self.btn_shuffle.setToolTip("Add every track on the disc to the queue in random order")
         self.btn_all.clicked.connect(lambda: self._check_all(True))
@@ -14916,7 +14915,7 @@ class LibraryTab(QWidget):
         self._scan_again = False
         folders = list(self.config["library_folders"])
         if not folders and not silent:
-            self.window().notify("Library is empty — add a music folder")
+            self.window().notify("Library is empty - add a music folder")
         self._scan_silent = silent
         if not silent:
             self.scan_bar.show()
@@ -18230,11 +18229,9 @@ class DevicesTab(QWidget):
         self._busy_text = reason
         self.sync_title.setText(reason)
         self.sync_detail.setText(
-            "The device is being read or written, so its music cannot be browsed, "
-            "played or copied until that finishes.\n\n"
-            "A phone answers one request at a time: a second reader waits in line and "
-            "the window stops answering, so this tab is out of the way while the task "
-            "runs.\n\n"
+            "The device is being read or written to, so its music cannot be browsed, "
+            "played or copied until task finishes.\n\n"
+            "mtp will crash if too many tasks try to run at once, syncs have priority.\n\n"
             "The device library is read again automatically afterwards.")
         self.views.setCurrentWidget(self.sync_page)
         self._set_controls(False)
@@ -19200,8 +19197,8 @@ class DevicesTab(QWidget):
         if self._busy_reason():
             QMessageBox.information(
                 self, "Devices",
-                "A sync is using this device. Wait for it to finish before reading "
-                "or writing the device from here.")
+                "A sync is using this device. Please wait for it to finish before "
+                "reading or writing from/to the device.")
             return
         reason = reason or f"Copying files on {self._device_label(self.backend.device.id)}\u2026"
         self._activity_prefix = reason.rstrip("\u2026").rstrip(".").strip()
@@ -20016,14 +20013,14 @@ class SyncTab(QWidget):
         # The bitrate choices belong to the codec above; this is the same list Copy to
         # device uses, so a profile and a one-off copy encode identically.
         self.transcode_bitrate = QComboBox()
-        self.transcode_bitrate.setToolTip("The codec's bitrate, or its VBR quality where it "
-                                          "has one. Changing this re-encodes a device copy "
+        self.transcode_bitrate.setToolTip("The codec's bitrate, or its VBR quality when "
+                                          "available. Changing this re-encodes a device copy "
                                           "on the next compare or sync.")
         self.audio_only = QCheckBox("Only audio files")
         self.include_lrc = QCheckBox("Include LRC files")
         self.include_lrc.setToolTip("Also copy the matching .lrc lyric file beside a "
                                     "selected audio file.")
-        self.autosync = QCheckBox("Autosync when connected")
+        self.autosync = QCheckBox("Autosync")
         form = QFormLayout()
         form.addRow("Name", self.name)
         dv = QHBoxLayout()
@@ -20033,8 +20030,8 @@ class SyncTab(QWidget):
         # Presets are shared: choosing one fills in the settings below, and Save stores
         # them for every device. They describe how a device should look, not which one.
         self.preset = QComboBox()
-        self.preset.setToolTip("Saved settings shared by every device: the folder on it, "
-                               "the variant, the compare method, the filesystem and any "
+        self.preset.setToolTip("Saved settings shared by every device: the target folder, "
+                               "the variant, the compare method, the filesystem, and any "
                                "transcode codec and bitrate.")
         self.preset.currentIndexChanged.connect(self._preset_chosen)
         self.preset_save = QPushButton("Save…")
@@ -20129,8 +20126,8 @@ class SyncTab(QWidget):
         self.log_btn.setIconSize(QSize(20, 20))
         self.log_btn.setIcon(tinted_icon(
             LOG_ICON_FILE, theme_settings(config)["palette"].get("text", "#ffffff")))
-        self.log_btn.setToolTip("Sync log — every compare, sync and verification this profile "
-                                "ran, newest first")
+        self.log_btn.setToolTip("Sync log - every compare, sync and verification this profile "
+                                "ran, newest first.")
         self.log_btn.clicked.connect(self.show_log)
         summary_row = QHBoxLayout()
         summary_row.setSpacing(8)
@@ -20474,11 +20471,11 @@ class SyncTab(QWidget):
                                        "setting recorded in the sync manifest.")
         else:
             self.verify_btn.setToolTip(
-                "Read and hash every file in the device folder (only audio files when "
+                "Read and hash every file in the target folder (only audio files when "
                 "this profile is audio only) and rebuild the sync manifest from those "
                 "hashes, so it lists exactly what the device holds. Timestamps are "
                 "ignored, so a device that rewrites them changes nothing. Exact, but "
-                "slow on a phone.")
+                "slow over mtp.")
 
     def _filesystem_changed(self):
         """Say what the chosen filesystem does to a file name: one line in the form, the
@@ -21086,7 +21083,7 @@ class SyncTab(QWidget):
         elif verify:
             if files == 0:
                 self.status.setText(
-                    "Verify content: the device folder is empty — no file was read or "
+                    "Verify content: the device folder is empty - no file was read or "
                     "hashed, so nothing was verified and the manifest was not rebuilt.")
             elif unreadable:
                 self.status.setText(
@@ -21099,8 +21096,8 @@ class SyncTab(QWidget):
                     f"{matches} match the library exactly. The manifest now records "
                     f"those hashes.")
         else:
-            self.status.setText("Fast hash: equal files matched the cached manifest — not "
-                                "verified byte for byte.")
+            self.status.setText("Fast hash: Compares hashes of manifest and library; "
+                                "not exact.")
         self._record_log(plan, p, sync, verify, errors)
         stamp = time.strftime("%Y-%m-%d %H:%M")
         for q in self.profiles:
@@ -22452,12 +22449,15 @@ class MainWindow(QMainWindow):
             self, f"About {APP_SHORT}",
             f"<h3>{APP_SHORT} {VERSION}</h3>"
             f"<p>{APP_NAME}</p>"
-            "<p>Library, player, batch tagger, device browser (MTP/USB) and sync for Linux, "
-            "in a single Python file.</p>"
-            "<p>Music: collection tree with grouping, playlists and smart playlists, queue with "
-            "drag reorder. Tags: batch tag editor with a whole-tag window for every tag on a "
-            "file. Devices: the collection's music folders, plus phones and USB storage. "
-            "Syncing: compare by content and mirror or update.</p>"
+            "<p>Made to be the best music management app. If you find any bugs, or would "
+            "like to request a feature, please contact me.</p>"
+            "<p>if you would like to support me, please consider donating to these apps "
+            "first, they were the inspiration:<br>"
+            "Mp3Tag linktomp3tagdonation.com<br>"
+            "Strawberry Music Player linktostrawberrydonation.com<br>"
+            "FreeFileSync linktoffsdonation.com<br>"
+            "____________________________________________________________________________________<br>"
+            "Buy me a coffee: Temporarily unavailable.</p>"
             f"<p>Copyright (C) 2026 Roger Barthares.</p>"
             "<p>Licensed under the GNU General Public License, version 3 only. "
             "This program comes with ABSOLUTELY NO WARRANTY. See LICENSE for the "

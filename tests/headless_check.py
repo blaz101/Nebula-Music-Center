@@ -3588,7 +3588,7 @@ check("Fast hash offers the Verify content button and admits it is not proof",
        sync_tab.verify_btn.toolTip()))
 check("the profile form has three check boxes, including LRC",
       [b.text() for b in sync_tab.findChildren(nebula.QCheckBox)]
-      == ["Only audio files", "Include LRC files", "Autosync when connected"],
+      == ["Only audio files", "Include LRC files", "Autosync"],
       [b.text() for b in sync_tab.findChildren(nebula.QCheckBox)])
 
 # Include LRC files: the picker lists audio, but the matching lyric sidecar travels

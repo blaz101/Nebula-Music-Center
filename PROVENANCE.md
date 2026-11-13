@@ -7,8 +7,12 @@ each asset came from.
 ## Nebula logo and app icon
 
 - **Full logo source:** `branding/nebula-logo.png`
-- **App icon:** `nebula.png`, cropped from the purple circle in the full logo,
-  including the circle and everything inside it, with transparent corners.
+- **App icon source (1.27):** `branding/nebula-icon.png`, the cleaner circular mark
+  supplied by the copyright holder (`/home/rba/Pictures/Nebula Icon.png`,
+  221 × 221 RGBA, transparent corners).
+- **App icon:** `nebula.png`, generated from `branding/nebula-icon.png` at
+  512 × 512.
+- **1.26 icon:** `nebula.png` was a crop of the purple circle in the full logo.
 - **Copyright:** Copyright (C) 2026 Roger Barthares.
 - **License:** distributed under GPL-3.0-only with the application.
 - **Evidence:** original source image supplied by the copyright holder.
