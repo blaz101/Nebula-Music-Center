@@ -1,5 +1,11 @@
 # Roadmap
 
+## 1.28
+
+- [ ] **Equalizer.** A real EQ for playback, with presets.
+- [ ] **Bit-perfect output.** Playback that hands the audio to the device
+  untouched, with a visible indicator when it is active.
+
 ## 1.27.1
 
 - [x] **Real donation links in About.** Mp3Tag, Strawberry Music Player and
