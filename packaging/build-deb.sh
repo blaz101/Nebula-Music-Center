@@ -10,7 +10,7 @@ V=1.27.1
 PKG=nebula-music-center
 ARCH=amd64
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-RELEASE_DIR=$SRC/release-$V
+RELEASE_DIR=${NMC_RELEASE_DIR:-$SRC/release-$V}
 OUT=$RELEASE_DIR
 DOWNLOADS_DIR=${NMC_DOWNLOADS_DIR:-$HOME/Downloads/NMC}
 STAGE=$(mktemp -d /tmp/deb$V-XXXXXX)
