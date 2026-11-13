@@ -1,4 +1,18 @@
-# Nebula Music Center 1.27.1
+# Nebula Music Center 1.28
+
+## What's new in 1.28
+
+- **Equalizer.** A 25-band graphical EQ (20 Hz – 20 kHz, 0.1 dB steps) and a
+  parametric EQ (peak, low-shelf and high-shelf bands with frequency, gain and Q).
+  Each tab keeps its own curve, so switching between them changes nothing.
+- **Presets and profiles.** Save named curves for each tab, and import or export
+  Equalizer APO profiles (`.txt`) or Nebula JSON profiles.
+- **Per-band readouts.** Every graphic band shows its gain above the slider.
+- **Bit-perfect switch.** Bypasses the equalizer and disables its controls. The
+  exclusive output path itself is not part of this release.
+- **Equalizer needs ffmpeg.** The equalised audio is rendered with the system
+  `ffmpeg` when a track starts, and the package recommends it. Without ffmpeg the
+  window still opens for editing, but nothing is applied.
 
 ## What's new in 1.27.1
 
@@ -51,8 +65,8 @@ https://github.com/blaz101/Nebula-Music-Center
 Extract the release archive and start the app:
 
 ```bash
-tar -xf nebula-music-center_1.27.1.orig.tar.xz
-cd nebula-music-center-1.27.1
+tar -xf nebula-music-center_1.28.orig.tar.xz
+cd nebula-music-center-1.28
 ./run.sh
 ```
 
@@ -69,7 +83,7 @@ Nothing is installed system-wide and nothing is written outside your home.
 ## Install it (.deb, Debian and Ubuntu)
 
 ```bash
-sudo apt install ./nebula-music-center_1.27.1_amd64.deb
+sudo apt install ./nebula-music-center_1.28_amd64.deb
 nebula-music-center              # or pick it from the menu
 ```
 

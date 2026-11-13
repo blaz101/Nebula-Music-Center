@@ -144,7 +144,7 @@ except ImportError:  # no multimedia module at all
 # ======================================================================
 APP_NAME = "Nebula Music Center"      # the full title, used in About and the desktop entry
 APP_SHORT = "Nebula"                 # what the title bar and menus call it
-VERSION = "1.27.1"
+VERSION = "1.28"
 SOURCE_URL = "https://github.com/blaz101/Nebula-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
@@ -307,6 +307,11 @@ DEFAULT_CONFIG = {
     "file_buffer_mb": 30,
     # playing from a device: megabytes copied into a local buffer ahead of the player
     "device_buffer_mb": 128,
+    # equalizer: preamp in dB, 25 graphic gains, parametric bands, bit-perfect bypass
+    "eq_profile": {"mode": "graphic", "preamp": 0.0, "graphic": [],
+                   "parametric": [], "bitperfect": False},
+    # named EQ curves saved from the equalizer window
+    "eq_presets": {},
 }
 
 
@@ -9004,6 +9009,728 @@ class SeekSlider(QSlider):
 
 
 # ---------------------------------------------------------------- player
+# ---------------------------------------------------------------- equalizer
+# 25 bands from 20 Hz to 20 kHz, each one a peaking biquad. Profiles use the
+# Equalizer APO text format ("Preamp: ...", "Filter N: ON PK Fc ... Gain ... Q ..."),
+# which is what AutoEQ and most headphone presets ship as, plus a JSON form that
+# keeps the graphic sliders exactly as they were set.
+EQ_BANDS = [round(20.0 * (1000.0 ** (i / 24.0)), 1) for i in range(25)]
+EQ_BAND_Q = 4.0
+EQ_MAX_GAIN = 12.0
+EQ_CACHE_DIR = os.path.join(CACHE_ROOT, "eq")
+EQ_TYPES = ("PK", "LS", "HS")
+
+
+class EQError(ValueError):
+    pass
+
+
+def eq_profile_from_config(cfg):
+    raw = cfg.get("eq_profile") if isinstance(cfg, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        preamp = max(-24.0, min(24.0, float(raw.get("preamp") or 0.0)))
+    except (TypeError, ValueError):
+        preamp = 0.0
+    graphic = []
+    for value in list(raw.get("graphic") or [])[:len(EQ_BANDS)]:
+        try:
+            graphic.append(max(-EQ_MAX_GAIN, min(EQ_MAX_GAIN, float(value))))
+        except (TypeError, ValueError):
+            graphic.append(0.0)
+    graphic += [0.0] * (len(EQ_BANDS) - len(graphic))
+    parametric = []
+    for band in raw.get("parametric") or []:
+        if not isinstance(band, dict):
+            continue
+        try:
+            freq = max(10.0, min(24000.0, float(band.get("freq") or 1000.0)))
+            gain = max(-24.0, min(24.0, float(band.get("gain") or 0.0)))
+            q = max(0.1, min(10.0, float(band.get("q") or 1.0)))
+        except (TypeError, ValueError):
+            continue
+        kind = str(band.get("type") or "PK").upper()
+        parametric.append({"type": kind if kind in EQ_TYPES else "PK",
+                           "freq": freq, "gain": gain, "q": q})
+    mode = str(raw.get("mode") or "graphic").lower()
+    if mode not in ("graphic", "parametric"):
+        mode = "graphic"
+    return {"mode": mode, "preamp": preamp, "graphic": graphic, "parametric": parametric,
+            "bitperfect": bool(raw.get("bitperfect"))}
+
+
+def eq_filter_chain(profile):
+    """The ffmpeg filter chain for a profile, or "" when nothing is being changed."""
+    if not profile or profile.get("bitperfect"):
+        return ""
+    parts = []
+    try:
+        preamp = float(profile.get("preamp") or 0.0)
+    except (TypeError, ValueError):
+        preamp = 0.0
+    if abs(preamp) >= 0.05:
+        parts.append(f"volume={preamp:.2f}dB")
+    mode = str(profile.get("mode") or "graphic")
+    if mode == "graphic":
+        for freq, gain in zip(EQ_BANDS, profile.get("graphic") or []):
+            try:
+                gain = float(gain)
+            except (TypeError, ValueError):
+                continue
+            if abs(gain) >= 0.05:
+                parts.append(f"equalizer=f={freq:.1f}:t=q:w={EQ_BAND_Q:.2f}:g={gain:.2f}")
+    for band in (profile.get("parametric") or []) if mode == "parametric" else []:
+        try:
+            freq = float(band.get("freq"))
+            gain = float(band.get("gain"))
+            q = float(band.get("q") or 1.0)
+        except (TypeError, ValueError):
+            continue
+        if abs(gain) < 0.05:
+            continue
+        kind = str(band.get("type") or "PK").upper()
+        if kind == "LS":
+            parts.append(f"bass=g={gain:.2f}:f={freq:.1f}:width_type=q:w={q:.3f}")
+        elif kind == "HS":
+            parts.append(f"treble=g={gain:.2f}:f={freq:.1f}:width_type=q:w={q:.3f}")
+        else:
+            parts.append(f"equalizer=f={freq:.1f}:t=q:w={q:.3f}:g={gain:.2f}")
+    return ",".join(parts)
+
+
+def _prune_eq_cache(keep=60):
+    try:
+        files = sorted((os.path.join(EQ_CACHE_DIR, n) for n in os.listdir(EQ_CACHE_DIR)),
+                       key=lambda p: os.path.getmtime(p), reverse=True)
+    except OSError:
+        return
+    for old in files[keep:]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def render_eq_audio(path, profile):
+    """Render the track through the EQ chain once, into the cache.
+
+    Qt gives no filter hook on QMediaPlayer, so the equalised audio is written
+    ahead of playback. Returns the rendered file, the original path when the
+    profile is flat, or None when the render failed.
+    """
+    chain = eq_filter_chain(profile)
+    if not chain:
+        return path
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = hashlib.sha1(f"{path}|{stamp}|{chain}".encode("utf-8", "replace")).hexdigest()[:20]
+    out = os.path.join(EQ_CACHE_DIR, key + ".flac")
+    try:
+        if os.path.getsize(out) > 0:
+            return out
+    except OSError:
+        pass
+    os.makedirs(EQ_CACHE_DIR, exist_ok=True)
+    tmp = out + ".part"
+    cmd = [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", path, "-vn",
+           "-map_metadata", "-1", "-af", chain, "-c:a", "flac", "-f", "flac", tmp]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=600)
+        os.replace(tmp, out)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    _prune_eq_cache()
+    return out
+
+
+_APO_PREAMP = re.compile(r"^\s*Preamp\s*:\s*(-?[0-9.]+)\s*dB", re.I)
+_APO_FILTER = re.compile(
+    r"^\s*Filter\s+\d+\s*:\s*(ON|OFF)\s+([A-Za-z]+)\s+Fc\s+([0-9.]+)\s*Hz\s+"
+    r"Gain\s+(-?[0-9.]+)\s*dB(?:\s+Q\s+([0-9.]+))?", re.I)
+_APO_GRAPHIC = re.compile(r"^\s*GraphicEQ\s*:\s*(.+)$", re.I)
+
+
+def parse_eq_profile(text, suffix=""):
+    """Read an Equalizer APO text profile or a Nebula JSON profile."""
+    text = text or ""
+    if suffix.lower() == ".json" or text.lstrip().startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise EQError("That JSON file could not be read: " + str(exc))
+        if not isinstance(data, dict):
+            raise EQError("That JSON file is not an EQ profile.")
+        return eq_profile_from_config({"eq_profile": data})
+    profile = {"mode": "graphic", "preamp": 0.0, "graphic": [0.0] * len(EQ_BANDS),
+               "parametric": [], "bitperfect": False}
+    graphic_eq = None
+    found = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _APO_PREAMP.match(line)
+        if match:
+            try:
+                profile["preamp"] = max(-24.0, min(24.0, float(match.group(1))))
+            except ValueError:
+                pass
+            found = True
+            continue
+        match = _APO_GRAPHIC.match(line)
+        if match:
+            graphic_eq = match.group(1)
+            found = True
+            continue
+        match = _APO_FILTER.match(line)
+        if match:
+            found = True
+            if match.group(1).upper() == "OFF":
+                continue
+            kind = match.group(2).upper()
+            try:
+                freq = float(match.group(3))
+                gain = float(match.group(4))
+                q = float(match.group(5)) if match.group(5) else 1.0
+            except ValueError:
+                continue
+            profile["parametric"].append({
+                "type": kind if kind in EQ_TYPES else "PK",
+                "freq": max(10.0, min(24000.0, freq)),
+                "gain": max(-24.0, min(24.0, gain)),
+                "q": max(0.1, min(10.0, q))})
+            continue
+    if graphic_eq:
+        points = []
+        pairs = re.findall(r"(-?[0-9.]+)\s+(-?[0-9.]+)", graphic_eq)
+        for freq_s, gain_s in pairs:
+            try:
+                freq, gain = float(freq_s), float(gain_s)
+            except ValueError:
+                continue
+            if freq > 0:
+                points.append((freq, gain))
+        points.sort()
+        if points:
+            for i, band in enumerate(EQ_BANDS):
+                profile["graphic"][i] = max(-EQ_MAX_GAIN, min(EQ_MAX_GAIN,
+                                                              _interp_log(points, band)))
+    if not found and not profile["parametric"] and not any(profile["graphic"]):
+        raise EQError("No EQ filters were found in that file.")
+    if profile["parametric"] and not graphic_eq:
+        profile["mode"] = "parametric"
+    return profile
+
+
+def _interp_log(points, freq):
+    if freq <= points[0][0]:
+        return points[0][1]
+    if freq >= points[-1][0]:
+        return points[-1][1]
+    for (f0, g0), (f1, g1) in zip(points, points[1:]):
+        if f0 <= freq <= f1:
+            span = math.log(f1 / f0) or 1e-9
+            return g0 + (g1 - g0) * (math.log(freq / f0) / span)
+    return 0.0
+
+
+def format_eq_profile(profile):
+    """Write the active tab as an Equalizer APO profile."""
+    lines = [f"Preamp: {float(profile.get('preamp') or 0.0):.1f} dB"]
+    if str(profile.get("mode") or "graphic") == "graphic":
+        pairs = "; ".join(f"{freq:.1f} {float(gain):.1f}"
+                          for freq, gain in zip(EQ_BANDS, profile.get("graphic") or []))
+        lines.append(f"GraphicEQ: {pairs}")
+    else:
+        index = 1
+        for band in profile.get("parametric") or []:
+            lines.append(f"Filter {index}: ON {band.get('type', 'PK')} Fc "
+                         f"{float(band.get('freq', 1000)):.1f} Hz Gain "
+                         f"{float(band.get('gain', 0.0)):.1f} dB Q "
+                         f"{float(band.get('q', 1.0)):.2f}")
+            index += 1
+    return "\n".join(lines) + "\n"
+
+
+def eq_icon_pixmap(color, px=18):
+    """The custom six-bar EQ mark from assets/icons/eq.svg, painted at any size."""
+    pixmap = QPixmap(px, px)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(max(1.0, px / 12.0))
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    scale = px / 24.0
+    for x, y0, y1 in ((3.0, 19.0, 10.5), (6.5, 19.0, 8.0), (10.0, 19.0, 13.0),
+                      (13.5, 19.0, 9.5), (17.0, 19.0, 6.5), (20.5, 19.0, 12.0)):
+        painter.drawLine(QPointF(x * scale, y0 * scale), QPointF(x * scale, y1 * scale))
+    painter.end()
+    return pixmap
+
+
+class EQBandSlider(QSlider):
+    """A band slider with the time bar's pill handle and a fill from 0 dB."""
+
+    def __init__(self, freq, parent=None):
+        super().__init__(Qt.Vertical, parent)
+        self.freq = freq
+        self.setRange(-int(EQ_MAX_GAIN * 10), int(EQ_MAX_GAIN * 10))
+        self.setValue(0)
+        self.setSingleStep(1)
+        self.setMinimumHeight(96)
+        self.setMinimumWidth(20)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(f"{freq:g} Hz: 0.0 dB")
+
+    def gain(self):
+        return self.value() / 10.0
+
+    def set_gain(self, gain):
+        self.setValue(int(round(float(gain) * 10)))
+
+    def refresh_tip(self):
+        self.setToolTip(f"{self.freq:g} Hz: {self.gain():+.1f} dB")
+
+    def _geometry(self):
+        handle_h = 12.0
+        pad = handle_h / 2 + 1
+        return pad, max(1.0, self.height() - pad * 2), handle_h
+
+    def _y_for(self, value):
+        pad, span, _handle = self._geometry()
+        ratio = (self.maximum() - value) / max(1, self.maximum() - self.minimum())
+        return pad + ratio * span
+
+    def _value_at(self, y):
+        pad, span, handle_h = self._geometry()
+        pos = max(0.0, min(span, y - pad))
+        return int(round(self.maximum() - (pos / span) * (self.maximum() - self.minimum())))
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        width = self.width()
+        pad, span, handle_h = self._geometry()
+        x = width / 2.0
+        zero_y = self._y_for(0)
+        value_y = self._y_for(self.value())
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(GROOVE if self.isEnabled() else BORDER))
+        painter.drawRoundedRect(QRectF(x - 2, pad, 4, span), 2, 2)
+        if abs(value_y - zero_y) >= 1:
+            painter.setBrush(QColor(ACCENT if self.isEnabled() else MUTED))
+            painter.drawRoundedRect(QRectF(x - 2, min(zero_y, value_y), 4,
+                                           abs(value_y - zero_y)), 2, 2)
+        handle_w = 9.0
+        painter.setBrush(QColor(HANDLE if self.isEnabled() else BUTTON))
+        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.drawRoundedRect(QRectF(x - handle_w / 2, value_y - handle_h / 2,
+                                       handle_w, handle_h), 4.5, 4.5)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setSliderDown(True)
+            self.setValue(self._value_at(event.position().y()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self.setValue(self._value_at(event.position().y()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.setSliderDown(False)
+        super().mouseReleaseEvent(event)
+
+
+class EQDialog(QDialog):
+    """The equalizer window: 25 graphic bands, parametric bands, profiles."""
+
+    def __init__(self, player, parent=None):
+        super().__init__(parent)
+        self.player = player
+        self.setWindowTitle("Equalizer")
+        self.setObjectName("Panel")
+        self.setModal(False)
+        self.setMinimumWidth(720)
+        self.setMinimumHeight(600)
+        self.resize(760, 608)
+        self._loading = True
+        self._ffmpeg_missing = not bool(shutil.which("ffmpeg"))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(6)
+
+        head = QHBoxLayout()
+        title = QLabel("Equalizer")
+        title.setObjectName("Heading")
+        head.addWidget(title)
+        self.status = QLabel("")
+        self.status.setObjectName("Muted")
+        head.addWidget(self.status, 1)
+        self.presets_btn = QToolButton()
+        self.presets_btn.setText("Saved presets \u25be")
+        self.presets_btn.setPopupMode(QToolButton.InstantPopup)
+        self.presets_btn.setToolTip("Load, save or delete named EQ curves")
+        self.presets_menu = QMenu(self)
+        self.presets_btn.setMenu(self.presets_menu)
+        head.addWidget(self.presets_btn)
+        self.bit_btn = QPushButton("Bit-perfect")
+        self.bit_btn.setCheckable(True)
+        self.bit_btn.setToolTip("Bypass the EQ; every band is disabled while it is on")
+        self.bit_btn.toggled.connect(self._bitperfect_toggled)
+        head.addWidget(self.bit_btn)
+        root.addLayout(head)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(4)
+        self.mode_graphic = QPushButton("Graphical")
+        self.mode_graphic.setCheckable(True)
+        self.mode_graphic.setToolTip("25 graphic bands")
+        self.mode_parametric = QPushButton("Parametric")
+        self.mode_parametric.setCheckable(True)
+        self.mode_parametric.setToolTip("Bands with their own frequency, gain and Q")
+        for button in (self.mode_graphic, self.mode_parametric):
+            button.setMinimumWidth(96)
+            mode_row.addWidget(button)
+        mode_row.addStretch()
+        mode_row.addWidget(QLabel("Preamp"))
+        self.preamp = QDoubleSpinBox()
+        self.preamp.setRange(-24, 24)
+        self.preamp.setDecimals(1)
+        self.preamp.setSingleStep(0.5)
+        self.preamp.setSuffix(" dB")
+        self.preamp.setFixedWidth(88)
+        self.preamp.valueChanged.connect(self._touch)
+        mode_row.addWidget(self.preamp)
+        root.addLayout(mode_row)
+
+        self.pages = QStackedWidget()
+
+        graphic = QWidget()
+        graphic_lay = QHBoxLayout(graphic)
+        graphic_lay.setContentsMargins(6, 4, 6, 4)
+        graphic_lay.setSpacing(2)
+        self.sliders = []
+        self.band_labels = []
+        for freq in EQ_BANDS:
+            column = QVBoxLayout()
+            column.setSpacing(1)
+            readout = QLabel("0.0")
+            readout.setObjectName("Muted")
+            readout.setAlignment(Qt.AlignHCenter)
+            readout.setStyleSheet("font-size: 7pt;")
+            column.addWidget(readout)
+            slider = EQBandSlider(freq)
+            slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            slider.valueChanged.connect(self._touch)
+            slider.valueChanged.connect(slider.refresh_tip)
+            slider.valueChanged.connect(
+                lambda value, label=readout: label.setText(f"{value / 10.0:+.1f}"))
+            column.addWidget(slider, 1)
+            label = QLabel(f"{freq:.0f}" if freq >= 100 else f"{freq:.1f}")
+            label.setObjectName("Muted")
+            label.setAlignment(Qt.AlignHCenter)
+            label.setStyleSheet("font-size: 7pt;")
+            column.addWidget(label)
+            graphic_lay.addLayout(column)
+            self.sliders.append(slider)
+            self.band_labels.append(readout)
+        self.pages.addWidget(graphic)
+
+        params = QWidget()
+        params_lay = QVBoxLayout(params)
+        params_lay.setContentsMargins(6, 4, 6, 4)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Type", "Freq (Hz)", "Gain (dB)", "Q"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setMinimumHeight(250)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        params_lay.addWidget(self.table)
+        row = QHBoxLayout()
+        add = QPushButton("Add band")
+        add.clicked.connect(lambda: self._add_param_row())
+        remove = QPushButton("Remove")
+        remove.clicked.connect(self._remove_param_row)
+        row.addWidget(add)
+        row.addWidget(remove)
+        row.addStretch()
+        params_lay.addLayout(row)
+        self.pages.addWidget(params)
+        root.addWidget(self.pages, 1)
+
+        self.mode = "graphic"
+        self.mode_graphic.clicked.connect(lambda: self._set_mode("graphic"))
+        self.mode_parametric.clicked.connect(lambda: self._set_mode("parametric"))
+
+        foot = QHBoxLayout()
+        flat = QPushButton("Flat")
+        flat.setToolTip("Zero every band and clear the parametric list")
+        flat.clicked.connect(self._flat)
+        imp = QPushButton("Import…")
+        imp.setToolTip("Read an Equalizer APO (.txt) or Nebula (.json) profile")
+        imp.clicked.connect(self._import)
+        exp = QPushButton("Export…")
+        exp.setToolTip("Write this curve as an Equalizer APO or Nebula profile")
+        exp.clicked.connect(self._export)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        foot.addWidget(flat)
+        foot.addWidget(imp)
+        foot.addWidget(exp)
+        foot.addStretch()
+        foot.addWidget(close)
+        root.addLayout(foot)
+
+        self._build_presets_menu()
+        self._load_profile(eq_profile_from_config(player.config))
+        self._loading = False
+        self._update_status()
+        self._set_editable(not self.bit_btn.isChecked())
+
+    # -- building and reading the profile ---------------------------------
+    def _profile(self):
+        parametric = []
+        for r in range(self.table.rowCount()):
+            combo = self.table.cellWidget(r, 0)
+            freq = self.table.cellWidget(r, 1)
+            gain = self.table.cellWidget(r, 2)
+            q = self.table.cellWidget(r, 3)
+            if not all((combo, freq, gain, q)):
+                continue
+            parametric.append({"type": combo.currentText(), "freq": freq.value(),
+                               "gain": gain.value(), "q": q.value()})
+        return {"mode": getattr(self, "mode", "graphic"),
+                "preamp": float(self.preamp.value()),
+                "graphic": [s.gain() for s in self.sliders],
+                "parametric": parametric,
+                "bitperfect": bool(self.bit_btn.isChecked())}
+
+    def _load_profile(self, profile):
+        was_loading = self._loading
+        self._loading = True
+        self.preamp.setValue(float(profile.get("preamp") or 0.0))
+        for slider, gain in zip(self.sliders, profile.get("graphic") or []):
+            slider.set_gain(gain)
+        self.bit_btn.setChecked(bool(profile.get("bitperfect")))
+        self.table.setRowCount(0)
+        for band in profile.get("parametric") or []:
+            self._add_param_row(band)
+        self._set_mode(str(profile.get("mode") or "graphic"), loading=True)
+        self._loading = was_loading
+        self._update_status()
+        self._set_editable(not self.bit_btn.isChecked())
+
+    def _add_param_row(self, band=None):
+        band = band or {"type": "PK", "freq": 1000.0, "gain": 0.0, "q": 1.0}
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        combo = QComboBox()
+        combo.addItems(list(EQ_TYPES))
+        combo.setCurrentText(str(band.get("type") or "PK"))
+        freq = QDoubleSpinBox()
+        freq.setRange(10, 24000)
+        freq.setDecimals(1)
+        freq.setValue(float(band.get("freq") or 1000.0))
+        gain = QDoubleSpinBox()
+        gain.setRange(-24, 24)
+        gain.setDecimals(1)
+        gain.setSingleStep(0.5)
+        gain.setValue(float(band.get("gain") or 0.0))
+        q = QDoubleSpinBox()
+        q.setRange(0.1, 10)
+        q.setDecimals(2)
+        q.setSingleStep(0.1)
+        q.setValue(float(band.get("q") or 1.0))
+        for column, widget in enumerate((combo, freq, gain, q)):
+            self.table.setCellWidget(row, column, widget)
+        for widget in (freq, gain, q):
+            widget.valueChanged.connect(self._touch)
+        combo.currentTextChanged.connect(self._touch)
+
+    def _remove_param_row(self):
+        row = self.table.currentRow()
+        if row < 0 and self.table.rowCount():
+            row = self.table.rowCount() - 1
+        if row >= 0:
+            self.table.removeRow(row)
+            self._touch()
+
+    def _set_mode(self, mode, loading=False):
+        self.mode = mode if mode in ("graphic", "parametric") else "graphic"
+        self.mode_graphic.setChecked(self.mode == "graphic")
+        self.mode_parametric.setChecked(self.mode == "parametric")
+        self.pages.setCurrentIndex(0 if self.mode == "graphic" else 1)
+        if not loading:
+            self._build_presets_menu()
+            self._touch()
+
+    def _flat(self):
+        if self.mode == "graphic":
+            for slider in self.sliders:
+                slider.set_gain(0.0)
+            for label in self.band_labels:
+                label.setText("+0.0")
+        else:
+            self.table.setRowCount(0)
+        self.preamp.setValue(0.0)
+        self._touch()
+
+    # -- profiles ----------------------------------------------------------
+    def _import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import EQ profile", "", "EQ profiles (*.txt *.json);;All files (*)",
+            options=FILE_DIALOG_OPTIONS)
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                profile = parse_eq_profile(handle.read(), os.path.splitext(path)[1])
+        except (OSError, EQError) as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+            return
+        self._load_profile(profile)
+        self._touch("Profile imported — it applies when this window closes.")
+
+    def _export(self):
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "Export EQ profile", "nebula-eq.txt",
+            "Equalizer APO (*.txt);;Nebula EQ (*.json)", options=FILE_DIALOG_OPTIONS)
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".json" if "json" in chosen.lower() else ".txt"
+        profile = self._profile()
+        try:
+            if path.lower().endswith(".json"):
+                data = dict(profile)
+                data["format"] = "nebula-eq"
+                data["version"] = 1
+                data["bands"] = list(EQ_BANDS)
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(data, handle, indent=2)
+            else:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(format_eq_profile(profile))
+        except OSError as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        self._touch("Profile exported.")
+
+    # -- saved presets ------------------------------------------------------
+    def _preset_store(self):
+        store = self.player.config.get("eq_presets")
+        if not isinstance(store, dict):
+            store = {}
+            self.player.config["eq_presets"] = store
+        return store
+
+    def _build_presets_menu(self):
+        menu = self.presets_menu
+        menu.clear()
+        presets = {name: preset for name, preset in self._preset_store().items()
+                   if isinstance(preset, dict)
+                   and str(preset.get("mode") or "graphic") == getattr(self, "mode", "graphic")}
+        if presets:
+            for name in sorted(presets):
+                menu.addAction(name, lambda _checked=False, n=name: self._load_preset(n))
+        else:
+            empty = menu.addAction("No saved presets yet")
+            empty.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Save current as…", self._save_preset)
+        if presets:
+            remove = menu.addMenu("Delete preset")
+            for name in sorted(presets):
+                remove.addAction(name, lambda _checked=False, n=name: self._delete_preset(n))
+
+    def _load_preset(self, name):
+        presets = self._preset_store()
+        if name not in presets:
+            return
+        self._load_profile(eq_profile_from_config({"eq_profile": presets[name]}))
+        self._touch(f"Preset \u201c{name}\u201d loaded — applies when this window closes.")
+
+    def _save_preset(self):
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        presets = dict(self._preset_store())
+        presets[name] = self._profile()
+        self.player.config["eq_presets"] = presets
+        self._build_presets_menu()
+        self._touch(f"Preset \u201c{name}\u201d saved.")
+
+    def _delete_preset(self, name):
+        presets = dict(self._preset_store())
+        if presets.pop(name, None) is None:
+            return
+        self.player.config["eq_presets"] = presets
+        self._build_presets_menu()
+        self._touch(f"Preset \u201c{name}\u201d deleted.")
+
+    # -- state -------------------------------------------------------------
+    def _touch(self, *_args):
+        if self._loading:
+            return
+        self._update_status()
+
+    def _update_status(self, note=""):
+        if self.bit_btn.isChecked():
+            self.status.setText("Bit-perfect: EQ bypassed")
+        elif self._ffmpeg_missing:
+            self.status.setText("ffmpeg is missing: the EQ can be edited but not applied")
+        elif note:
+            self.status.setText(note)
+        else:
+            self.status.setText("EQ is applied when the window is closed.")
+
+    def _bitperfect_toggled(self, on):
+        self._set_editable(not on)
+        self._update_status()
+        if not self._loading:
+            self._commit()
+            self.player.apply_eq()
+
+    def _set_editable(self, on):
+        for slider in self.sliders:
+            slider.setEnabled(on)
+        self.table.setEnabled(on)
+        self.preamp.setEnabled(on)
+        for button in self.findChildren(QPushButton):
+            if button.text() in ("Add band", "Remove", "Flat", "Import…"):
+                button.setEnabled(on)
+
+    def _commit(self):
+        self.player.config["eq_profile"] = self._profile()
+
+    def closeEvent(self, event):
+        self._commit()
+        self.player.apply_eq()
+        super().closeEvent(event)
+
+
 class PlayerBar(QWidget):
     """Strawberry-style bottom bar: cover, transport, format pills, spectrum, seek, volume."""
 
@@ -9036,6 +9763,8 @@ class PlayerBar(QWidget):
         self.audio = QAudioOutput(self)
         self.player.setAudioOutput(self.audio)
         self.audio.setVolume(config.get("volume", 70) / 100)
+        self.eq_profile = eq_profile_from_config(config)
+        self._eq_rendering = False
 
         # cover (click -> enlarged view)
         self.cover = QLabel()
@@ -9613,6 +10342,7 @@ class PlayerBar(QWidget):
             if is_device_entry(path):
                 # use the buffered copy once it is complete; until then read the device
                 local = DEVICE_BUFFER.cached(path) or path
+            local = self._eq_source(local)
             self.player.setSource(QUrl.fromLocalFile(local))
         self.player.play()
         self._load_info(path, local)
@@ -9623,6 +10353,38 @@ class PlayerBar(QWidget):
                 pass
         self.track_changed.emit(path)
         self.index_changed.emit(i)
+
+    def _eq_source(self, path):
+        """Play the equalised copy when the profile changes anything."""
+        if not eq_filter_chain(self.eq_profile):
+            return path
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            rendered = render_eq_audio(path, self.eq_profile)
+        finally:
+            QApplication.restoreOverrideCursor()
+        return rendered or path
+
+    def apply_eq(self):
+        """Re-take the profile and restart the current track through it."""
+        profile = eq_profile_from_config(self.config)
+        if profile == self.eq_profile:
+            return
+        self.eq_profile = profile
+        if self._eq_rendering or self.index < 0 or self.index >= len(self.queue):
+            return
+        if is_cd_entry(self.queue[self.index]):
+            return
+        if self.player.playbackState() == QMediaPlayer.StoppedState:
+            return
+        position = self.player.position()
+        self._eq_rendering = True
+        try:
+            self.play_index(self.index)
+        finally:
+            self._eq_rendering = False
+        if position > 0:
+            QTimer.singleShot(250, lambda: self.player.setPosition(position))
 
     def _load_info(self, path, local=None):
         self._stopped = False
@@ -12947,6 +13709,17 @@ class LibraryTab(QWidget):
         lay.addWidget(add)
         return page
 
+    def open_eq(self):
+        dialog = getattr(self, "_eq_dialog", None)
+        if dialog is None:
+            dialog = EQDialog(self.player, self)
+            dialog.finished.connect(lambda _result: self.eq_btn.setChecked(False))
+            self._eq_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.eq_btn.setChecked(True)
+
     def _build_queue_page(self):
         page = QWidget()
         page.setObjectName("Panel")
@@ -12973,6 +13746,15 @@ class LibraryTab(QWidget):
         toolbar.addSpacing(6)
         toolbar.addWidget(self.undo_btn)
         toolbar.addWidget(self.redo_btn)
+        self.eq_btn = QToolButton()
+        self.eq_btn.setObjectName("PlayerToggle")
+        self.eq_btn.setFixedSize(26, 26)
+        self.eq_btn.setIconSize(QSize(16, 16))
+        self.eq_btn.setIcon(QIcon(eq_icon_pixmap(TEXT, 18)))
+        self.eq_btn.setToolTip("Equalizer")
+        self.eq_btn.setCheckable(True)
+        self.eq_btn.clicked.connect(self.open_eq)
+        toolbar.addWidget(self.eq_btn)
         toolbar.addStretch()
         for text, tip, fn, width in (("+", "Add files to the queue", self.add_files_dialog, 28),
                                      ("−", "Remove selected queue tracks", self.remove_selected, 28),

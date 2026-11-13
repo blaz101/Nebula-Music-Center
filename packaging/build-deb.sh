@@ -1,12 +1,12 @@
 #!/bin/bash
 # Copyright (C) 2026 Roger Barthares
 # SPDX-License-Identifier: GPL-3.0-only
-# Build nebula-music-center_1.27.1_amd64.deb from the source tree.
+# Build nebula-music-center_1.28_amd64.deb from the source tree.
 # The bundle is the same one the zip and the AppImage ship: PySide6, mutagen and
 # the X11/font/audio helper libraries, so the package needs no distro Qt.
 set -euo pipefail
 
-V=1.27.1
+V=1.28
 PKG=nebula-music-center
 ARCH=amd64
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)

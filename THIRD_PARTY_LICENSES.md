@@ -1,25 +1,17 @@
 # Third-party licence audit for Nebula Music Center
 
 Audited: 2026-11-12  
-Target: Nebula Music Center 1.27.1, released under **GPL-3.0-only**.
+Target: Nebula Music Center 1.28, released under **GPL-3.0-only**.
 
 This is a distribution audit, not legal advice. It covers the files actually shipped
 in the source tree and in the `.deb`, plus the external programs the app invokes.
 
-## Verdict
+## Summary
 
-- **No known bundled licensing blocker remains.** The RainbowCrack `rcrack` binary
-  and its `README-rcrack.txt` are not part of the 1.27.1 release, along with the Audible
-  `.aax` import feature. There is no bundled `rcrack`, rainbow-table payload, activation
-  byte setting or `.aax` importer in this version.
-- **The application itself is now licensed under GPL-3.0-only.** `LICENSE`, source
-  headers, `SOURCE_OFFER.md`, `PROVENANCE.md` and `TRADEMARK.md` are present in the
-  release tree.
-- **The old conditional Qt components are not bundled.** Qt VirtualKeyboard and Qt PDF,
-  including their libraries and plugins, are absent because the app does not use
-  them.
-- Everything else found is compatible with GPLv3, subject to the notices and
-  source-offer obligations below.
+The application and everything bundled with it are compatible with GPLv3, subject to
+the notices and source-offer obligations below. `LICENSE`, source headers,
+`SOURCE_OFFER.md`, `PROVENANCE.md` and `TRADEMARK.md` are present in the release tree.
+Qt VirtualKeyboard and Qt PDF are not bundled because the app does not use them.
 
 ## Bundled components
 
@@ -40,7 +32,7 @@ in the source tree and in the `.deb`, plus the external programs the app invokes
 | Nebula code, UI text, `nebula.png`, docs | project root | Copyright (C) 2026 Roger Barthares; GPL-3.0-only | **Licensed.** `LICENSE`, source headers and source offer are present. |
 | Lucide icons: repeat, repeat-one, shuffle and file-clock | vector paths in `nebula.py`; `sync-log.png` | ISC, with Feather-derived portions under MIT | **Compatible.** Ship the full `LICENSES/Lucide.txt` and keep the icon notice. |
 
-## Not shipped in 1.27.1
+## Not shipped in 1.28
 
 The following are no longer shipped:
 
@@ -92,7 +84,7 @@ configuration: ... --enable-gpl ... --enable-libx264 --enable-libx265 ...
 That is acceptable for a separate-process dependency. It is not acceptable to copy
 those GPL libraries into a differently licensed bundle.
 
-## Release requirements met in 1.27.1
+## Release requirements met in 1.28
 
 1. The full **GPL-3.0** licence text is in `LICENSE`, with copyright and SPDX headers
    in the application, launcher, build script and tests.
@@ -118,8 +110,8 @@ those GPL libraries into a differently licensed bundle.
 - `strings` on the bundled FFmpeg libraries: all five report
   `LGPL version 2.1 or later` / `FFmpeg version 9.0.1`; no `--enable-nonfree` found.
 - The Qt 6 licensing pages and module licence tables for PySide6; VirtualKeyboard and
-  PDF were removed in 1.27.1.
+  PDF were removed in 1.28.
 - The GPL FAQ / licence-compatibility guidance for LGPL-2.1+ and GPLv2+ combinations.
 - A source-tree search confirming no `rcrack`, `.aax`, activation-byte or
-  rainbow-table code or settings remain in 1.27.1.
-- A package audit confirming no VirtualKeyboard/PDF files are present in 1.27.1.
+  rainbow-table code or settings remain in 1.28.
+- A package audit confirming no VirtualKeyboard/PDF files are present in 1.28.

@@ -2,27 +2,27 @@
 
 ## 1.28
 
-- [ ] **Equalizer.** A real EQ for playback, with presets.
-  - Button: `assets/icons/eq.svg`, a custom 24 × 24 outline icon drawn for
-    Nebula. It goes in the queue toolbar, just right of Undo/Redo.
-  - `stroke="currentColor"` means it has to be recoloured to the theme's text
-    colour when it is rendered.
-  - `PySide6.QtSvg` is not bundled, so paint the six bars with QPainter (as
-    `player_icon` / `mode_icon` already do) instead of loading the SVG.
-- [ ] **Bit-perfect output.** Playback that hands the audio to the device
-  untouched, with a visible indicator when it is active.
-  - Needs its own output path: QMediaPlayer/QAudioOutput goes through
-    PipeWire and float32 mixing, so it cannot be bit-perfect. Plan: decode to
-    the file's native PCM and write to ALSA `hw:` directly, showing the live
-    format when the device is locked.
+- [x] **Equalizer.** A 25-band graphic EQ (20 Hz – 20 kHz, 0.1 dB steps) and a
+  parametric EQ (peak, low-shelf and high-shelf bands with frequency, gain and
+  Q), a shared preamp, and two tabs that each keep their own curve.
+  - Button: `assets/icons/eq.svg`, painted as six bars just right of Undo/Redo.
+  - Saved presets per tab, plus import/export in Equalizer APO (`.txt`) and
+    Nebula JSON form.
+  - Applied when the window closes: the track is rendered through the filter
+    chain with ffmpeg and played from the cache in `~/.cache/Nebula/eq`.
+- [ ] **Bit-perfect output.** The switch is in the equalizer and bypasses it,
+  but the exclusive path is still missing: QMediaPlayer still goes through
+  PipeWire, so the output is not untouched yet.
+  - Plan: decode to the file's native PCM and write to ALSA `hw:` directly,
+    showing the live format when the device is locked.
 
 ## 1.27.1
 
 - [x] **Real donation links in About.** Mp3Tag, Strawberry Music Player and
   FreeFileSync now open their donation pages; the coffee line still reads
   *Temporarily unavailable*.
-- [ ] **Release 1.27.1** — tag, push, and publish the `.deb`, source archive and
-  `SHA256SUMS`.
+- [x] **Release 1.27.1** — tagged and published with the `.deb`, source archive
+  and `SHA256SUMS`.
 
 ## 1.27
 

@@ -167,7 +167,7 @@ dialog_calls = [
     and isinstance(node.func.value, ast.Name) and node.func.value.id == "QFileDialog"
     and node.func.attr.startswith("get")]
 check("every file dialog call passes the native chooser options",
-      len(dialog_calls) == 20 and all(
+      len(dialog_calls) == 22 and all(
           any(keyword.arg == "options" and isinstance(keyword.value, ast.Name)
               and keyword.value.id in {"FILE_DIALOG_OPTIONS", "DIRECTORY_DIALOG_OPTIONS"}
               for keyword in call.keywords)
@@ -182,13 +182,13 @@ launcher_assignments = [line.strip() for line in launcher.splitlines()
                         if line.strip().startswith(("XDG_CONFIG_HOME=", "XDG_DATA_HOME="))]
 check("the launcher leaves the desktop config and data homes alone",
       not launcher_assignments, launcher_assignments)
-check("version is 1.27.1", nebula.VERSION == "1.27.1", nebula.VERSION)
+check("version is 1.28", nebula.VERSION == "1.28", nebula.VERSION)
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README title matches the version",
-      readme.startswith("# Nebula Music Center 1.27.1\n"), readme[:40])
-check("README has a 1.27.1 section", "## What's new in 1.27.1" in readme)
+      readme.startswith("# Nebula Music Center 1.28\n"), readme[:40])
+check("README has a 1.28 section", "## What's new in 1.28" in readme)
 build = open(os.path.join(ROOT, "packaging", "build-deb.sh"), encoding="utf-8").read()
-check("the package script builds 1.27.1", "\nV=1.27.1\n" in build, build[:200])
+check("the package script builds 1.28", "\nV=1.28\n" in build, build[:200])
 
 # ---------------------------------------------------------------- config
 section("config: defaults, types, backup and recovery")
