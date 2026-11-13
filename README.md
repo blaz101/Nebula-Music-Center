@@ -1,4 +1,10 @@
-# Nebula Music Center 1.27
+# Nebula Music Center 1.27.1
+
+## What's new in 1.27.1
+
+- **Real links in About.** The inspiration entries now open the Mp3Tag, Strawberry
+  Music Player and FreeFileSync donation pages; the coffee line still says the
+  support page is temporarily unavailable.
 
 ## What's new in 1.27
 - Updated icon
@@ -45,8 +51,8 @@ https://github.com/blaz101/Nebula-Music-Center
 Extract the release archive and start the app:
 
 ```bash
-tar -xf nebula-music-center_1.27.orig.tar.xz
-cd nebula-music-center-1.27
+tar -xf nebula-music-center_1.27.1.orig.tar.xz
+cd nebula-music-center-1.27.1
 ./run.sh
 ```
 
@@ -63,7 +69,7 @@ Nothing is installed system-wide and nothing is written outside your home.
 ## Install it (.deb, Debian and Ubuntu)
 
 ```bash
-sudo apt install ./nebula-music-center_1.27_amd64.deb
+sudo apt install ./nebula-music-center_1.27.1_amd64.deb
 nebula-music-center              # or pick it from the menu
 ```
 

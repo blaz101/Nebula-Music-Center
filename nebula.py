@@ -144,7 +144,7 @@ except ImportError:  # no multimedia module at all
 # ======================================================================
 APP_NAME = "Nebula Music Center"      # the full title, used in About and the desktop entry
 APP_SHORT = "Nebula"                 # what the title bar and menus call it
-VERSION = "1.27"
+VERSION = "1.27.1"
 SOURCE_URL = "https://github.com/blaz101/Nebula-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
@@ -22453,9 +22453,10 @@ class MainWindow(QMainWindow):
             "like to request a feature, please contact me.</p>"
             "<p>if you would like to support me, please consider donating to these apps "
             "first, they were the inspiration:<br>"
-            "Mp3Tag linktomp3tagdonation.com<br>"
-            "Strawberry Music Player linktostrawberrydonation.com<br>"
-            "FreeFileSync linktoffsdonation.com<br>"
+            "<a href=\"https://www.mp3tag.de/en/donations.html\">Mp3Tag</a><br>"
+            "<a href=\"https://www.strawberrymusicplayer.org/#sponsorus\">Strawberry "
+            "Music Player</a><br>"
+            "<a href=\"https://freefilesync.org/download.php\">FreeFileSync</a><br>"
             "____________________________________________________________________________________<br>"
             "Buy me a coffee: Temporarily unavailable.</p>"
             f"<p>Copyright (C) 2026 Roger Barthares.</p>"
