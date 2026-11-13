@@ -33,6 +33,16 @@ each asset came from.
 - **License:** ISC, with Feather-derived portions under MIT. See
   `LICENSES/Lucide.txt`.
 
+## EQ icon
+
+- **File:** `assets/icons/eq.svg`
+- **Icon:** a six-bar equalizer outline, drawn for Nebula Music Center by the
+  copyright holder. It is not taken from an icon set.
+- **License:** distributed under GPL-3.0-only with the application.
+- **Note:** `PySide6.QtSvg` is not bundled and the app does not depend on it, so
+  the button paints these six bars as paths (like `player_icon`) rather than
+  loading the file at runtime.
+
 ## Other UI icons
 
 - The remaining interface glyphs are drawn in `nebula.py`, use Qt standard icons,

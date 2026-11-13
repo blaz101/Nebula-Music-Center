@@ -3,8 +3,18 @@
 ## 1.28
 
 - [ ] **Equalizer.** A real EQ for playback, with presets.
+  - Button: `assets/icons/eq.svg`, a custom 24 × 24 outline icon drawn for
+    Nebula. It goes in the queue toolbar, just right of Undo/Redo.
+  - `stroke="currentColor"` means it has to be recoloured to the theme's text
+    colour when it is rendered.
+  - `PySide6.QtSvg` is not bundled, so paint the six bars with QPainter (as
+    `player_icon` / `mode_icon` already do) instead of loading the SVG.
 - [ ] **Bit-perfect output.** Playback that hands the audio to the device
   untouched, with a visible indicator when it is active.
+  - Needs its own output path: QMediaPlayer/QAudioOutput goes through
+    PipeWire and float32 mixing, so it cannot be bit-perfect. Plan: decode to
+    the file's native PCM and write to ALSA `hw:` directly, showing the live
+    format when the device is locked.
 
 ## 1.27.1
 
